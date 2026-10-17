@@ -1,0 +1,19 @@
+[package]
+name = "gpui-pdf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A GPU-accelerated PDF reader built with GPUI"
+
+[dependencies]
+pdf-core = { path = "../pdf-core" }
+
+gpui.workspace = true
+gpui_platform.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+image.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
