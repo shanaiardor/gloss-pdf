@@ -1,9 +1,9 @@
-//! 页面区域：滚动容器、页面位图、选择/搜索/高亮/链接覆盖层。
+﻿//! 页面区域：滚动容器、页面位图、选择/搜索/高亮/链接覆盖层。
 
 use gpui::{Context, MouseButton, div, img, prelude::*, px};
 use pdf_core::RectPt;
 
-use crate::app::{AppState, BOTTOM_INSET, PAGE_PAD};
+use crate::app::{AppState, BOTTOM_INSET, PAGE_PAD, PageLayout, TOP_INSET};
 use crate::geometry::merge_rects;
 use crate::theme::Theme;
 use crate::ui::empty::empty_state;
@@ -14,9 +14,11 @@ impl AppState {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let page_width = self.viewer.page_size().map_or(0.0, |page| page.width) * self.viewer.zoom;
-        let available = f32::from(self.viewport.width) - PAGE_PAD * 2.0;
-        let center = ((available - page_width) / 2.0).max(0.0);
+        let layout = self
+            .viewer
+            .page_size()
+            .map(|page| PageLayout::new(page, self.viewer.zoom, self.viewport));
+        let center = layout.map_or(0.0, |layout| layout.center);
 
         div()
             .id("page-scroll")
@@ -25,7 +27,8 @@ impl AppState {
             .track_scroll(&self.viewer.scroll)
             .child(
                 div()
-                    .p(px(PAGE_PAD))
+                    .px(px(PAGE_PAD))
+                    .pt(px(TOP_INSET))
                     .pb(px(BOTTOM_INSET))
                     .child(div().ml(px(center)).child(self.page_view(theme, cx))),
             )
@@ -97,9 +100,11 @@ impl AppState {
                     .w(px((rect.width() * zoom).max(1.0)))
                     .h(px((rect.height() * zoom).max(1.0)))
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _event: &gpui::ClickEvent, _window, cx| {
-                        this.follow_link(target.clone(), cx);
-                    }))
+                    .on_click(
+                        cx.listener(move |this, _event: &gpui::ClickEvent, _window, cx| {
+                            this.follow_link(target.clone(), cx);
+                        }),
+                    )
                     .into_any_element(),
             );
         }

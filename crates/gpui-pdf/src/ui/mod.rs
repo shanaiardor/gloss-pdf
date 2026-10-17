@@ -2,6 +2,7 @@
 
 pub(crate) mod chrome;
 pub(crate) mod empty;
+pub(crate) mod home;
 pub(crate) mod outline;
 pub(crate) mod page;
 pub(crate) mod search_bar;

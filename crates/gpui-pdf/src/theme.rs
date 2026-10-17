@@ -63,12 +63,12 @@ impl Theme {
     pub fn light() -> Self {
         Self {
             dark: false,
-            bg: rgb(0xf6f7f9),
-            surface: rgb(0xffffff),
-            surface_hover: rgb(0xf0f2f6),
-            border: rgb(0xdfe3ea),
-            text: rgb(0x1a1d24),
-            text_muted: rgb(0x5f6775),
+            bg: rgb(0xfbfaf6),
+            surface: rgb(0xfffefb),
+            surface_hover: rgb(0xf1efe9),
+            border: rgb(0xe7e4dc),
+            text: rgb(0x24231f),
+            text_muted: rgb(0x8b8982),
             accent: rgb(0x2563eb),
             accent_hover: rgb(0x1d4ed8),
             accent_text: rgb(0xffffff),

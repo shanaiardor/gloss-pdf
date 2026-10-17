@@ -1,13 +1,18 @@
 ﻿//! 浮动界面组件：顶部胶囊、底部胶囊、窗口按钮、拖拽条。
 
-use gpui::{App, ClickEvent, Context, Window, WindowControlArea, div, prelude::*, px};
+use gpui::{App, ClickEvent, Context, Window, WindowControlArea, div, prelude::*, px, rgb};
 
 use crate::app::AppState;
+use crate::layout::FitMode;
 use crate::theme::Theme;
 
 impl AppState {
     pub(crate) fn floating_top(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
-        let outline_label = if self.outline_open { "目录 ·" } else { "目录" };
+        let outline_label = if self.outline_open {
+            "目录 ·"
+        } else {
+            "目录"
+        };
         let can_save = !self.viewer.highlights.is_empty();
 
         let mut save = pill_button(
@@ -23,6 +28,7 @@ impl AppState {
         }
 
         let capsule = div()
+            .id("floating-top-capsule")
             .flex()
             .items_center()
             .gap_1()
@@ -33,6 +39,16 @@ impl AppState {
             .border_1()
             .border_color(theme.border)
             .shadow_lg()
+            // 扩大后的顶部拖拽带在胶囊下面，胶囊要挡住命中区。
+            .occlude()
+            .child(pill_button(
+                "home",
+                "首页",
+                theme,
+                cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.close_document(cx);
+                }),
+            ))
             .child(pill_button(
                 "open",
                 "打开",
@@ -167,14 +183,23 @@ impl AppState {
                     this.set_zoom(zoom, cx);
                 }),
             ))
-            .child(pill_button(
-                "fit",
+            .child(div().w(px(1.)).h(px(16.)).bg(theme.border))
+            .child(fit_button(
+                "fit-width",
                 "适宽",
+                self.viewer.fit_mode == FitMode::Width,
                 theme,
                 cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                    this.fit_to_width();
-                    let zoom = this.viewer.zoom;
-                    this.set_zoom(zoom, cx);
+                    this.fit_to_width(cx);
+                }),
+            ))
+            .child(fit_button(
+                "fit-page",
+                "适页",
+                self.viewer.fit_mode == FitMode::Page,
+                theme,
+                cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.fit_to_page(cx);
                 }),
             ));
 
@@ -188,47 +213,58 @@ impl AppState {
             .child(capsule)
     }
 
-    pub(crate) fn window_controls(&self, theme: &Theme) -> gpui::Div {
+    pub(crate) fn window_controls(&self, _theme: &Theme) -> gpui::Div {
         div()
             .absolute()
-            .top(px(10.))
-            .right(px(12.))
+            .top(px(14.))
+            .left(px(16.))
             .flex()
             .items_center()
-            .gap_1()
-            .child(window_control(
-                "win-min",
-                "—",
-                WindowControlArea::Min,
-                26.0,
-                theme,
-            ))
-            .child(window_control(
-                "win-max",
-                "□",
-                WindowControlArea::Max,
-                22.0,
-                theme,
-            ))
-            .child(window_control(
+            .gap(px(8.))
+            .child(window_control_dot(
                 "win-close",
-                "✕",
                 WindowControlArea::Close,
-                26.0,
-                theme,
+                rgb(0xff5f57),
+            ))
+            .child(window_control_dot(
+                "win-min",
+                WindowControlArea::Min,
+                rgb(0xfebc2e),
+            ))
+            .child(window_control_dot(
+                "win-max",
+                WindowControlArea::Max,
+                rgb(0x28c840),
             ))
     }
 }
 
 pub(crate) fn drag_strip() -> gpui::Stateful<gpui::Div> {
-    div()
-        .id("titlebar-drag")
-        .absolute()
-        .top_0()
-        .left_0()
-        .right_0()
-        .h(px(14.))
-        .window_control_area(WindowControlArea::Drag)
+    drag_cursor(
+        div()
+            .id("titlebar-drag")
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(46.))
+            .window_control_area(WindowControlArea::Drag),
+    )
+}
+
+/// 拖拽区域的鼠标样式。
+///
+/// Windows 端 GPUI 把 OpenHand/ClosedHand 都映射成箭头，只有 PointingHand 会变成手型，
+/// 所以这里在 Windows 上用 pointing hand，其他平台用更贴切的 grab hand。
+pub(crate) fn drag_cursor<D: gpui::Styled>(element: D) -> D {
+    #[cfg(target_os = "windows")]
+    {
+        element.cursor_pointer()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        element.cursor_grab()
+    }
 }
 
 fn pill_button(
@@ -252,25 +288,37 @@ fn pill_button(
         .child(label.into())
 }
 
-fn window_control(
+/// 适宽/适页按钮：当前生效的模式用强调色标出来。
+fn fit_button(
     id: &'static str,
     label: impl Into<gpui::SharedString>,
-    area: WindowControlArea,
-    size: f32,
+    active: bool,
     theme: &Theme,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
-    let hover_bg = theme.surface_hover;
+    let button = pill_button(id, label, theme, on_click);
+    if active {
+        button
+            .bg(theme.accent.opacity(0.16))
+            .text_color(theme.accent)
+    } else {
+        button
+    }
+}
+
+fn window_control_dot(
+    id: &'static str,
+    area: WindowControlArea,
+    color: gpui::Rgba,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
-        .size(px(size))
+        .size(px(12.))
         .rounded_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_size(px(size * 0.46))
-        .text_color(theme.text_muted)
+        .bg(color)
         .cursor_pointer()
-        .hover(move |style| style.bg(hover_bg))
+        .hover(|style| style.opacity(0.82))
+        // 首页顶部整条都可拖动，窗口按钮要挡住拖拽命中区。
+        .occlude()
         .window_control_area(area)
-        .child(label.into())
 }

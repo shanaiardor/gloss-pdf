@@ -3,6 +3,9 @@
 mod app;
 mod geometry;
 mod highlights;
+mod home;
+mod layout;
+mod progress;
 mod search;
 mod selection;
 mod theme;
@@ -48,7 +51,7 @@ fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
-                title: Some(SharedString::from("GPUI PDF")),
+                title: Some(SharedString::from("极简 PDF")),
                 // 隐藏 Windows 原生标题栏，改用自绘的浮动控件。
                 appears_transparent: true,
                 ..Default::default()
