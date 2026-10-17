@@ -181,6 +181,10 @@ impl AppState {
                         if item == HomeNav::Home {
                             this.home.nav = HomeNav::Home;
                             this.home.query.clear();
+                            this.settings_open = false;
+                        } else if item == HomeNav::Settings {
+                            this.home.nav = HomeNav::Settings;
+                            this.toggle_settings(cx);
                         } else if let Some(message) = message {
                             // 其他页面尚未实现，保持“主页”选中，只给一条提示。
                             this.set_status(message, cx);

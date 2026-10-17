@@ -9,6 +9,8 @@
 │ crates/gpui-pdf（二进制）                     │
 │  app.rs      控制器：引擎事件、键盘/鼠标、生命周期 │
 │  home.rs     首页状态：最近阅读、搜索、侧栏       │
+│  settings.rs 用户设置：主题、词典路径             │
+│  dictionary.rs 词典面板状态：当前词/加载/结果     │
 │  progress.rs 阅读进度模型：页码/滚动比例/缩放     │
 │  viewer.rs   阅读器状态：文档/页/缩放/滚动       │
 │  layout.rs   适宽/适页缩放、窗口尺寸（纯计算）    │
@@ -22,6 +24,15 @@
 │  engine.rs  PDFium worker：打开/渲染/提取       │
 │  model.rs   RectPt / CharBox / Link / Outline │
 └─────────────────────────────────────────────┘
+                │ Command / Event（mpsc channel）
+┌───────────────▼─────────────────────────────┐
+│ crates/dict-core（库，无 UI 依赖）             │
+│  engine.rs  MDX worker：加载/查词/@@@LINK 跳转  │
+│  css.rs     CSS 解析/层叠/计算样式              │
+│  html.rs    释义 HTML → Block/Span/Table       │
+│  fonts.rs   WOFF 解包 + 字体覆盖范围           │
+│  model.rs   DictEntry / Block / Span           │
+└─────────────────────────────────────────────┘
 ```
 
 ## 各模块职责
@@ -30,7 +41,15 @@
 |---|---|---|
 | `pdf-core::engine` | PDFium 生命周期、线程、渲染成 BGRA、文本/链接/目录提取 | 布局、坐标换算、交互 |
 | `pdf-core::model` | UI 无关的数据类型 | 任何 GPUI 类型 |
+| `dict-core::engine` | MDX 线程、加载词典、查询与重定向、读取同名/拆分 MDD、外置 CSS 和字体 | 渲染、设置读写 |
+| `dict-core::css` | 用 `lightningcss` 解析样式表，用 `kuchiki`/Servo selectors 匹配选择器，做层叠与继承 | 元素布局、绘制 |
+| `dict-core::html` | 用 `kuchiki` 解析 HTML；计算样式、`::before`/`::after` 内容、表格、图片和按字符选字体 | 完整浏览器布局（float/flex/columns） |
+| `dict-core::fonts` | 解包 WOFF、解析 cmap 覆盖范围、给 UI 提供字体字节 | 字体栅格化 |
+| `dict-core::model` | 词典条目、段落、行内样式、表格、图片 | 任何 GPUI 类型 |
 | `app::AppState` | 引擎事件 → Viewer 更新；键盘/鼠标分派；打开文件 | 具体控件绘制 |
+| `settings::SettingsStore` | 主题与词典路径的读写 | 词典解析 |
+| `dictionary::DictionaryState` | 词典窗口的开关、当前词、加载/查询状态 | 词典解析、磁盘 |
+| `dictionary::DictionaryView` | 推送给独立词典窗口的最小快照 | 查询逻辑 |
 | `home::HomeState` | 最近阅读持久化（含阅读进度）、首页搜索过滤、侧栏选中项 | GPUI 控件 |
 | `progress::ReadingProgress` | 页码/页内滚动比例/缩放/适应模式的数据模型与百分比换算 | 磁盘读写、视口换算 |
 | `layout` | 页边距、适宽/适页缩放、按纸张比例算窗口尺寸 | 绘制、窗口 API |
@@ -43,6 +62,8 @@
 | `ui::chrome` | 顶部/底部浮动胶囊、窗口按钮、拖拽条 | 状态变更 |
 | `ui::page` | 滚动容器、页面位图、覆盖层、链接热区 | 命中测试 |
 | `ui::outline` | 浮动目录面板 | 书签解析 |
+| `ui::dictionary` | 独立词典窗口：主窗口查词后自动弹出/更新 | 词典查询、窗口定位 |
+| `ui::settings` | 设置面板：主题、词典路径 | 设置持久化 |
 | `ui::empty` / `ui::toast` | 空状态、瞬时提示 | — |
 
 ## 数据流
@@ -54,13 +75,20 @@
    打开文档后 `Render` 依据当前显示器工作区调整窗口尺寸；之后每次 `viewport` 变化都按当前适应模式重算缩放。
 4. `Render` 里调用 `ui::*` 的方法把 `Viewer` / `HomeState` 映射成 element 树。
 5. 首页状态下 `ui::home` 读取 `HomeState`；有文档时改画 `ui::page`，顶部胶囊的「首页」清空 `Viewer` 回到首页。
+6. 双击 PDF 文字 → `Selection::select_word` 选中英文单词或中文单字 → `AppState::lookup_word` 发送 `dict_core::Command::Lookup`；
+   MDX worker 回传 `Found/NotFound/Error`，`DictionaryState` 更新后同步到独立词典窗口（放在主窗口右侧，不遮挡页面）。
+   设置面板选择 `.mdx` 时写入 `settings.json` 并发送 `Command::Load`。
+7. 加载词典时 worker 会同时打开同名 `.mdd` 和拆分的 `.1.mdd` / `.2.mdd`，读取 MDX 头部描述里引用的外置 CSS，
+   把 `@font-face` 的 WOFF 解包成 sfnt 后通过 `Event::Loaded` 交给 UI 注册到 GPUI 文本系统。
+   每条释义的 HTML/CSS 都在 worker 里转成 `Block`，UI 只负责把 run、表格和图片画出来。
 
 约束：
 
-- **pdf-core 不依赖 gpui**，可以直接写单元测试，也可以以后换渲染后端。
+- **pdf-core / dict-core 不依赖 gpui**，可以直接写单元测试，也可以以后换渲染后端。
 - **UI 不直接调 PDFium**，只读 Viewer。
 - **坐标换算只在一处**：`AppState::page_origin` / `to_pdf`，PDF pt（左下原点）↔ 屏幕 px（左上原点）。
 - **PDFium 非线程安全**：所有 PDFium 调用都在 worker 线程；UI 只拿结果。
+- **HTML/CSS 语法解析不自研**：`kuchiki`（html5ever + Servo selectors）负责 HTML 与选择器，`lightningcss` 负责 CSS；`dict-core` 只做层叠、继承和 GPUI 模型转换。
 
 ## 加功能的落点
 
@@ -72,6 +100,7 @@
 | 新的快捷键 | `app.rs::on_key_down` |
 | 新的阅读状态（如连续滚动位置、阅读进度） | `progress.rs`（模型）+ `viewer.rs`（恢复）+ `app.rs`（采样与落盘） |
 | 新的文本交互（选区扩展、按词移动） | `selection.rs` + `app.rs` 的鼠标处理 |
+| 词典 / 查词 / 多词典 | `dict-core`（解析与查询）+ `dictionary.rs` + `ui::dictionary` + `settings.rs` |
 | 新的搜索能力（全文、正则） | `search.rs` + `pdf-core`（跨页搜索要新增 Command/Event） |
 | 新批注类型（下划线、便签） | `highlights.rs` 泛化为 `annotations.rs` |
 | 表单填写 | `pdf-core` 新增 Form API + `viewer` 状态 + `ui` 控件 |
@@ -82,5 +111,12 @@
 
 - 纯逻辑（`layout`、`selection`、`search`、`progress`、`home`、`viewer` 的进度恢复）有单元测试：
   `cargo test -p gpui-pdf`。
+- `dict-core` 有 CSS 层叠、选择器/伪元素、表格、图片、字体路径的单元测试：`cargo test -p dict-core`。
+- 真实词典回归测试默认忽略，需要指向《王力古漢語字典》的 `.mdx`：
+  ```powershell
+  $env:GPUI_PDF_TEST_DICT = 'C:\path\to\王力古漢語字典 (2000).mdx'
+  cargo test -p dict-core -- --ignored
+  ```
 - `pdf-core` 可加用 `samples/` 下 PDF 的集成测试（需要 `pdfium.dll`）。
 - GPUI 层目前靠手动验证：`cargo run -p gpui-pdf -- samples/dummy.pdf`。
+- 词典样式支持范围与限制见 [dictionary.md](dictionary.md)。

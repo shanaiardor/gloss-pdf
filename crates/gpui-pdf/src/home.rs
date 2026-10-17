@@ -52,7 +52,7 @@ impl HomeNav {
             HomeNav::Recent => Some("最近阅读已经在首页展示"),
             HomeNav::Favorites => Some("收藏功能即将上线"),
             HomeNav::Tools => Some("工具功能即将上线"),
-            HomeNav::Settings => Some("设置功能即将上线"),
+            HomeNav::Settings => None,
         }
     }
 }
@@ -267,8 +267,9 @@ fn same_path(left: &Path, right: &Path) -> bool {
         .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
-fn recent_file_path() -> Option<PathBuf> {
-    let directory = if cfg!(target_os = "windows") {
+/// 用户数据目录（Windows: `%APPDATA%\gpui-pdf`）。
+pub(crate) fn user_data_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "windows") {
         std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .map(|path| path.join("gpui-pdf"))
@@ -287,9 +288,11 @@ fn recent_file_path() -> Option<PathBuf> {
                     .map(|path| path.join(".local").join("share"))
             })
             .map(|path| path.join("gpui-pdf"))
-    }?;
+    }
+}
 
-    Some(directory.join("recent.json"))
+fn recent_file_path() -> Option<PathBuf> {
+    Some(user_data_dir()?.join("recent.json"))
 }
 
 #[cfg(test)]
@@ -358,7 +361,8 @@ mod tests {
 
     #[test]
     fn legacy_progress_without_fit_still_parses() {
-        let legacy = r#"{"page":1,"pages":5,"zoom":1.2,"scroll_x":0.0,"scroll_y":0.3,"updated_at":10}"#;
+        let legacy =
+            r#"{"page":1,"pages":5,"zoom":1.2,"scroll_x":0.0,"scroll_y":0.3,"updated_at":10}"#;
         let progress: ReadingProgress = serde_json::from_str(legacy).unwrap();
         assert_eq!(progress.fit, None);
         assert!((progress.zoom - 1.2).abs() < f32::EPSILON);

@@ -7,6 +7,7 @@ description = "A GPU-accelerated PDF reader built with GPUI"
 
 [dependencies]
 pdf-core = { path = "../pdf-core" }
+dict-core = { path = "../dict-core" }
 
 gpui.workspace = true
 gpui_platform.workspace = true
@@ -17,3 +18,7 @@ image.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle = "0.6"
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }

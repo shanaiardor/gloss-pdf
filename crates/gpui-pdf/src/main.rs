@@ -1,6 +1,7 @@
 ﻿//! 入口：初始化日志，打开主窗口，把错误收敛到日志里。
 
 mod app;
+mod dictionary;
 mod geometry;
 mod highlights;
 mod home;
@@ -8,9 +9,13 @@ mod layout;
 mod progress;
 mod search;
 mod selection;
+mod settings;
 mod theme;
 mod ui;
 mod viewer;
+mod window_layout;
+#[cfg(target_os = "windows")]
+mod window_move;
 
 use anyhow::Context as _;
 use gpui::{

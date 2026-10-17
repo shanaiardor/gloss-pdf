@@ -1,0 +1,16 @@
+[package]
+name = "dict-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MDict (.mdx) engine with CSS-aware HTML rendering (no UI dependencies)"
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+futures.workspace = true
+image.workspace = true
+flate2 = "1"
+kuchiki = "0.8.1"
+lightningcss = { version = "1.0.0-alpha.72", default-features = false }
+mdictlib = { version = "0.2.8", features = ["lzo"] }

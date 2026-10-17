@@ -20,7 +20,6 @@ impl Selection {
         self.dragging = false;
     }
 
-
     pub fn start_at(&mut self, index: usize) {
         self.anchor = Some(index);
         self.focus = Some(index);
@@ -58,8 +57,8 @@ impl Selection {
 
         for character in selected {
             if let Some((previous_rect, previous_char)) = previous {
-                let new_line =
-                    (character.rect.bottom - previous_rect.bottom).abs() > previous_rect.height() * 0.5;
+                let new_line = (character.rect.bottom - previous_rect.bottom).abs()
+                    > previous_rect.height() * 0.5;
                 if new_line {
                     if !text.ends_with('\n') {
                         text.push('\n');
@@ -79,23 +78,63 @@ impl Selection {
         Some(text)
     }
 
-    /// 双击选词：向两侧扩展到非字母数字边界。
+    /// 双击选词：中文按单字，英文按词；不跨行、不跨栏。
     pub fn select_word(&mut self, chars: &[CharBox], index: usize) {
-        let is_word = |ch: char| ch.is_alphanumeric() || ch == '_';
+        let Some(target) = chars.get(index) else {
+            return;
+        };
+
+        if is_cjk(target.ch) || !is_word_char(target.ch) {
+            self.anchor = Some(index);
+            self.focus = Some(index);
+            return;
+        }
+
+        let line_height = target.rect.height().max(1.0);
+        let same_line = |left: &CharBox, right: &CharBox| {
+            (left.rect.bottom - right.rect.bottom).abs() <= line_height * 0.5
+        };
+        let close_enough = |left: &CharBox, right: &CharBox| {
+            right.rect.left - left.rect.right <= line_height * 1.5
+        };
 
         let mut start = index;
-        while start > 0 && is_word(chars[start - 1].ch) {
+        while start > 0 {
+            let previous = &chars[start - 1];
+            let current = &chars[start];
+            if !is_word_char(previous.ch)
+                || !same_line(previous, current)
+                || !close_enough(previous, current)
+            {
+                break;
+            }
             start -= 1;
         }
 
         let mut end = index;
-        while end + 1 < chars.len() && is_word(chars[end + 1].ch) {
+        while end + 1 < chars.len() {
+            let current = &chars[end];
+            let next = &chars[end + 1];
+            if !is_word_char(next.ch) || !same_line(current, next) || !close_enough(current, next) {
+                break;
+            }
             end += 1;
         }
 
         self.anchor = Some(start);
         self.focus = Some(end);
     }
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '\'' || ch == '-'
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF
+    )
 }
 
 #[cfg(test)]
@@ -143,5 +182,50 @@ mod tests {
         let selection = Selection::default();
         assert!(selection.rects(&chars()).is_empty());
         assert!(selection.text(&chars()).is_none());
+    }
+
+    fn line(text: &str, bottom: f32, x_start: f32) -> Vec<CharBox> {
+        let mut chars = Vec::new();
+        let mut x = x_start;
+        for ch in text.chars() {
+            let width = if ch == ' ' { 3.0 } else { 6.0 };
+            chars.push(CharBox {
+                ch,
+                rect: RectPt {
+                    left: x,
+                    bottom,
+                    right: x + width,
+                    top: bottom + 10.0,
+                },
+            });
+            x += width;
+        }
+        chars
+    }
+
+    #[test]
+    fn double_click_cjk_selects_single_char() {
+        let chars = line("你好世界", 0.0, 0.0);
+        let mut selection = Selection::default();
+        selection.select_word(&chars, 1);
+        assert_eq!(selection.text(&chars).as_deref(), Some("好"));
+    }
+
+    #[test]
+    fn select_word_stops_at_line_boundary() {
+        let mut chars = line("hello", 0.0, 0.0);
+        chars.extend(line("world", 20.0, 0.0));
+        let mut selection = Selection::default();
+        selection.select_word(&chars, 7);
+        assert_eq!(selection.text(&chars).as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn select_word_stops_at_wide_gap() {
+        let mut chars = line("hello", 0.0, 0.0);
+        chars.extend(line("world", 0.0, 120.0));
+        let mut selection = Selection::default();
+        selection.select_word(&chars, 6);
+        assert_eq!(selection.text(&chars).as_deref(), Some("world"));
     }
 }

@@ -1,25 +1,31 @@
 ﻿//! 应用控制器：把 PDF 引擎事件、键盘/鼠标输入接到 Viewer 状态和 UI 上。
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dict_core::{Command as DictCommand, DictEngine, Event as DictEvent};
 use futures::StreamExt;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Point, Render, RenderImage,
-    Size, Window, div, point, prelude::*, px, size,
+    AnyWindowHandle, App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Point, Render,
+    RenderImage, Size, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions, div,
+    point, prelude::*, px, size,
 };
 use pdf_core::{Command, Event, LinkTarget, PageSize, PdfEngine};
 
+use crate::dictionary::{DictLoadState, DictionaryState, DictionaryView};
 use crate::highlights::sidecar_path;
-use crate::home::HomeState;
+use crate::home::{HomeNav, HomeState};
 use crate::layout::{
     FitArea, FitMode, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, SCREEN_MARGIN, VERTICAL_INSETS,
     WINDOW_FILL, window_size_for_page,
 };
 use crate::progress::{ReadingProgress, unix_now};
+use crate::settings::SettingsStore;
 use crate::theme::Theme;
+use crate::ui::dictionary::DictionaryWindow;
 use crate::viewer::{Document, PageData, Viewer, scroll_offset_for_ratio};
 
 pub(crate) use crate::layout::{BOTTOM_INSET, PAGE_PAD, TOP_INSET};
@@ -80,12 +86,87 @@ fn window_room(window: &Window, cx: &App) -> (f32, f32) {
     (room_width, room_height)
 }
 
+fn normalize_term(raw: &str) -> String {
+    let term = raw.lines().next().unwrap_or_default().trim();
+    let term = term.trim_matches(is_edge_punctuation);
+    term.chars().take(64).collect()
+}
+
+fn rect_f(bounds: Bounds<gpui::Pixels>) -> crate::window_layout::RectF {
+    crate::window_layout::RectF::new(
+        f32::from(bounds.origin.x),
+        f32::from(bounds.origin.y),
+        f32::from(bounds.size.width),
+        f32::from(bounds.size.height),
+    )
+}
+
+/// 词典窗口的尺寸：优先 380×720，屏幕放不下时按工作区收窄。
+fn dictionary_window_size(work: crate::window_layout::RectF) -> Size<gpui::Pixels> {
+    use crate::window_layout::SCREEN_MARGIN;
+
+    let width = 380.0_f32.min((work.width - SCREEN_MARGIN * 2.0).max(280.0));
+    let height = 720.0_f32.min((work.height - SCREEN_MARGIN * 2.0).max(360.0));
+    size(px(width), px(height))
+}
+
+fn is_edge_punctuation(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '.' | ','
+                | ';'
+                | ':'
+                | '!'
+                | '?'
+                | '"'
+                | '\''
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '('
+                | ')'
+                | '（'
+                | '）'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '《'
+                | '》'
+                | '「'
+                | '」'
+                | '【'
+                | '】'
+                | '。'
+                | '，'
+                | '、'
+                | '；'
+                | '：'
+                | '！'
+                | '？'
+                | '…'
+                | '—'
+                | '–'
+        )
+}
+
 pub struct AppState {
     pub(crate) theme: Theme,
     pub(crate) focus_handle: FocusHandle,
     pub(crate) engine: std::sync::mpsc::Sender<Command>,
     pub(crate) viewer: Viewer,
     pub(crate) home: HomeState,
+    pub(crate) settings: SettingsStore,
+    pub(crate) settings_open: bool,
+    pub(crate) dict: DictEngine,
+    pub(crate) dictionary: DictionaryState,
+    /// 独立词典窗口；关闭后保留的句柄会在下一次同步时清掉。
+    pub(crate) dictionary_window: Option<WindowHandle<DictionaryWindow>>,
+    /// 主窗口与显示器工作区，用来把词典窗口放到主窗口右侧。
+    main_window_bounds: Option<Bounds<gpui::Pixels>>,
+    display_bounds: Option<Bounds<gpui::Pixels>>,
     pub(crate) viewport: Size<gpui::Pixels>,
     pub(crate) scale_factor: f32,
     pub(crate) request_id: u64,
@@ -121,6 +202,36 @@ impl AppState {
         })
         .detach();
 
+        let settings = SettingsStore::load();
+        let theme = if settings.current.dark {
+            Theme::dark()
+        } else {
+            Theme::light()
+        };
+
+        let (dict_tx, mut dict_rx) = futures::channel::mpsc::unbounded();
+        let dict = DictEngine::spawn(dict_tx);
+        if let Some(path) = settings.current.dictionary_path.clone() {
+            let _ = dict.commands.send(DictCommand::Load { path });
+        }
+
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = dict_rx.next().await {
+                if this
+                    .update(cx, |this, cx| this.handle_dict_event(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        let mut dictionary = DictionaryState::default();
+        if settings.current.dictionary_path.is_some() {
+            dictionary.load_state = DictLoadState::Loading;
+        }
+
         // 页内滚动不会触发专门的事件，按固定间隔采样，空闲时立即停手。
         cx.spawn(async move |this, cx| {
             loop {
@@ -137,15 +248,50 @@ impl AppState {
         })
         .detach();
 
+        // 词典窗口自己关掉时（✕ 或 Alt+F4），同步主窗口里的状态和工具栏标签。
+        //
+        // 关闭回调可能在主窗口自己触发的 `remove_window` 里同步执行，这时直接
+        // `AppState::update` 会撞上还借着的实体；推迟到本轮事件处理结束后再改。
+        let app = cx.entity();
+        cx.on_window_closed(move |cx, window_id| {
+            let app = app.clone();
+            cx.defer(move |cx| {
+                let _ = app.update(cx, |this, cx| {
+                    let closed = this.dictionary_window.is_some_and(|handle| {
+                        AnyWindowHandle::from(handle).window_id() == window_id
+                    });
+                    if closed {
+                        this.dictionary_window = None;
+                        this.dictionary.open = false;
+                        cx.notify();
+                    }
+                });
+            });
+        })
+        .detach();
+
         // 关窗/退出时兜底保存一次，避免最后不到一秒的滚动丢失。
-        cx.on_release(|this, _cx| this.flush_progress()).detach();
+        cx.on_release(|this, cx| {
+            this.flush_progress();
+            if let Some(handle) = this.dictionary_window.take() {
+                let _ = handle.update(cx, |_view, window, _cx| window.remove_window());
+            }
+        })
+        .detach();
 
         Self {
-            theme: Theme::light(),
+            theme,
             focus_handle: cx.focus_handle(),
             engine,
             viewer: Viewer::new(),
             home: HomeState::load(),
+            settings,
+            settings_open: false,
+            dict,
+            dictionary,
+            dictionary_window: None,
+            main_window_bounds: None,
+            display_bounds: None,
             viewport: Size {
                 width: px(1040.),
                 height: px(720.),
@@ -331,7 +477,325 @@ impl AppState {
 
     pub(crate) fn toggle_theme(&mut self, cx: &mut Context<Self>) {
         self.theme = self.theme.clone().toggled();
+        self.settings.current.dark = self.theme.dark;
+        self.settings.save();
+        self.sync_dictionary_window(cx);
         self.set_status(format!("主题：{}", self.theme.name()), cx);
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = !self.settings_open;
+        if self.settings_open {
+            self.home.menu_open = None;
+            self.home.search_focused = false;
+        } else if !self.viewer.has_document() {
+            self.home.nav = HomeNav::Home;
+        }
+        cx.notify();
+    }
+
+    // ---------- 词典 ----------
+
+    pub(crate) fn handle_dict_event(&mut self, event: DictEvent, cx: &mut Context<Self>) {
+        match event {
+            DictEvent::Loaded {
+                path: _,
+                title,
+                entries,
+                fonts,
+            } => {
+                if self.settings.current.dictionary_path.is_none() {
+                    return;
+                }
+                if !fonts.is_empty() {
+                    let count = fonts.len();
+                    let fonts: Vec<Cow<'static, [u8]>> =
+                        fonts.into_iter().map(Cow::Owned).collect();
+                    match cx.text_system().add_fonts(fonts) {
+                        Ok(()) => log::info!("registered {count} dictionary fonts"),
+                        Err(error) => log::warn!("注册词典字体失败: {error:#}"),
+                    }
+                }
+                self.dictionary.load_state = DictLoadState::Ready { title, entries };
+                self.dictionary.loading = false;
+                if let Some(term) = self.dictionary.pending_term.take() {
+                    self.lookup_word(term, cx);
+                    return;
+                }
+                self.set_status(format!("词典已加载 · {entries} 条"), cx);
+            }
+            DictEvent::Found {
+                request,
+                term,
+                entries,
+                redirected,
+            } => {
+                if request != self.dictionary.request {
+                    return;
+                }
+                self.dictionary.loading = false;
+                self.dictionary.not_found = false;
+                self.dictionary.error = None;
+                self.dictionary.entries = entries;
+                if redirected {
+                    self.dictionary.word = term;
+                }
+            }
+            DictEvent::NotFound { request, term } => {
+                if request != self.dictionary.request {
+                    return;
+                }
+                self.dictionary.loading = false;
+                self.dictionary.entries.clear();
+                self.dictionary.not_found = true;
+                self.dictionary.word = term;
+            }
+            DictEvent::Error { request, message } => {
+                if let Some(request) = request
+                    && request != self.dictionary.request
+                {
+                    return;
+                }
+                self.dictionary.loading = false;
+                if request.is_none() {
+                    if self.settings.current.dictionary_path.is_none() {
+                        return;
+                    }
+                    self.dictionary.load_state = DictLoadState::Failed(message.clone());
+                }
+                self.dictionary.error = Some(message.clone());
+                self.set_status(message, cx);
+            }
+        }
+        self.sync_dictionary_window(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn lookup_word(&mut self, term: String, cx: &mut Context<Self>) {
+        let term = normalize_term(&term);
+        if term.is_empty() {
+            return;
+        }
+
+        if self.settings.current.dictionary_path.is_none() {
+            self.settings_open = true;
+            self.set_status("请先在设置中选择 MDX 词典", cx);
+            cx.notify();
+            return;
+        }
+
+        match self.dictionary.load_state.clone() {
+            DictLoadState::Loading => {
+                self.dictionary.pending_term = Some(term);
+                self.dictionary.open = true;
+                self.ensure_dictionary_window(cx);
+                self.set_status("词典正在加载…", cx);
+                cx.notify();
+                return;
+            }
+            DictLoadState::Unconfigured => {
+                self.settings_open = true;
+                self.set_status("请先在设置中选择 MDX 词典", cx);
+                cx.notify();
+                return;
+            }
+            DictLoadState::Failed(message) => {
+                self.dictionary.error = Some(message.clone());
+                self.dictionary.open = true;
+                self.ensure_dictionary_window(cx);
+                self.set_status(message, cx);
+                cx.notify();
+                return;
+            }
+            DictLoadState::Ready { .. } => {}
+        }
+
+        self.dictionary.request = self.dictionary.request.wrapping_add(1);
+        let request = self.dictionary.request;
+        self.dictionary.word = term.clone();
+        self.dictionary.loading = true;
+        self.dictionary.not_found = false;
+        self.dictionary.error = None;
+        self.dictionary.entries.clear();
+        self.dictionary.pending_term = None;
+        self.dictionary.open = true;
+        self.ensure_dictionary_window(cx);
+
+        if let Err(error) = self
+            .dict
+            .commands
+            .send(DictCommand::Lookup { request, term })
+        {
+            self.dictionary.loading = false;
+            self.dictionary.error = Some(format!("词典线程不可用: {error}"));
+            self.sync_dictionary_window(cx);
+        }
+        cx.notify();
+    }
+
+    fn lookup_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.viewer.selection.text(self.viewer.chars()) else {
+            return;
+        };
+        self.lookup_word(text, cx);
+    }
+
+    pub(crate) fn toggle_dictionary_window(&mut self, cx: &mut Context<Self>) {
+        let alive = self
+            .dictionary_window
+            .is_some_and(|handle| handle.update(cx, |_view, _window, _cx| ()).is_ok());
+
+        if alive {
+            self.close_dictionary_window(cx);
+            return;
+        }
+
+        self.dictionary_window = None;
+        if self.settings.current.dictionary_path.is_none() {
+            self.settings_open = true;
+            self.set_status("请先在设置中选择 MDX 词典", cx);
+            cx.notify();
+            return;
+        }
+
+        self.ensure_dictionary_window(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn ensure_dictionary_window(&mut self, cx: &mut Context<Self>) {
+        let view = DictionaryView::from(&self.dictionary);
+        let theme = self.theme.clone();
+
+        if let Some(handle) = self.dictionary_window {
+            match handle.update(cx, |window, _window, cx| window.apply(view, theme, cx)) {
+                Ok(()) => return,
+                Err(_) => self.dictionary_window = None,
+            }
+        }
+
+        let view = DictionaryView::from(&self.dictionary);
+        let theme = self.theme.clone();
+        let bounds = match (self.main_window_bounds, self.display_bounds) {
+            (Some(main), Some(display)) => {
+                let work = rect_f(display);
+                let window_size = dictionary_window_size(work);
+                let (x, y) = crate::window_layout::adjacent_origin(
+                    rect_f(main),
+                    (f32::from(window_size.width), f32::from(window_size.height)),
+                    work,
+                    12.0,
+                );
+                Bounds::new(point(px(x), px(y)), window_size)
+            }
+            _ => Bounds::centered(
+                None,
+                dictionary_window_size(crate::window_layout::RectF::new(0.0, 0.0, 1920.0, 1080.0)),
+                cx,
+            ),
+        };
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some("词典".into()),
+                // 和主窗口一样自绘标题栏，不要系统标题栏。
+                appears_transparent: true,
+                ..Default::default()
+            }),
+            is_minimizable: false,
+            // 不抢主窗口的键盘焦点：查词时阅读器快捷键仍然可用。
+            focus: false,
+            window_min_size: Some(size(px(280.), px(320.))),
+            ..Default::default()
+        };
+
+        match cx.open_window(options, move |_window, cx| {
+            cx.new(|_cx| DictionaryWindow::new(view, theme))
+        }) {
+            Ok(handle) => {
+                self.dictionary_window = Some(handle);
+                self.dictionary.open = true;
+                log::info!("dictionary window opened");
+            }
+            Err(error) => {
+                self.dictionary.open = false;
+                self.set_status(format!("无法打开词典窗口: {error}"), cx);
+            }
+        }
+    }
+
+    fn sync_dictionary_window(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = self.dictionary_window else {
+            return;
+        };
+        let view = DictionaryView::from(&self.dictionary);
+        let theme = self.theme.clone();
+
+        if handle
+            .update(cx, |window, _window, cx| window.apply(view, theme, cx))
+            .is_err()
+        {
+            self.dictionary_window = None;
+            self.dictionary.open = false;
+        }
+    }
+
+    pub(crate) fn close_dictionary_window(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.dictionary_window.take() {
+            let _ = handle.update(cx, |_window, window, _cx| window.remove_window());
+        }
+        self.dictionary.open = false;
+        cx.notify();
+    }
+
+    pub(crate) fn choose_dictionary(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择 MDX 词典".into()),
+        });
+
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                let _ = this.update(cx, |this, cx| this.set_dictionary_path(path, cx));
+            }
+        })
+        .detach();
+    }
+
+    fn set_dictionary_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let is_mdx = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("mdx"));
+        if !is_mdx || !path.is_file() {
+            self.set_status("请选择 .mdx 词典文件", cx);
+            cx.notify();
+            return;
+        }
+
+        self.settings.current.dictionary_path = Some(path.clone());
+        self.settings.save();
+        self.dictionary.clear_results();
+        self.dictionary.load_state = DictLoadState::Loading;
+        self.settings_open = false;
+        self.sync_dictionary_window(cx);
+
+        let _ = self.dict.commands.send(DictCommand::Load { path });
+        self.set_status("正在加载词典…", cx);
+        cx.notify();
+    }
+
+    pub(crate) fn clear_dictionary(&mut self, cx: &mut Context<Self>) {
+        self.settings.current.dictionary_path = None;
+        self.settings.save();
+        let _ = self.dict.commands.send(DictCommand::Unload);
+        self.dictionary.clear_results();
+        self.dictionary.load_state = DictLoadState::Unconfigured;
+        self.sync_dictionary_window(cx);
+        self.set_status("已清除词典", cx);
         cx.notify();
     }
 
@@ -467,6 +931,9 @@ impl AppState {
         self.viewer.close();
         self.last_progress = None;
         self.outline_open = false;
+        self.settings_open = false;
+        self.dictionary.clear_results();
+        self.close_dictionary_window(cx);
         self.home.menu_open = None;
         self.home.search_focused = false;
         self.home.query.clear();
@@ -496,6 +963,8 @@ impl AppState {
                 self.home.record(path.clone(), name.clone());
                 self.home.query.clear();
                 self.home.search_focused = false;
+                self.dictionary.clear_results();
+                self.sync_dictionary_window(cx);
                 self.viewer.reset(
                     Document {
                         path,
@@ -750,6 +1219,7 @@ impl AppState {
         if event.click_count >= 2 {
             self.select_word_at(index);
             self.viewer.selection.dragging = true;
+            self.lookup_selection(cx);
         } else {
             self.viewer.selection.start_at(index);
         }
@@ -812,6 +1282,7 @@ impl AppState {
             match keystroke.key.as_str() {
                 "o" => self.open_pdf(window, cx),
                 "d" => self.toggle_theme(cx),
+                "," => self.toggle_settings(cx),
                 "q" => {
                     self.flush_progress();
                     cx.quit();
@@ -828,10 +1299,16 @@ impl AppState {
 
         match keystroke.key.as_str() {
             "escape" => {
-                self.home.query.clear();
-                self.home.menu_open = None;
-                self.home.search_focused = false;
-                cx.notify();
+                if self.settings_open {
+                    self.toggle_settings(cx);
+                } else if self.dictionary_window.is_some() {
+                    self.close_dictionary_window(cx);
+                } else {
+                    self.home.query.clear();
+                    self.home.menu_open = None;
+                    self.home.search_focused = false;
+                    cx.notify();
+                }
             }
             "backspace" => {
                 if self.home.query.pop().is_some() {
@@ -887,6 +1364,11 @@ impl AppState {
             }
         }
 
+        if control && keystroke.modifiers.shift && keystroke.key.eq_ignore_ascii_case("d") {
+            self.toggle_dictionary_window(cx);
+            return;
+        }
+
         if control {
             match keystroke.key.as_str() {
                 "o" => self.open_pdf(window, cx),
@@ -917,6 +1399,10 @@ impl AppState {
                 }
                 "d" => {
                     self.toggle_theme(cx);
+                    return;
+                }
+                "," => {
+                    self.toggle_settings(cx);
                     return;
                 }
                 "b" => {
@@ -963,9 +1449,15 @@ impl AppState {
                     return;
                 }
                 "escape" => {
-                    self.viewer.selection.clear();
-                    self.outline_open = false;
-                    cx.notify();
+                    if self.settings_open {
+                        self.toggle_settings(cx);
+                    } else if self.dictionary_window.is_some() {
+                        self.close_dictionary_window(cx);
+                    } else {
+                        self.viewer.selection.clear();
+                        self.outline_open = false;
+                        cx.notify();
+                    }
                     return;
                 }
                 _ => {}
@@ -999,6 +1491,10 @@ impl Render for AppState {
         let viewport_changed = self.viewport != viewport;
         self.viewport = viewport;
         self.scale_factor = window.scale_factor();
+        self.main_window_bounds = Some(window.bounds());
+        self.display_bounds = window
+            .display(&**cx)
+            .map(|display| display.visible_bounds());
 
         if viewport_changed && self.viewer.has_document() && self.refit() {
             self.request_render();
@@ -1045,10 +1541,31 @@ impl Render for AppState {
         if let Some(panel) = self.outline_panel(&theme, cx) {
             root = root.child(panel);
         }
+        if let Some(panel) = self.settings_panel(&theme, cx) {
+            root = root.child(panel);
+        }
         if self.viewer.search.open {
             root = root.child(self.search_overlay(&theme));
         }
 
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_term_trims_punctuation_and_takes_first_line() {
+        assert_eq!(normalize_term("  \"apple\",\nsecond"), "apple");
+        assert_eq!(normalize_term("（你好）"), "你好");
+        assert_eq!(normalize_term("..."), "");
+    }
+
+    #[test]
+    fn normalize_term_caps_length() {
+        let term = normalize_term(&"a".repeat(100));
+        assert_eq!(term.chars().count(), 64);
     }
 }

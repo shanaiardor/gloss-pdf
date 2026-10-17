@@ -87,13 +87,25 @@ impl AppState {
                     this.add_highlight(cx);
                 }),
             ))
-            .child(save)
             .child(pill_button(
-                "theme",
-                "主题",
+                "dictionary",
+                if self.dictionary_window.is_some() {
+                    "词典 ·"
+                } else {
+                    "词典"
+                },
                 theme,
                 cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                    this.toggle_theme(cx);
+                    this.toggle_dictionary_window(cx);
+                }),
+            ))
+            .child(save)
+            .child(pill_button(
+                "settings",
+                "设置",
+                theme,
+                cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.toggle_settings(cx);
                 }),
             ));
 
