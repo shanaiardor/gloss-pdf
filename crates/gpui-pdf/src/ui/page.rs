@@ -1,10 +1,14 @@
-﻿//! 页面区域：滚动容器、页面位图、选择/搜索/高亮/链接覆盖层。
+﻿//! 页面区域：连续滚动的页面列、每页位图与选择/搜索/高亮/链接覆盖层。
+//!
+//! 整篇文档是**一列绝对定位的页面**：每页的 top/left 由 `DocumentLayout` 算好，
+//! 总高度固定，所以只渲染可视范围附近的几页也不影响滚动条长度和滚动位移。
 
 use gpui::{Context, MouseButton, div, img, prelude::*, px};
 use pdf_core::RectPt;
 
-use crate::app::{AppState, BOTTOM_INSET, PAGE_PAD, PageLayout, TOP_INSET};
+use crate::app::AppState;
 use crate::geometry::merge_rects;
+use crate::layout::{DocumentLayout, PREFETCH_PAGES};
 use crate::theme::Theme;
 use crate::ui::empty::empty_state;
 
@@ -14,37 +18,61 @@ impl AppState {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let layout = self
-            .viewer
-            .page_size()
-            .map(|page| PageLayout::new(page, self.viewer.zoom, self.viewport));
-        let center = layout.map_or(0.0, |layout| layout.center);
-
-        div()
+        let container = div()
             .id("page-scroll")
             .size_full()
             .overflow_scroll()
             .track_scroll(&self.viewer.scroll)
-            .child(
-                div()
-                    .px(px(PAGE_PAD))
-                    .pt(px(TOP_INSET))
-                    .pb(px(BOTTOM_INSET))
-                    .child(div().ml(px(center)).child(self.page_view(theme, cx))),
-            )
+            // 拖选挂在容器上：指针滑出页面甚至滑到别的页也能继续扩展选区。
+            .on_mouse_move(cx.listener(Self::on_page_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_page_mouse_up));
+
+        let Some(layout) = self.doc_layout() else {
+            return container.child(empty_state(theme, cx));
+        };
+        if layout.is_empty() {
+            return container.child(empty_state(theme, cx));
+        }
+
+        let range = layout.visible_range(
+            self.scroll_top(),
+            f32::from(self.viewport.height),
+            PREFETCH_PAGES,
+        );
+
+        container.child(
+            div()
+                .relative()
+                .w(px(layout.content_width))
+                .h(px(layout.content_height))
+                .children(range.map(|page| self.page_view(page, &layout, theme, cx))),
+        )
     }
 
-    pub(crate) fn page_view(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
-        let Some(page_size) = self.viewer.page_size() else {
-            return empty_state(theme, cx);
+    /// 一页：位图或占位，加上这一页自己的高亮/搜索命中/选区/链接覆盖层。
+    fn page_view(
+        &self,
+        index: usize,
+        layout: &DocumentLayout,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let Some(geometry) = layout.page_box(index) else {
+            return div();
+        };
+        let Some(page_size) = self.viewer.page_size_at(index) else {
+            return div();
         };
 
         let zoom = self.viewer.zoom;
-        let width = page_size.width * zoom;
-        let height = page_size.height * zoom;
+        let width = geometry.width;
+        let height = geometry.height;
 
-        let Some(page) = &self.viewer.page else {
+        let Some(page) = self.viewer.page(index) else {
             return div()
+                .absolute()
+                .left(px(geometry.left))
+                .top(px(geometry.top))
                 .w(px(width))
                 .h(px(height))
                 .flex()
@@ -58,7 +86,7 @@ impl AppState {
 
         let mut overlays: Vec<gpui::AnyElement> = Vec::new();
 
-        for highlight in self.viewer.highlights.for_page(self.viewer.current_page) {
+        for highlight in self.viewer.highlights.for_page(index) {
             for rect in &highlight.rects {
                 overlays.push(
                     rect_overlay(rect, page_size.height, zoom, theme.highlight).into_any_element(),
@@ -67,8 +95,9 @@ impl AppState {
         }
 
         let search = &self.viewer.search;
-        for (index, range) in search.matches.iter().enumerate() {
-            let color = if index == search.current {
+        let active = search.active_page() == index;
+        for (match_index, range) in search.matches_for(index).iter().enumerate() {
+            let color = if active && match_index == search.current {
                 theme.search_current
             } else {
                 theme.search_hit
@@ -82,18 +111,20 @@ impl AppState {
             }
         }
 
-        for rect in self.viewer.selection.rects(&page.chars) {
-            overlays.push(
-                rect_overlay(&rect, page_size.height, zoom, theme.selection).into_any_element(),
-            );
+        if self.viewer.selection.page == Some(index) {
+            for rect in self.viewer.selection.rects(&page.chars) {
+                overlays.push(
+                    rect_overlay(&rect, page_size.height, zoom, theme.selection).into_any_element(),
+                );
+            }
         }
 
-        for (index, link) in page.links.iter().enumerate() {
+        for (link_index, link) in page.links.iter().enumerate() {
             let rect = link.rect;
             let target = link.target.clone();
             overlays.push(
                 div()
-                    .id(100_000 + index)
+                    .id(index * 100_000 + link_index)
                     .absolute()
                     .left(px(rect.left * zoom))
                     .top(px((page_size.height - rect.top) * zoom))
@@ -109,17 +140,28 @@ impl AppState {
             );
         }
 
+        // 外层只负责把这页放到文档里的位置，内层才是页面本身（覆盖层的定位基准）。
         div()
-            .relative()
+            .absolute()
+            .left(px(geometry.left))
+            .top(px(geometry.top))
             .w(px(width))
             .h(px(height))
-            .bg(gpui::white())
-            .shadow_lg()
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_page_mouse_down))
-            .on_mouse_move(cx.listener(Self::on_page_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_page_mouse_up))
-            .child(img(page.image.clone()).w_full().h_full())
-            .children(overlays)
+            .child(
+                div()
+                    .relative()
+                    .size_full()
+                    .bg(gpui::white())
+                    .shadow_lg()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, _window, cx| {
+                            this.on_page_mouse_down(index, event, cx);
+                        }),
+                    )
+                    .child(img(page.image.clone()).w_full().h_full())
+                    .children(overlays),
+            )
     }
 }
 

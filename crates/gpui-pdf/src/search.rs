@@ -1,11 +1,13 @@
-﻿//! 搜索状态：查询串、当前页匹配、全文命中与跨页跳转。
+﻿//! 搜索状态：查询串、逐页匹配、全文命中与跨页跳转。
 //!
-//! 两个层次：
-//! - **本页匹配**：`matches` 是当前页字符下标的区间，用来画高亮块。
+//! 三个层次：
+//! - **逐页匹配**：`page_matches` 记录每一页的匹配区间，连续滚动时多页同时可见都能画高亮。
+//! - **本页匹配**：`matches` 是「活动页」（锚线所在页）的匹配，`current` 指出当前第几个。
 //! - **全文命中**：`pages` 记录每页命中数（由 PDF worker 统计），`doc_index` 是
 //!   当前命中在全文里的序号。`Enter` 在全文范围内循环，跳到别的页时把该页的
 //!   第 N 个匹配记在 `pending`，等页面渲染完再选中它。
 
+use std::collections::HashMap;
 use std::ops::RangeInclusive;
 
 use pdf_core::{CharBox, PageHits};
@@ -14,9 +16,9 @@ use pdf_core::{CharBox, PageHits};
 pub struct SearchState {
     pub open: bool,
     pub query: String,
-    /// 当前页的匹配区间。
+    /// 活动页的匹配区间。
     pub matches: Vec<RangeInclusive<usize>>,
-    /// 当前页里被选中的匹配序号。
+    /// 活动页里被选中的匹配序号。
     pub current: usize,
     /// 全文命中：只含有命中的页，按页码升序。
     pub pages: Vec<PageHits>,
@@ -26,6 +28,10 @@ pub struct SearchState {
     pub doc_index: Option<usize>,
     /// 全文搜索是否在跑。
     pub scanning: bool,
+    /// 每页的匹配区间，连续滚动时逐页画高亮用。
+    page_matches: HashMap<usize, Vec<RangeInclusive<usize>>>,
+    /// `matches` / `current` 属于哪一页。
+    active_page: usize,
     /// 等页面渲染完要选中的页内序号。
     pending: Option<(usize, usize)>,
 }
@@ -52,53 +58,60 @@ impl SearchState {
         self.total = 0;
         self.doc_index = None;
         self.scanning = false;
+        self.page_matches.clear();
         self.pending = None;
     }
 
-    /// 重新计算当前页匹配。`page` 用来判断刚跳过来的目标页要不要定位到第 N 个。
-    pub fn recompute(&mut self, chars: &[CharBox], page: usize) {
+    /// 只清逐页缓存（查询串变了，旧的匹配全部作废）。
+    pub fn clear_page_matches(&mut self) {
+        self.page_matches.clear();
         self.matches.clear();
         self.current = 0;
+    }
 
-        if !self.open || self.query.is_empty() {
-            return;
-        }
+    pub fn active_page(&self) -> usize {
+        self.active_page
+    }
 
-        let needle: Vec<char> = self.query.to_lowercase().chars().collect();
-        let haystack: Vec<char> = chars
-            .iter()
-            .map(|character| {
-                character
-                    .ch
-                    .to_lowercase()
-                    .next()
-                    .unwrap_or(character.ch)
-            })
-            .collect();
+    /// 某一页的匹配区间，画高亮用。
+    pub fn matches_for(&self, page: usize) -> &[RangeInclusive<usize>] {
+        self.page_matches
+            .get(&page)
+            .map(|matches| matches.as_slice())
+            .unwrap_or_default()
+    }
 
-        if needle.is_empty() || needle.len() > haystack.len() {
-            return;
-        }
+    /// 重新计算活动页的匹配，并把结果写进逐页缓存。
+    ///
+    /// 目标页还没渲染时 `chars` 是空的，这里不能把待定位的序号丢掉，
+    /// 等这一页的字符数据到了再定位。
+    pub fn recompute(&mut self, chars: &[CharBox], page: usize) {
+        let matches = find_matches(&self.query, chars);
+        self.active_page = page;
+        self.page_matches.insert(page, matches.clone());
+        self.matches = matches;
+        self.current = 0;
 
-        let mut start = 0;
-        while start + needle.len() <= haystack.len() {
-            if haystack[start..start + needle.len()] == needle[..] {
-                self.matches
-                    .push(start..=start + needle.len() - 1);
-                start += needle.len();
-            } else {
-                start += 1;
-            }
-        }
-
-        // 目标页还没渲染时 `chars` 是空的，这里不能把待定位的序号丢掉，
-        // 等这一页的字符数据到了再定位。
         if !self.matches.is_empty()
             && let Some((target_page, local)) = self.pending
             && target_page == page
         {
             self.current = local.min(self.matches.len() - 1);
             self.pending = None;
+        }
+    }
+
+    /// 缓存非活动页的匹配，不动 `matches` / `current`。
+    pub fn cache_page(&mut self, chars: &[CharBox], page: usize) {
+        if !self.open || self.query.is_empty() {
+            self.page_matches.remove(&page);
+            return;
+        }
+        let matches = find_matches(&self.query, chars);
+        if matches.is_empty() {
+            self.page_matches.remove(&page);
+        } else {
+            self.page_matches.insert(page, matches);
         }
     }
 
@@ -181,6 +194,35 @@ impl SearchState {
         }
         self.doc_index = index.checked_sub(1);
     }
+}
+
+/// 在单页字符里找所有不重叠的命中，返回字符下标区间（不是字节下标）。
+fn find_matches(query: &str, chars: &[CharBox]) -> Vec<RangeInclusive<usize>> {
+    let needle: Vec<char> = query.to_lowercase().chars().collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+
+    let haystack: Vec<char> = chars
+        .iter()
+        .map(|character| character.ch.to_lowercase().next().unwrap_or(character.ch))
+        .collect();
+
+    let mut matches = Vec::new();
+    if needle.len() > haystack.len() {
+        return matches;
+    }
+
+    let mut start = 0;
+    while start + needle.len() <= haystack.len() {
+        if haystack[start..start + needle.len()] == needle[..] {
+            matches.push(start..=start + needle.len() - 1);
+            start += needle.len();
+        } else {
+            start += 1;
+        }
+    }
+    matches
 }
 
 #[cfg(test)]
@@ -343,6 +385,40 @@ mod tests {
             ..Default::default()
         };
         search.recompute(&chars("anything"), 0);
+        assert!(search.matches.is_empty());
+    }
+
+    #[test]
+    fn cached_matches_are_kept_per_page() {
+        let mut search = SearchState {
+            open: true,
+            query: "o".into(),
+            ..Default::default()
+        };
+        search.recompute(&chars("foo"), 0);
+        // 连续滚动时别的页也要画高亮，但活动页仍是 0。
+        search.cache_page(&chars("tool"), 3);
+
+        assert_eq!(search.matches_for(0).len(), 2);
+        assert_eq!(search.matches_for(3).len(), 2);
+        assert!(search.matches_for(1).is_empty());
+        assert_eq!(search.active_page(), 0);
+        assert_eq!(search.matches.len(), 2);
+        assert_eq!(search.current, 0);
+    }
+
+    #[test]
+    fn clearing_page_matches_keeps_the_query() {
+        let mut search = SearchState {
+            open: true,
+            query: "o".into(),
+            ..Default::default()
+        };
+        search.recompute(&chars("foo"), 0);
+        search.clear_page_matches();
+
+        assert_eq!(search.query, "o");
+        assert!(search.matches_for(0).is_empty());
         assert!(search.matches.is_empty());
     }
 }

@@ -19,52 +19,22 @@ use crate::dictionary::{DictLoadState, DictionaryState, DictionaryView};
 use crate::highlights::sidecar_path;
 use crate::home::{HomeNav, HomeState};
 use crate::layout::{
-    FitArea, FitMode, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, SCREEN_MARGIN, VERTICAL_INSETS,
-    WINDOW_FILL, window_size_for_page,
+    DocumentLayout, FitArea, FitMode, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, PREFETCH_PAGES,
+    SCREEN_MARGIN, WINDOW_FILL, window_size_for_page,
 };
 use crate::progress::{ReadingProgress, unix_now};
 use crate::settings::SettingsStore;
 use crate::theme::Theme;
 use crate::ui::dictionary::DictionaryWindow;
 use crate::ui::text_input::{TextInput, TextInputEvent};
-use crate::viewer::{Document, PageData, Viewer, scroll_offset_for_ratio};
-
-pub(crate) use crate::layout::{BOTTOM_INSET, PAGE_PAD, TOP_INSET};
+use crate::viewer::{Document, PageData, Viewer};
 
 /// 页内滚动没有独立事件，用固定间隔采样阅读位置。
 const PROGRESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// 连续滚动时合并写盘，避免每一帧都碰磁盘。
 const PROGRESS_FLUSH_DELAY: Duration = Duration::from_millis(800);
-
-/// 页面在滚动容器里的尺寸与居中偏移，恢复阅读进度时也用它算内容高度。
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PageLayout {
-    pub page_width: f32,
-    pub page_height: f32,
-    pub center: f32,
-}
-
-impl PageLayout {
-    pub fn new(page: PageSize, zoom: f32, viewport: Size<gpui::Pixels>) -> Self {
-        let page_width = page.width * zoom;
-        let page_height = page.height * zoom;
-        let available = f32::from(viewport.width) - PAGE_PAD * 2.0;
-        let center = ((available - page_width) / 2.0).max(0.0);
-        Self {
-            page_width,
-            page_height,
-            center,
-        }
-    }
-
-    /// 滚动内容的实际尺寸：左右页边距 + 居中留白，以及上下浮动胶囊留白。
-    pub fn content_size(&self) -> (f32, f32) {
-        (
-            PAGE_PAD * 2.0 + self.center + self.page_width,
-            VERTICAL_INSETS + self.page_height,
-        )
-    }
-}
+/// PageDown/PageUp 一次滚过视口高度的比例，留一点重叠方便接续阅读。
+const PAGE_SCROLL_OVERLAP: f32 = 0.9;
 
 /// 窗口当前还能长到多大（内容尺寸）。
 ///
@@ -413,7 +383,8 @@ impl AppState {
 
     fn current_progress(&self) -> Option<ReadingProgress> {
         let doc = self.viewer.doc.as_ref()?;
-        let (scroll_x, scroll_y) = self.viewer.scroll_ratios();
+        let layout = self.doc_layout()?;
+        let (page, ratio_y) = self.reading_anchor(&layout);
         // serde_json 不接受 NaN/Infinity，缩放异常时退回 1.0。
         let zoom = if self.viewer.zoom.is_finite() {
             self.viewer.zoom
@@ -421,13 +392,13 @@ impl AppState {
             1.0
         };
         Some(ReadingProgress {
-            page: self.viewer.current_page,
+            page,
             pages: doc.pages.len(),
             zoom,
             // 新记录总是带模式，包括手动缩放（free）；缺字段表示旧版本。
             fit: Some(self.viewer.fit_mode),
-            scroll_x,
-            scroll_y,
+            scroll_x: self.scroll_ratio_x(&layout),
+            scroll_y: ratio_y,
             updated_at: unix_now(),
         })
     }
@@ -456,33 +427,87 @@ impl AppState {
 
     /// 用当前视口把恢复出来的页内比例换算成滚动偏移。
     fn apply_pending_scroll(&mut self) {
-        if let Some(ratios) = self.viewer.take_pending_scroll() {
-            self.set_scroll_ratios(ratios);
+        let Some((page, ratio_x, ratio_y)) = self.viewer.take_pending_scroll() else {
+            return;
+        };
+        let Some(layout) = self.doc_layout() else {
+            return;
+        };
+        self.scroll_to_anchor(&layout, page, ratio_y);
+
+        // 横向：页面比视口宽时按比例还原，否则保持最左。
+        let max_x = (layout.content_width - f32::from(self.viewport.width)).max(0.0);
+        if max_x > 0.0 {
+            let mut offset = self.viewer.scroll.offset();
+            offset.x = px(-ratio_x.clamp(0.0, 1.0) * max_x);
+            self.viewer.scroll.set_offset(offset);
         }
     }
 
-    /// 按当前缩放和视口设置页内滚动位置。
-    fn set_scroll_ratios(&mut self, (ratio_x, ratio_y): (f32, f32)) {
-        let Some(page) = self.viewer.page_size() else {
+    // ---------- 滚动几何 ----------
+
+    /// 当前缩放和视口下的整篇排版。
+    ///
+    /// 每页只算几下浮点，一帧调用两三次（同步页码、补渲染、画页面）不构成瓶颈；
+    /// 不缓存是有意的：缩放、窗口宽度、文档任一变化都不必操心失效。
+    pub(crate) fn doc_layout(&self) -> Option<DocumentLayout> {
+        let doc = self.viewer.doc.as_ref()?;
+        Some(DocumentLayout::new(
+            &doc.pages,
+            self.viewer.zoom,
+            f32::from(self.viewport.width),
+        ))
+    }
+
+    /// 滚动内容上边缘在内容坐标里的位置；0 表示贴顶。
+    pub(crate) fn scroll_top(&self) -> f32 {
+        -f32::from(self.viewer.scroll.offset().y)
+    }
+
+    /// 设置滚动顶部位置，夹在内容范围内。
+    fn set_scroll_top(&self, layout: &DocumentLayout, top: f32) {
+        let top = layout.clamp_scroll_top(top, f32::from(self.viewport.height));
+        let mut offset = self.viewer.scroll.offset();
+        offset.y = px(-top);
+        self.viewer.scroll.set_offset(offset);
+    }
+
+    /// 阅读锚点：视口中线落在第几页、页内比例多少。
+    ///
+    /// 页码判定、进度保存、缩放前后对齐位置都用这一个锚点。
+    fn reading_anchor(&self, layout: &DocumentLayout) -> (usize, f32) {
+        layout.anchor_at(self.scroll_top(), f32::from(self.viewport.height))
+    }
+
+    /// 把锚点挪到「第 `page` 页的 `ratio` 处」。
+    fn scroll_to_anchor(&self, layout: &DocumentLayout, page: usize, ratio: f32) {
+        let top = layout.scroll_top_for_anchor(page, ratio, f32::from(self.viewport.height));
+        self.set_scroll_top(layout, top);
+    }
+
+    /// 横向滚动比例：0 是最左，1 是最右。
+    fn scroll_ratio_x(&self, layout: &DocumentLayout) -> f32 {
+        let max = (layout.content_width - f32::from(self.viewport.width)).max(0.0);
+        if max <= 0.0 {
+            return 0.0;
+        }
+        let ratio = (-f32::from(self.viewer.scroll.offset().x) / max).clamp(0.0, 1.0);
+        if ratio == 0.0 { 0.0 } else { ratio }
+    }
+
+    /// 按视口高度滚动一屏（PageDown / PageUp / 空格）。
+    fn scroll_by_viewport(&mut self, direction: f32, cx: &mut Context<Self>) {
+        let Some(layout) = self.doc_layout() else {
             return;
         };
-
-        let layout = PageLayout::new(page, self.viewer.zoom, self.viewport);
-        let (content_width, content_height) = layout.content_size();
-        let viewport_width = f32::from(self.viewport.width);
-        let viewport_height = f32::from(self.viewport.height);
-        self.viewer.scroll.set_offset(point(
-            px(scroll_offset_for_ratio(
-                ratio_x,
-                content_width,
-                viewport_width,
-            )),
-            px(scroll_offset_for_ratio(
-                ratio_y,
-                content_height,
-                viewport_height,
-            )),
-        ));
+        let step = f32::from(self.viewport.height) * PAGE_SCROLL_OVERLAP;
+        self.set_scroll_top(&layout, self.scroll_top() + direction * step);
+        self.ensure_visible_pages();
+        self.sync_current_page();
+        if self.capture_progress() {
+            self.schedule_progress_flush(cx);
+        }
+        cx.notify();
     }
 
     // ---------- 文档与渲染 ----------
@@ -721,7 +746,7 @@ impl AppState {
     }
 
     fn lookup_selection(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = self.viewer.selection.text(self.viewer.chars()) else {
+        let Some(text) = self.viewer.selection.text(self.selection_chars()) else {
             return;
         };
         self.lookup_word(text, cx);
@@ -906,33 +931,86 @@ impl AppState {
         .detach();
     }
 
-    fn request_render(&mut self) {
-        if self.viewer.page_size().is_none() {
+    // ---------- 渲染调度 ----------
+
+    /// 请求渲染一页；同一缩放已在跑或已有同位图时直接跳过。
+    fn ensure_page(&mut self, page: usize) {
+        if page >= self.viewer.page_count() {
             return;
         }
-        self.request_id += 1;
         let scale = (self.viewer.zoom * self.scale_factor).clamp(0.1, 8.0);
-        let _ = self.engine.send(Command::Render {
-            page: self.viewer.current_page,
+        let request = self.request_id + 1;
+        if !self.viewer.begin_request(page, request, scale) {
+            return;
+        }
+        self.request_id = request;
+        if let Err(error) = self.engine.send(Command::Render {
+            page,
             scale,
-            request: self.request_id,
-        });
+            request,
+        }) {
+            log::warn!("渲染请求发送失败: {error}");
+        }
     }
 
+    /// 按可视范围补渲染，并淘汰离得远的位图。
+    ///
+    /// 每一帧都会调用，靠 `Viewer::begin_request` 去重，所以不会重复排队。
+    fn ensure_visible_pages(&mut self) {
+        let Some(layout) = self.doc_layout() else {
+            return;
+        };
+        let range = layout.visible_range(
+            self.scroll_top(),
+            f32::from(self.viewport.height),
+            PREFETCH_PAGES,
+        );
+        for page in range.clone() {
+            self.ensure_page(page);
+        }
+        self.viewer.evict(range);
+    }
+
+    /// 滚动后按锚线更新当前页：读到哪里，页码和搜索高亮就跟到哪里。
+    fn sync_current_page(&mut self) {
+        let Some(layout) = self.doc_layout() else {
+            return;
+        };
+        let (page, _) = self.reading_anchor(&layout);
+        if page == self.viewer.current_page {
+            return;
+        }
+        self.viewer.current_page = page;
+        self.refresh_matches(page);
+    }
+
+    /// 重算某一页的搜索匹配：当前页更新 `matches`，其他页只更新逐页缓存。
+    fn refresh_matches(&mut self, page: usize) {
+        self.viewer.refresh_search(page);
+    }
+
+    /// 跳到某一页：滚到页顶，并立刻安排这一页的渲染。
     pub(crate) fn set_page(&mut self, page: usize, cx: &mut Context<Self>) {
         if !self.viewer.set_page(page) {
             return;
         }
-        self.refit();
-        self.request_render();
-        self.recompute_matches(cx);
+        if let Some(layout) = self.doc_layout() {
+            self.scroll_to_anchor(&layout, page, 0.0);
+        }
+        self.ensure_visible_pages();
+        self.refresh_matches(page);
         self.flush_progress();
         cx.notify();
     }
 
     pub(crate) fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        // 缩放前后保持锚点不动，读者视线不会因缩放跳走。
+        let anchor = self.doc_layout().map(|layout| self.reading_anchor(&layout));
         self.viewer.set_zoom(zoom);
-        self.request_render();
+        if let (Some(layout), Some((page, ratio))) = (self.doc_layout(), anchor) {
+            self.scroll_to_anchor(&layout, page, ratio);
+        }
+        self.ensure_visible_pages();
         self.flush_progress();
         cx.notify();
     }
@@ -946,31 +1024,35 @@ impl AppState {
         )
     }
 
-    /// 视口变化或切页后，按当前适宽/适页模式重算缩放。
+    /// 视口变化后按当前适宽/适页模式重算缩放，并把阅读位置留在原来的锚点上。
     ///
-    /// 返回 `true` 表示缩放或模式变了，调用方需要重新渲染页面。
+    /// 返回 `true` 表示缩放或模式变了，调用方需要重新检查可视页。
     fn refit(&mut self) -> bool {
         let mode = self.viewer.fit_mode;
         if mode == FitMode::Free {
             return false;
         }
 
-        let ratios = self.viewer.scroll_ratios();
+        let anchor = self.doc_layout().map(|layout| self.reading_anchor(&layout));
         if !self.viewer.fit(mode, self.fit_area()) {
             return false;
         }
-        self.set_scroll_ratios(ratios);
+        if let (Some(layout), Some((page, ratio))) = (self.doc_layout(), anchor) {
+            self.scroll_to_anchor(&layout, page, ratio);
+        }
         true
     }
 
     /// 用户主动切换适宽/适页：重算缩放并立即重渲染。
     pub(crate) fn apply_fit(&mut self, mode: FitMode, cx: &mut Context<Self>) {
-        let ratios = self.viewer.scroll_ratios();
+        let anchor = self.doc_layout().map(|layout| self.reading_anchor(&layout));
         if !self.viewer.fit(mode, self.fit_area()) {
             return;
         }
-        self.set_scroll_ratios(ratios);
-        self.request_render();
+        if let (Some(layout), Some((page, ratio))) = (self.doc_layout(), anchor) {
+            self.scroll_to_anchor(&layout, page, ratio);
+        }
+        self.ensure_visible_pages();
         self.flush_progress();
         cx.notify();
     }
@@ -1072,7 +1154,7 @@ impl AppState {
 
                 // 等 render 拿到当前显示器工作区后，按这张纸的比例调整窗口；
                 // 随后视口变化会再按适宽/适页模式重算缩放。
-                self.pending_window_fit = self.viewer.page_size().filter(|page| {
+                self.pending_window_fit = self.viewer.page_size_at(0).filter(|page| {
                     page.width.is_finite()
                         && page.height.is_finite()
                         && page.width > 0.0
@@ -1088,7 +1170,7 @@ impl AppState {
                     self.viewer.highlights.load(&path);
                 }
 
-                self.request_render();
+                self.ensure_visible_pages();
                 if restored {
                     self.set_status(
                         format!(
@@ -1117,29 +1199,34 @@ impl AppState {
                 chars,
                 links,
             } => {
-                if page != self.viewer.current_page || request != self.request_id {
+                // 只认还没作废的请求：缩放变了或页已经滚走，旧位图直接丢掉。
+                let Some(scale) = self.viewer.take_request(page, request) else {
                     return;
-                }
+                };
                 let Some(buffer) = image::RgbaImage::from_raw(width, height, bgra) else {
                     self.set_status("页面位图格式错误", cx);
                     cx.notify();
                     return;
                 };
                 let render_image = RenderImage::new([image::Frame::new(buffer)]);
-                self.viewer.page = Some(PageData {
-                    image: Arc::new(render_image),
-                    chars,
-                    links,
-                });
-                self.recompute_matches(cx);
                 log::info!(
                     "rendered page {}: {}x{}, {} chars, {} links",
                     page,
                     width,
                     height,
-                    self.viewer.page.as_ref().map_or(0, |page| page.chars.len()),
-                    self.viewer.page.as_ref().map_or(0, |page| page.links.len())
+                    chars.len(),
+                    links.len()
                 );
+                self.viewer.store_page(
+                    page,
+                    PageData {
+                        image: Arc::new(render_image),
+                        chars,
+                        links,
+                        scale,
+                    },
+                );
+                self.refresh_matches(page);
             }
             Event::SearchResults {
                 request,
@@ -1171,40 +1258,23 @@ impl AppState {
 
     // ---------- 坐标 ----------
 
-    pub(crate) fn page_origin(&self, window: &Window) -> Point<gpui::Pixels> {
-        let viewport = window.viewport_size();
-        let body_width = f32::from(viewport.width);
-        let page_width = self.viewer.page_size().map_or(0.0, |page| page.width) * self.viewer.zoom;
-        let center = ((body_width - PAGE_PAD * 2.0 - page_width) / 2.0).max(0.0);
+    /// 鼠标位置 → 某一页的页内坐标（像素，原点在页面左上角）。
+    ///
+    /// 连续滚动下页面不再是屏幕原点，位置要减去「滚动偏移 + 这一页在文档里的位置」。
+    /// 超出页面时夹到页边：拖选越过页边界时仍能在这一页里取到最近的字符。
+    fn page_point(&self, page: usize, position: Point<gpui::Pixels>) -> Option<(f32, f32)> {
+        let layout = self.doc_layout()?;
+        let page_box = layout.page_box(page)?;
         let offset = self.viewer.scroll.offset();
-
-        point(
-            px(PAGE_PAD + center + f32::from(offset.x)),
-            px(TOP_INSET + f32::from(offset.y)),
-        )
+        let x = f32::from(position.x) - f32::from(offset.x) - page_box.left;
+        let y = f32::from(position.y) - f32::from(offset.y) - page_box.top;
+        Some((x.clamp(0.0, page_box.width), y.clamp(0.0, page_box.height)))
     }
 
-    fn to_local(&self, position: Point<gpui::Pixels>, window: &Window) -> (f32, f32) {
-        let origin = self.page_origin(window);
-        (
-            f32::from(position.x) - f32::from(origin.x),
-            f32::from(position.y) - f32::from(origin.y),
-        )
-    }
-
-    fn to_pdf(&self, local: (f32, f32)) -> (f32, f32) {
-        let page = self.viewer.page_size().unwrap_or_default();
-        (
-            local.0 / self.viewer.zoom,
-            page.height - local.1 / self.viewer.zoom,
-        )
-    }
-
-    fn hit_char(&self, x: f32, y: f32) -> Option<usize> {
-        let page = self.viewer.page.as_ref()?;
+    fn hit_char(&self, page: usize, x: f32, y: f32) -> Option<usize> {
         let mut best: Option<(f32, usize)> = None;
 
-        for (index, character) in page.chars.iter().enumerate() {
+        for (index, character) in self.viewer.chars_of(page).iter().enumerate() {
             let rect = character.rect;
             if x >= rect.left && x <= rect.right && y >= rect.bottom && y <= rect.top {
                 return Some(index);
@@ -1219,15 +1289,28 @@ impl AppState {
         best.and_then(|(distance, index)| (distance < 24.0).then_some(index))
     }
 
-    fn char_at_point(&self, window: &Window, position: Point<gpui::Pixels>) -> Option<usize> {
-        let (x, y) = self.to_pdf(self.to_local(position, window));
-        self.hit_char(x, y)
+    /// 屏幕位置换算到某一页的 PDF 坐标（pt，原点在左下角，y 向上）。
+    fn char_at_point(&self, page: usize, position: Point<gpui::Pixels>) -> Option<usize> {
+        let (local_x, local_y) = self.page_point(page, position)?;
+        let size = self.viewer.page_size_at(page)?;
+        let x = local_x / self.viewer.zoom;
+        let y = size.height - local_y / self.viewer.zoom;
+        self.hit_char(page, x, y)
+    }
+
+    /// 选区所在页的字符数据；没有选区时为空。
+    fn selection_chars(&self) -> &[pdf_core::CharBox] {
+        self.viewer
+            .selection
+            .page
+            .map(|page| self.viewer.chars_of(page))
+            .unwrap_or_default()
     }
 
     // ---------- 选择 / 高亮 / 搜索 ----------
 
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
-        match self.viewer.selection.text(self.viewer.chars()) {
+        match self.viewer.selection.text(self.selection_chars()) {
             Some(text) if !text.is_empty() => {
                 let count = text.chars().count();
                 log::info!("copied {count} chars: {text:?}");
@@ -1246,39 +1329,38 @@ impl AppState {
         let Some(range) = self.viewer.selection.range() else {
             return;
         };
-        let Some(text) = self.viewer.selection.text(self.viewer.chars()) else {
+        let Some(text) = self.viewer.selection.text(self.selection_chars()) else {
             return;
         };
         log::info!(
             "selection page {} chars {}..={} ({}): {text:?}",
-            self.viewer.current_page + 1,
+            self.viewer.selection.page.unwrap_or(0) + 1,
             range.start(),
             range.end(),
             text.chars().count(),
         );
     }
 
-    fn select_word_at(&mut self, index: usize) {
-        let Some(page) = &self.viewer.page else {
-            return;
-        };
-        self.viewer.selection.select_word(&page.chars, index);
+    fn select_word_at(&mut self, page: usize, index: usize) {
+        self.viewer.select_word_at(page, index);
     }
 
     pub(crate) fn add_highlight(&mut self, cx: &mut Context<Self>) {
-        let rects = self.viewer.selection.rects(self.viewer.chars());
+        // 高亮跟着选区走：在哪一页选的，就写到哪一页。
+        let Some(page) = self.viewer.selection.page else {
+            self.set_status("先选中要标注的文本", cx);
+            cx.notify();
+            return;
+        };
+        let chars = self.viewer.chars_of(page);
+        let rects = self.viewer.selection.rects(chars);
         if rects.is_empty() {
             self.set_status("先选中要标注的文本", cx);
             cx.notify();
             return;
         }
 
-        let page = self.viewer.current_page;
-        let text = self
-            .viewer
-            .selection
-            .text(self.viewer.chars())
-            .unwrap_or_default();
+        let text = self.viewer.selection.text(chars).unwrap_or_default();
         let added = self.viewer.highlights.add(page, rects, text).is_some();
         if added {
             self.set_status("已添加高亮，Ctrl+S 保存", cx);
@@ -1342,15 +1424,10 @@ impl AppState {
         cx.notify();
     }
 
+    /// 重新计算当前页的搜索匹配（查询变了、切页后、页面刚渲染完都要调）。
     fn recompute_matches(&mut self, cx: &mut Context<Self>) {
-        let chars = self
-            .viewer
-            .page
-            .as_ref()
-            .map(|page| page.chars.as_slice())
-            .unwrap_or_default();
         let page = self.viewer.current_page;
-        self.viewer.search.recompute(chars, page);
+        self.refresh_matches(page);
         cx.notify();
     }
 
@@ -1375,9 +1452,13 @@ impl AppState {
         cx.notify();
     }
 
-    /// 查询串变化：先算本页匹配，再请 worker 统计全文。
+    /// 查询串变化：逐页缓存全部作废，已渲染的页立刻重算，再请 worker 统计全文。
     pub(crate) fn on_search_query_changed(&mut self, cx: &mut Context<Self>) {
-        self.recompute_matches(cx);
+        self.viewer.search.clear_page_matches();
+        for page in self.viewer.cached_pages() {
+            self.refresh_matches(page);
+        }
+        self.refresh_matches(self.viewer.current_page);
         self.request_doc_search(cx);
     }
 
@@ -1425,35 +1506,40 @@ impl AppState {
 
     // ---------- 交互 ----------
 
+    /// 在某一页上按下鼠标：起点归到这一页，之后拖动只在这一页里扩展。
     pub(crate) fn on_page_mouse_down(
         &mut self,
+        page: usize,
         event: &MouseDownEvent,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.char_at_point(window, event.position) else {
+        let Some(index) = self.char_at_point(page, event.position) else {
             return;
         };
         if event.click_count >= 2 {
-            self.select_word_at(index);
+            self.select_word_at(page, index);
             self.viewer.selection.dragging = true;
             self.lookup_selection(cx);
         } else {
-            self.viewer.selection.start_at(index);
+            self.viewer.selection.start_at(page, index);
         }
         cx.notify();
     }
 
+    /// 拖选：挂在滚动容器上，指针滑出页面（甚至滑到别的页）也能继续扩展选区。
     pub(crate) fn on_page_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.viewer.selection.dragging || event.pressed_button != Some(MouseButton::Left) {
             return;
         }
-        if let Some(index) = self.char_at_point(window, event.position) {
+        let Some(page) = self.viewer.selection.page else {
+            return;
+        };
+        if let Some(index) = self.char_at_point(page, event.position) {
             self.viewer.selection.extend_to(index);
             cx.notify();
         }
@@ -1674,12 +1760,21 @@ impl AppState {
             }
         } else {
             match keystroke.key.as_str() {
-                "pagedown" | "right" | "space" => {
+                // 连续滚动下 PageDown / 空格滚动一屏，左右键才是整页跳。
+                "pagedown" | "space" => {
+                    self.scroll_by_viewport(1.0, cx);
+                    return;
+                }
+                "pageup" => {
+                    self.scroll_by_viewport(-1.0, cx);
+                    return;
+                }
+                "right" => {
                     let next = self.viewer.current_page + 1;
                     self.set_page(next, cx);
                     return;
                 }
-                "pageup" | "left" => {
+                "left" => {
                     if self.viewer.current_page > 0 {
                         let previous = self.viewer.current_page - 1;
                         self.set_page(previous, cx);
@@ -1737,8 +1832,15 @@ impl Render for AppState {
             .display(&**cx)
             .map(|display| display.visible_bounds());
 
-        if viewport_changed && self.viewer.has_document() && self.refit() {
-            self.request_render();
+        if viewport_changed && self.viewer.has_document() {
+            // 适宽/适页在窗口变化后要重算缩放，阅读位置保持在同一个锚点上。
+            self.refit();
+        }
+
+        if self.viewer.has_document() {
+            // 滚动条每帧都在动：先把「读到第几页」对齐到最新偏移，再补渲染可视页。
+            self.sync_current_page();
+            self.ensure_visible_pages();
         }
 
         let theme = self.theme.clone();

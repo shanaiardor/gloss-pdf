@@ -1,4 +1,7 @@
 ﻿//! 文本选择状态：锚点/焦点字符索引，以及从字符包围盒重建矩形与文本。
+//!
+//! 连续滚动下选区属于某一页：`page` 记住这组字符下标是哪一页的，
+//! 覆盖层和复制都按这一页取数据。
 
 use std::ops::RangeInclusive;
 
@@ -8,6 +11,8 @@ use crate::geometry::merge_rects;
 
 #[derive(Default)]
 pub struct Selection {
+    /// 选区所在页；选区为空时为 `None`。
+    pub page: Option<usize>,
     pub anchor: Option<usize>,
     pub focus: Option<usize>,
     pub dragging: bool,
@@ -15,12 +20,15 @@ pub struct Selection {
 
 impl Selection {
     pub fn clear(&mut self) {
+        self.page = None;
         self.anchor = None;
         self.focus = None;
         self.dragging = false;
     }
 
-    pub fn start_at(&mut self, index: usize) {
+    /// 开始一次拖选，选区归到 `page` 上。
+    pub fn start_at(&mut self, page: usize, index: usize) {
+        self.page = Some(page);
         self.anchor = Some(index);
         self.focus = Some(index);
         self.dragging = true;
@@ -79,12 +87,13 @@ impl Selection {
     }
 
     /// 双击选词：中文按单字，英文按词；不跨行、不跨栏。
-    pub fn select_word(&mut self, chars: &[CharBox], index: usize) {
+    pub fn select_word(&mut self, page: usize, chars: &[CharBox], index: usize) {
         let Some(target) = chars.get(index) else {
             return;
         };
 
         if is_cjk(target.ch) || !is_word_char(target.ch) {
+            self.page = Some(page);
             self.anchor = Some(index);
             self.focus = Some(index);
             return;
@@ -121,6 +130,7 @@ impl Selection {
             end += 1;
         }
 
+        self.page = Some(page);
         self.anchor = Some(start);
         self.focus = Some(end);
     }
@@ -164,7 +174,7 @@ mod tests {
     fn select_word_expands_both_sides() {
         let chars = chars();
         let mut selection = Selection::default();
-        selection.select_word(&chars, 7);
+        selection.select_word(0, &chars, 7);
         assert_eq!(selection.text(&chars).as_deref(), Some("world"));
     }
 
@@ -172,7 +182,7 @@ mod tests {
     fn drag_selection_is_normalized() {
         let chars = chars();
         let mut selection = Selection::default();
-        selection.start_at(6);
+        selection.start_at(0, 6);
         selection.extend_to(0);
         assert_eq!(selection.text(&chars).as_deref(), Some("hello w"));
     }
@@ -207,7 +217,7 @@ mod tests {
     fn double_click_cjk_selects_single_char() {
         let chars = line("你好世界", 0.0, 0.0);
         let mut selection = Selection::default();
-        selection.select_word(&chars, 1);
+        selection.select_word(0, &chars, 1);
         assert_eq!(selection.text(&chars).as_deref(), Some("好"));
     }
 
@@ -216,7 +226,7 @@ mod tests {
         let mut chars = line("hello", 0.0, 0.0);
         chars.extend(line("world", 20.0, 0.0));
         let mut selection = Selection::default();
-        selection.select_word(&chars, 7);
+        selection.select_word(0, &chars, 7);
         assert_eq!(selection.text(&chars).as_deref(), Some("world"));
     }
 
@@ -225,7 +235,7 @@ mod tests {
         let mut chars = line("hello", 0.0, 0.0);
         chars.extend(line("world", 0.0, 120.0));
         let mut selection = Selection::default();
-        selection.select_word(&chars, 6);
+        selection.select_word(0, &chars, 6);
         assert_eq!(selection.text(&chars).as_deref(), Some("world"));
     }
 }
