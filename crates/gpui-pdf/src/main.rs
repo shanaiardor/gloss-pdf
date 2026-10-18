@@ -2,6 +2,8 @@
 
 mod app;
 mod assets;
+mod dict_history;
+mod dict_suggest;
 mod dictionary;
 mod fonts;
 mod geometry;
@@ -13,6 +15,7 @@ mod search;
 mod selection;
 mod settings;
 mod theme;
+mod tiles;
 mod ui;
 mod update;
 mod viewer;

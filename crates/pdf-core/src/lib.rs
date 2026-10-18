@@ -12,8 +12,11 @@
 //! ```
 
 mod engine;
+mod metadata;
 mod model;
 pub mod text_match;
 
 pub use engine::{Command, Event, PdfEngine};
-pub use model::{CharBox, LinkBox, LinkTarget, OutlineItem, PageHits, PageSize, RectPt};
+pub use model::{
+    CharBox, DocumentMetadata, LinkBox, LinkTarget, OutlineItem, PageHits, PageSize, RectPt,
+};

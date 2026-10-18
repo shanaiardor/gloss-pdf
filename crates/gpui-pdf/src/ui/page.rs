@@ -23,6 +23,7 @@ impl AppState {
             .size_full()
             .overflow_scroll()
             .track_scroll(&self.viewer.scroll)
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             // 拖选挂在容器上：指针滑出页面甚至滑到别的页也能继续扩展选区。
             .on_mouse_move(cx.listener(Self::on_page_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_page_mouse_up));
@@ -69,20 +70,11 @@ impl AppState {
         let height = geometry.height;
 
         let Some(page) = self.viewer.page(index) else {
-            return div()
-                .absolute()
-                .left(px(geometry.left))
-                .top(px(geometry.top))
-                .w(px(width))
-                .h(px(height))
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.surface)
-                .text_color(theme.text_muted)
-                .text_size(px(13.))
-                .child("正在渲染…");
+            return page_placeholder(geometry.left, geometry.top, width, height, theme);
         };
+        if page.tiles.is_empty() || page.scale <= 0.0 {
+            return page_placeholder(geometry.left, geometry.top, width, height, theme);
+        }
 
         let mut overlays: Vec<gpui::AnyElement> = Vec::new();
 
@@ -159,10 +151,48 @@ impl AppState {
                             this.on_page_mouse_down(index, event, cx);
                         }),
                     )
-                    .child(img(page.image.clone()).w_full().h_full())
-                    .children(overlays),
+                    .child(
+                        div()
+                            .relative()
+                            .size_full()
+                            .children(page.tiles.iter().map(|tile| {
+                                let tile_left = tile.origin_x as f32 / page.scale * zoom;
+                                let tile_top = tile.origin_y as f32 / page.scale * zoom;
+                                let tile_width = tile.width as f32 / page.scale * zoom;
+                                let tile_height = tile.height as f32 / page.scale * zoom;
+                                img(tile.image.clone())
+                                    .absolute()
+                                    .left(px(tile_left))
+                                    .top(px(tile_top))
+                                    .w(px(tile_width))
+                                    .h(px(tile_height))
+                            }))
+                            .children(overlays),
+                    ),
             )
     }
+}
+
+fn page_placeholder(
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    theme: &Theme,
+) -> gpui::Div {
+    div()
+        .absolute()
+        .left(px(left))
+        .top(px(top))
+        .w(px(width))
+        .h(px(height))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(theme.surface)
+        .text_color(theme.text_muted)
+        .text_size(px(13.))
+        .child("正在渲染…")
 }
 
 fn rect_overlay(rect: &RectPt, page_height: f32, zoom: f32, color: gpui::Rgba) -> gpui::Div {

@@ -9,10 +9,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use dict_core::Command as DictCommand;
+use dict_core::{Command as DictCommand, DictionaryConfig};
 use gpui::{Context, PathPromptOptions, Window};
-use pdf_core::{Command, OutlineItem, PageHits, PageSize};
+use pdf_core::{Command, DocumentMetadata, OutlineItem, PageHits, PageSize};
 
+use crate::dict_suggest::{MAX_SUGGESTIONS, SUGGEST_DEBOUNCE};
 use crate::dictionary::{DictLoadState, normalize_term};
 use crate::highlights::sidecar_path;
 use crate::progress::{ReadingProgress, unix_now};
@@ -105,6 +106,7 @@ impl super::AppState {
         path: PathBuf,
         pages: Vec<PageSize>,
         outline: Vec<OutlineItem>,
+        metadata: DocumentMetadata,
         cx: &mut Context<Self>,
     ) {
         // 切换文档前先记下上一份文档的最后位置，record 会顺带落盘。
@@ -115,10 +117,12 @@ impl super::AppState {
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| path.display().to_string());
+        // 首页与窗口标题优先用 PDF 的 Title，缺失时回退文件名。
+        let display_title = metadata.title_or(&name).to_string();
         let saved = self.home.progress_for(&path);
 
         let area = self.fit_area();
-        self.home.record(path.clone(), name.clone());
+        self.home.record(path.clone(), display_title.clone());
         self.home.query.clear();
         self.home.search_focused = false;
         self.dictionary.clear_results();
@@ -129,6 +133,7 @@ impl super::AppState {
                 path,
                 pages,
                 outline,
+                metadata,
             },
             area,
         );
@@ -148,6 +153,8 @@ impl super::AppState {
         // 恢复成功时以保存的位置为基线，等布局完成后采样再修正；
         // 失败时清空基线，让下一次采样覆盖掉过期的旧进度。
         self.last_progress = if restored { saved } else { None };
+        self.window_title = format!("{display_title} · 极简 PDF");
+        self.window_title_dirty = true;
 
         if let Some(doc) = &self.viewer.doc {
             let path = sidecar_path(&doc.path);
@@ -178,11 +185,14 @@ impl super::AppState {
     pub(crate) fn close_document(&mut self, cx: &mut Context<Self>) {
         self.flush_progress();
         self.viewer.close();
+        self.page_input_open = false;
         self.search_input.update(cx, |input, cx| input.clear(cx));
         self.pending_focus = Some(FocusTarget::Root);
         self.last_progress = None;
         self.outline_open = false;
         self.settings_open = false;
+        self.window_title = "极简 PDF".into();
+        self.window_title_dirty = true;
         self.dictionary.clear_results();
         self.close_dictionary_window(cx);
         self.home.menu_open = None;
@@ -457,18 +467,54 @@ impl super::AppState {
 
     // ---------- 词典资源 ----------
 
+    /// 输入变化后防抖请求前缀建议；每次输入都会推进代次号，过期结果直接丢弃。
+    pub(super) fn request_suggestions(&mut self, raw: String, cx: &mut Context<Self>) {
+        let term = normalize_term(&raw);
+        self.dictionary.suggest_request = self.dictionary.suggest_request.wrapping_add(1);
+        let request = self.dictionary.suggest_request;
+        self.dictionary.suggestions.clear();
+        self.sync_dictionary_window(cx);
+
+        if term.is_empty() || !matches!(self.dictionary.load_state, DictLoadState::Ready { .. }) {
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SUGGEST_DEBOUNCE).await;
+            let _ = this.update(cx, |this, _cx| {
+                if this.dictionary.suggest_request != request {
+                    return;
+                }
+                let _ = this.dict.commands.send(DictCommand::Prefix {
+                    request,
+                    term,
+                    // 每本多取一些，聚合去重后仍能凑满 8 条。
+                    limit: MAX_SUGGESTIONS * 3,
+                });
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn lookup_word(&mut self, term: String, cx: &mut Context<Self>) {
         let term = normalize_term(&term);
         if term.is_empty() {
             return;
         }
 
-        if self.settings.current.dictionary_path.is_none() {
+        // 回车/点击确认后不再展示建议，并让尚未返回的联想结果失效。
+        self.dictionary.suggest_request = self.dictionary.suggest_request.wrapping_add(1);
+        self.dictionary.suggestions.clear();
+        self.sync_dictionary_window(cx);
+
+        if !self.settings.current.has_enabled_dictionary() {
             self.settings_open = true;
-            self.set_status("请先在设置中选择 MDX 词典", cx);
+            self.set_status("请先在设置中添加并启用 MDX 词典", cx);
             cx.notify();
             return;
         }
+
+        self.dict_history.record(&term);
 
         match self.dictionary.load_state.clone() {
             DictLoadState::Loading => {
@@ -481,7 +527,7 @@ impl super::AppState {
             }
             DictLoadState::Unconfigured => {
                 self.settings_open = true;
-                self.set_status("请先在设置中选择 MDX 词典", cx);
+                self.set_status("请先在设置中添加并启用 MDX 词典", cx);
                 cx.notify();
                 return;
             }
@@ -523,50 +569,161 @@ impl super::AppState {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
-            multiple: false,
-            prompt: Some("选择 MDX 词典".into()),
+            multiple: true,
+            prompt: Some("添加 MDX 词典".into()),
         });
 
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = receiver.await
-                && let Some(path) = paths.into_iter().next()
+                && !paths.is_empty()
             {
-                let _ = this.update(cx, |this, cx| this.set_dictionary_path(path, cx));
+                let _ = this.update(cx, |this, cx| this.add_dictionary_paths(paths, cx));
             }
         })
         .detach();
     }
 
-    fn set_dictionary_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let is_mdx = path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("mdx"));
-        if !is_mdx || !path.is_file() {
-            self.set_status("请选择 .mdx 词典文件", cx);
+    fn add_dictionary_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let mut added = 0;
+        let mut rejected = 0;
+        for path in paths {
+            let is_mdx = path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("mdx"));
+            if !is_mdx || !path.is_file() {
+                rejected += 1;
+                continue;
+            }
+            if self
+                .settings
+                .current
+                .dictionaries
+                .iter()
+                .any(|dictionary| dictionary.path == path)
+            {
+                rejected += 1;
+                continue;
+            }
+            self.settings
+                .current
+                .dictionaries
+                .push(crate::settings::DictionarySetting {
+                    path,
+                    enabled: true,
+                });
+            added += 1;
+        }
+
+        if added == 0 {
+            let message = if rejected > 0 {
+                "请选择未添加过的 .mdx 词典文件"
+            } else {
+                "没有添加词典"
+            };
+            self.set_status(message, cx);
             cx.notify();
             return;
         }
 
-        self.settings.current.dictionary_path = Some(path.clone());
-        self.settings.save();
-        self.dictionary.clear_results();
-        self.dictionary.load_state = DictLoadState::Loading;
-        self.settings_open = false;
-        self.sync_dictionary_window(cx);
+        self.configure_dictionaries(cx);
+        self.set_status(format!("已添加 {added} 本词典，正在加载…"), cx);
+    }
 
-        let _ = self.dict.commands.send(DictCommand::Load { path });
-        self.set_status("正在加载词典…", cx);
+    pub(crate) fn remove_dictionary(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.settings.current.dictionaries.len() {
+            return;
+        }
+        self.settings.current.dictionaries.remove(index);
+        self.configure_dictionaries(cx);
+        self.set_status("已移除词典", cx);
+    }
+
+    pub(crate) fn move_dictionary(&mut self, index: usize, delta: isize, cx: &mut Context<Self>) {
+        let len = self.settings.current.dictionaries.len();
+        let Some(target) = index.checked_add_signed(delta) else {
+            return;
+        };
+        if index >= len || target >= len {
+            return;
+        }
+        self.settings.current.dictionaries.swap(index, target);
+        self.configure_dictionaries(cx);
+    }
+
+    pub(crate) fn toggle_dictionary(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(dictionary) = self.settings.current.dictionaries.get_mut(index) else {
+            return;
+        };
+        dictionary.enabled = !dictionary.enabled;
+        self.configure_dictionaries(cx);
+    }
+
+    /// 把设置里的完整词典列表推给 worker；加载状态先回到「加载中」。
+    fn configure_dictionaries(&mut self, cx: &mut Context<Self>) {
+        self.settings.current.migrate();
+        self.settings.save();
+
+        self.dictionary.configure_request = self.dictionary.configure_request.wrapping_add(1);
+        let request = self.dictionary.configure_request;
+        self.dictionary.statuses = self
+            .settings
+            .current
+            .dictionaries
+            .iter()
+            .map(|dictionary| crate::dictionary::DictStatus {
+                path: dictionary.path.clone(),
+                state: if dictionary.enabled {
+                    DictLoadState::Loading
+                } else {
+                    DictLoadState::Unconfigured
+                },
+            })
+            .collect();
+
+        let enabled = self.settings.current.has_enabled_dictionary();
+        self.dictionary.load_state = if enabled {
+            DictLoadState::Loading
+        } else {
+            DictLoadState::Unconfigured
+        };
+        self.dictionary.pending_term = None;
+
+        let dictionaries: Vec<_> = self
+            .settings
+            .current
+            .dictionaries
+            .iter()
+            .map(|dictionary| DictionaryConfig {
+                path: dictionary.path.clone(),
+                enabled: dictionary.enabled,
+            })
+            .collect();
+        let _ = self.dict.commands.send(DictCommand::Configure {
+            request,
+            dictionaries,
+        });
+        self.dictionary.clear_results();
+        self.sync_dictionary_window(cx);
+        cx.notify();
+    }
+
+    pub(super) fn clear_dict_history(&mut self, cx: &mut Context<Self>) {
+        self.dict_history.clear();
+        self.sync_dictionary_window(cx);
+        self.set_status("已清空查词历史", cx);
         cx.notify();
     }
 
     pub(crate) fn clear_dictionary(&mut self, cx: &mut Context<Self>) {
+        self.settings.current.dictionaries.clear();
         self.settings.current.dictionary_path = None;
         self.settings.save();
         let _ = self.dict.commands.send(DictCommand::Unload);
+        self.dictionary.statuses.clear();
         self.dictionary.clear_results();
         self.dictionary.load_state = DictLoadState::Unconfigured;
         self.sync_dictionary_window(cx);
-        self.set_status("已清除词典", cx);
+        self.set_status("已清除全部词典", cx);
         cx.notify();
     }
 }

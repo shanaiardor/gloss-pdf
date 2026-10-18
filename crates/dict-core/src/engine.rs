@@ -26,20 +26,50 @@ const MAX_CSS_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FONT_BYTES: usize = 32 * 1024 * 1024;
 /// 图片 / 样式表缓存条目上限。
 const MAX_CACHE_ENTRIES: usize = 512;
+/// 一次前缀联想最多回传多少个词（跨词典合并、去重后）。
+const MAX_PREFIX_SUGGESTIONS: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DictionaryConfig {
+    pub path: PathBuf,
+    pub enabled: bool,
+}
+
+/// 一本词典的加载结果，随 `Configured` 事件回传。
+#[derive(Clone, Debug)]
+pub struct DictionaryInfo {
+    pub path: PathBuf,
+    pub title: Option<String>,
+    pub entries: u64,
+    pub enabled: bool,
+    pub fonts: Vec<Vec<u8>>,
+    pub error: Option<String>,
+}
 
 pub enum Command {
-    Load { path: PathBuf },
+    /// 用完整的词典列表重建 worker 状态：保留已加载的词典，按新顺序与启用状态
+    /// 重排；停用的词典会被卸载。
+    Configure {
+        request: u64,
+        dictionaries: Vec<DictionaryConfig>,
+    },
     Unload,
-    Lookup { request: u64, term: String },
+    Lookup {
+        request: u64,
+        term: String,
+    },
+    /// 跨词典前缀联想；`limit` 是每本词典最多取多少条原始键。
+    Prefix {
+        request: u64,
+        term: String,
+        limit: usize,
+    },
 }
 
 pub enum Event {
-    Loaded {
-        path: PathBuf,
-        title: Option<String>,
-        entries: u64,
-        /// 需要注册到 GPUI 文本系统的字体（已从 WOFF 解包）。
-        fonts: Vec<Vec<u8>>,
+    Configured {
+        request: u64,
+        dictionaries: Vec<DictionaryInfo>,
     },
     Found {
         request: u64,
@@ -50,6 +80,11 @@ pub enum Event {
     NotFound {
         request: u64,
         term: String,
+    },
+    PrefixSuggestions {
+        request: u64,
+        term: String,
+        suggestions: Vec<String>,
     },
     Error {
         request: Option<u64>,
@@ -72,78 +107,239 @@ impl DictEngine {
     }
 }
 
+struct LoadedDictionary {
+    path: PathBuf,
+    title: Option<String>,
+    entries: u64,
+    fonts: Vec<Vec<u8>>,
+    dictionary: Dictionary,
+}
+
+impl LoadedDictionary {
+    fn info(&self, enabled: bool) -> DictionaryInfo {
+        DictionaryInfo {
+            path: self.path.clone(),
+            title: self.title.clone(),
+            entries: self.entries,
+            enabled,
+            fonts: self.fonts.clone(),
+            error: None,
+        }
+    }
+
+    fn source(&self) -> String {
+        self.title.clone().unwrap_or_else(|| {
+            self.path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.path.display().to_string())
+        })
+    }
+}
+
 fn worker_loop(commands: Receiver<Command>, events: UnboundedSender<Event>) {
-    let mut dictionary: Option<Dictionary> = None;
+    let mut loaded: Vec<LoadedDictionary> = Vec::new();
 
     while let Ok(command) = commands.recv() {
         match command {
-            Command::Load { path } => {
-                dictionary = None;
-                match load_dictionary(&path) {
-                    Ok((file, title, entries)) => {
-                        log::info!(
-                            "loaded dictionary {} ({} entries, {} style rules, {} fonts, {} mdds)",
-                            path.display(),
-                            entries,
-                            file.stylesheet.len(),
-                            file.fonts.faces().len(),
-                            file.mdd.len(),
-                        );
-                        let fonts = file.fonts.bytes();
-                        dictionary = Some(file);
-                        let _ = events.unbounded_send(Event::Loaded {
-                            path,
+            Command::Configure {
+                request,
+                dictionaries,
+            } => {
+                let mut previous: HashMap<PathBuf, LoadedDictionary> = loaded
+                    .drain(..)
+                    .map(|dictionary| (dictionary.path.clone(), dictionary))
+                    .collect();
+                let mut next = Vec::new();
+                let mut infos = Vec::new();
+                let mut seen = HashSet::new();
+
+                for config in dictionaries {
+                    if !seen.insert(config.path.clone()) {
+                        continue;
+                    }
+                    if !config.enabled {
+                        let (entries, title) = previous
+                            .get(&config.path)
+                            .map(|dictionary| (dictionary.entries, dictionary.title.clone()))
+                            .unwrap_or((0, None));
+                        infos.push(DictionaryInfo {
+                            path: config.path,
                             title,
                             entries,
-                            fonts,
+                            enabled: false,
+                            fonts: Vec::new(),
+                            error: None,
                         });
+                        continue;
                     }
-                    Err(error) => {
-                        let message = format!("加载词典失败: {error:#}");
-                        log::error!("{message}");
-                        let _ = events.unbounded_send(Event::Error {
-                            request: None,
-                            message,
-                        });
+
+                    let dictionary = previous.remove(&config.path).or_else(|| {
+                        match load_dictionary(&config.path) {
+                            Ok((dictionary, title, entries)) => {
+                                log::info!(
+                                    "loaded dictionary {} ({} entries, {} style rules, {} fonts, {} mdds)",
+                                    config.path.display(),
+                                    entries,
+                                    dictionary.stylesheet.len(),
+                                    dictionary.fonts.faces().len(),
+                                    dictionary.mdd.len(),
+                                );
+                                let fonts = dictionary.fonts.bytes();
+                                Some(LoadedDictionary {
+                                    path: config.path.clone(),
+                                    title,
+                                    entries,
+                                    fonts,
+                                    dictionary,
+                                })
+                            }
+                            Err(error) => {
+                                let message = format!("加载词典失败: {error:#}");
+                                log::error!("{message}");
+                                infos.push(DictionaryInfo {
+                                    path: config.path,
+                                    title: None,
+                                    entries: 0,
+                                    enabled: true,
+                                    fonts: Vec::new(),
+                                    error: Some(message),
+                                });
+                                None
+                            }
+                        }
+                    });
+
+                    if let Some(dictionary) = dictionary {
+                        infos.push(dictionary.info(true));
+                        next.push(dictionary);
                     }
                 }
+
+                loaded = next;
+                let _ = events.unbounded_send(Event::Configured {
+                    request,
+                    dictionaries: infos,
+                });
             }
             Command::Unload => {
-                dictionary = None;
+                loaded.clear();
             }
             Command::Lookup { request, term } => {
-                let Some(dictionary) = dictionary.as_mut() else {
+                if loaded.is_empty() {
                     let _ = events.unbounded_send(Event::Error {
                         request: Some(request),
                         message: "词典还没有加载完成".to_string(),
                     });
                     continue;
-                };
+                }
 
-                match dictionary.lookup(&term) {
-                    Ok(Some((entry, redirected))) => {
-                        let _ = events.unbounded_send(Event::Found {
-                            request,
-                            term,
-                            entries: vec![entry],
-                            redirected,
-                        });
+                let mut entries = Vec::new();
+                let mut redirected = false;
+                for dictionary in &mut loaded {
+                    match dictionary.dictionary.lookup(&term) {
+                        Ok(Some((mut entry, entry_redirected))) => {
+                            entry.source = Some(dictionary.source());
+                            entries.push(entry);
+                            redirected |= entry_redirected;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let message = format!("查询词典失败: {error:#}");
+                            log::error!("{message}");
+                        }
                     }
-                    Ok(None) => {
-                        let _ = events.unbounded_send(Event::NotFound { request, term });
-                    }
-                    Err(error) => {
-                        let message = format!("查询词典失败: {error:#}");
-                        log::error!("{message}");
-                        let _ = events.unbounded_send(Event::Error {
-                            request: Some(request),
-                            message,
-                        });
-                    }
+                }
+
+                if entries.is_empty() {
+                    let _ = events.unbounded_send(Event::NotFound { request, term });
+                } else {
+                    let _ = events.unbounded_send(Event::Found {
+                        request,
+                        term,
+                        entries,
+                        redirected,
+                    });
+                }
+            }
+            Command::Prefix {
+                request,
+                term,
+                limit,
+            } => {
+                let suggestions = if term.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    prefix_suggestions(&loaded, term.trim(), limit)
+                };
+                let _ = events.unbounded_send(Event::PrefixSuggestions {
+                    request,
+                    term,
+                    suggestions,
+                });
+            }
+        }
+    }
+}
+
+/// 跨词典收集前缀建议：保持词典顺序、忽略大小写去重，最多 8 条。
+///
+/// 精确前缀没有结果时，逐个去掉末尾字符再试（至少保留一个字符），给出
+/// “近似前缀”建议；这比全表模糊扫描便宜，输入末端拼错时仍能命中。
+fn prefix_suggestions(
+    dictionaries: &[LoadedDictionary],
+    term: &str,
+    per_dictionary: usize,
+) -> Vec<String> {
+    if per_dictionary == 0 {
+        return Vec::new();
+    }
+
+    let mut suggestions = collect_prefixes(dictionaries, term, per_dictionary);
+    if !suggestions.is_empty() {
+        return suggestions;
+    }
+
+    let mut fallback = term.to_string();
+    while fallback.chars().count() > 1 {
+        let Some((index, _)) = fallback.char_indices().next_back() else {
+            break;
+        };
+        fallback.truncate(index);
+        suggestions = collect_prefixes(dictionaries, &fallback, per_dictionary);
+        if !suggestions.is_empty() {
+            break;
+        }
+    }
+    suggestions
+}
+
+fn collect_prefixes(
+    dictionaries: &[LoadedDictionary],
+    term: &str,
+    per_dictionary: usize,
+) -> Vec<String> {
+    let mut suggestions = Vec::new();
+    let mut seen = HashSet::new();
+    for dictionary in dictionaries {
+        let keys = match dictionary.dictionary.mdx.prefix_keys(term, per_dictionary) {
+            Ok(keys) => keys,
+            Err(error) => {
+                log::warn!("前缀联想失败 {}: {error:#}", dictionary.path.display());
+                continue;
+            }
+        };
+        for key in keys {
+            let value = key.key().to_string();
+            if seen.insert(value.to_lowercase()) {
+                suggestions.push(value);
+                if suggestions.len() == MAX_PREFIX_SUGGESTIONS {
+                    return suggestions;
                 }
             }
         }
     }
+    suggestions
 }
 
 /// 打开后的词典：MDX 词条 + 同名 MDD 资源 + 样式/字体。
@@ -218,6 +414,7 @@ impl Dictionary {
                 headword,
                 phonetic,
                 blocks,
+                source: None,
             },
             redirected,
         )))
@@ -756,14 +953,23 @@ mod tests {
         let engine = DictEngine::spawn(tx);
         engine
             .commands
-            .send(Command::Load {
-                path: mdx_path.clone(),
+            .send(Command::Configure {
+                request: 1,
+                dictionaries: vec![DictionaryConfig {
+                    path: mdx_path.clone(),
+                    enabled: true,
+                }],
             })
             .unwrap();
 
         match futures::executor::block_on(rx.next()) {
-            Some(Event::Loaded { entries, .. }) => assert_eq!(entries, 2),
-            _ => panic!("expected Loaded event"),
+            Some(Event::Configured { dictionaries, .. }) => {
+                assert_eq!(dictionaries.len(), 1);
+                assert_eq!(dictionaries[0].entries, 2);
+                assert_eq!(dictionaries[0].title.as_deref(), Some("Test Dictionary"));
+                assert!(dictionaries[0].error.is_none());
+            }
+            _ => panic!("expected Configured event"),
         }
 
         engine
@@ -785,6 +991,7 @@ mod tests {
                 assert!(!redirected);
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].headword, "hello");
+                assert_eq!(entries[0].source.as_deref(), Some("Test Dictionary"));
                 let entry = &entries[0];
 
                 let Block::Paragraph(headword) = &entry.blocks[0] else {
@@ -848,6 +1055,269 @@ mod tests {
 
         std::fs::remove_file(mdx_path).ok();
         std::fs::remove_file(mdd_path).ok();
+    }
+
+    fn write_simple_dictionary(stem: &str, title: &str, entries: &[(&str, &str)]) -> PathBuf {
+        let mut builder =
+            MdxBuilder::with_options(WriteOptions::new().with_encoding(WriteEncoding::Utf8));
+        builder.header_attribute("Title", title).unwrap();
+        for (headword, body) in entries {
+            builder.add_entry(*headword, *body).unwrap();
+        }
+        let mut bytes = Vec::new();
+        builder.finish(&mut bytes).unwrap();
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "gpui-pdf-{stem}-{}-{stamp}.mdx",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn worker_suggests_prefixes_across_dictionaries_with_dedupe_and_cap() {
+        let first_entries: Vec<(String, String)> = (0..9)
+            .map(|index| (format!("pre{index}"), format!("<div>甲{index}</div>")))
+            .collect();
+        let first: Vec<(&str, &str)> = first_entries
+            .iter()
+            .map(|(headword, body)| (headword.as_str(), body.as_str()))
+            .collect();
+        let first = write_simple_dictionary("prefix-a", "词典甲", &first);
+        let second = write_simple_dictionary(
+            "prefix-b",
+            "词典乙",
+            &[("pre0", "<div>乙重复</div>"), ("prefix-two", "<div>乙</div>")],
+        );
+
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let engine = DictEngine::spawn(tx);
+        engine
+            .commands
+            .send(Command::Configure {
+                request: 1,
+                dictionaries: vec![
+                    DictionaryConfig {
+                        path: first.clone(),
+                        enabled: true,
+                    },
+                    DictionaryConfig {
+                        path: second.clone(),
+                        enabled: true,
+                    },
+                ],
+            })
+            .unwrap();
+        match futures::executor::block_on(rx.next()) {
+            Some(Event::Configured { .. }) => {}
+            _ => panic!("expected Configured event"),
+        }
+
+        engine
+            .commands
+            .send(Command::Prefix {
+                request: 2,
+                term: "pre".to_string(),
+                limit: 20,
+            })
+            .unwrap();
+        match futures::executor::block_on(rx.next()) {
+            Some(Event::PrefixSuggestions {
+                request,
+                term,
+                suggestions,
+            }) => {
+                assert_eq!(request, 2);
+                assert_eq!(term, "pre");
+                assert_eq!(suggestions.len(), 8, "跨词典合并后最多 8 条");
+                let unique: HashSet<String> =
+                    suggestions.iter().map(|value| value.to_lowercase()).collect();
+                assert_eq!(unique.len(), suggestions.len(), "建议按忽略大小写去重");
+                assert_eq!(suggestions[0], "pre0");
+            }
+            _ => panic!("expected PrefixSuggestions event"),
+        }
+
+        // 精确前缀无结果时，去掉末尾字符得到近似前缀建议。
+        engine
+            .commands
+            .send(Command::Prefix {
+                request: 3,
+                term: "prefix-twoo".to_string(),
+                limit: 20,
+            })
+            .unwrap();
+        match futures::executor::block_on(rx.next()) {
+            Some(Event::PrefixSuggestions { suggestions, .. }) => {
+                assert!(suggestions.contains(&"prefix-two".to_string()));
+            }
+            _ => panic!("expected approximate PrefixSuggestions event"),
+        }
+
+        for term in ["", "qqqq"] {
+            engine
+                .commands
+                .send(Command::Prefix {
+                    request: 4,
+                    term: term.to_string(),
+                    limit: 20,
+                })
+                .unwrap();
+            match futures::executor::block_on(rx.next()) {
+                Some(Event::PrefixSuggestions { suggestions, .. }) => {
+                    assert!(suggestions.is_empty(), "{term:?} 不应有建议");
+                }
+                _ => panic!("expected empty PrefixSuggestions event"),
+            }
+        }
+
+        std::fs::remove_file(first).ok();
+        std::fs::remove_file(second).ok();
+    }
+
+    #[test]
+    fn worker_aggregates_dictionaries_in_order_and_respects_enabled() {
+        let first = write_simple_dictionary(
+            "multi-a",
+            "词典甲",
+            &[("alpha", "<div>甲</div>"), ("shared", "<div>共享</div>")],
+        );
+        let second = write_simple_dictionary(
+            "multi-b",
+            "词典乙",
+            &[("alpha", "<div>乙</div>"), ("beta", "<div>乙独有</div>")],
+        );
+
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let engine = DictEngine::spawn(tx);
+        let configure = |request: u64, list: &[(PathBuf, bool)]| {
+            engine
+                .commands
+                .send(Command::Configure {
+                    request,
+                    dictionaries: list
+                        .iter()
+                        .map(|(path, enabled)| DictionaryConfig {
+                            path: path.clone(),
+                            enabled: *enabled,
+                        })
+                        .collect(),
+                })
+                .unwrap();
+        };
+
+        configure(1, &[(first.clone(), true), (second.clone(), true)]);
+        match futures::executor::block_on(rx.next()) {
+            Some(Event::Configured { dictionaries, .. }) => {
+                assert_eq!(dictionaries.len(), 2);
+                assert_eq!(dictionaries[0].title.as_deref(), Some("词典甲"));
+                assert_eq!(dictionaries[1].title.as_deref(), Some("词典乙"));
+                assert!(dictionaries.iter().all(|info| info.enabled));
+            }
+            _ => panic!("expected Configured event"),
+        }
+
+        engine
+            .commands
+            .send(Command::Lookup {
+                request: 10,
+                term: "alpha".to_string(),
+            })
+            .unwrap();
+        match futures::executor::block_on(rx.next()) {
+            Some(Event::Found { entries, .. }) => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].source.as_deref(), Some("词典甲"));
+                assert_eq!(entries[1].source.as_deref(), Some("词典乙"));
+            }
+            _ => panic!("expected aggregated Found event"),
+        }
+
+        configure(2, &[(second.clone(), true), (first.clone(), true)]);
+        match futures::executor::block_on(rx.next()) {
+            Some(Event::Configured { dictionaries, .. }) => {
+                assert_eq!(dictionaries[0].title.as_deref(), Some("词典乙"));
+                assert_eq!(dictionaries[1].title.as_deref(), Some("词典甲"));
+            }
+            _ => panic!("expected Configured event"),
+        }
+        engine
+            .commands
+            .send(Command::Lookup {
+                request: 11,
+                term: "alpha".to_string(),
+            })
+            .unwrap();
+        match futures::executor::block_on(rx.next()) {
+            Some(Event::Found { entries, .. }) => {
+                assert_eq!(entries[0].source.as_deref(), Some("词典乙"));
+                assert_eq!(entries[1].source.as_deref(), Some("词典甲"));
+            }
+            _ => panic!("expected reordered Found event"),
+        }
+
+        configure(3, &[(first.clone(), false), (second.clone(), true)]);
+        match futures::executor::block_on(rx.next()) {
+            Some(Event::Configured { dictionaries, .. }) => {
+                assert!(!dictionaries[0].enabled);
+                assert!(dictionaries[1].enabled);
+            }
+            _ => panic!("expected Configured event"),
+        }
+        engine
+            .commands
+            .send(Command::Lookup {
+                request: 12,
+                term: "alpha".to_string(),
+            })
+            .unwrap();
+        match futures::executor::block_on(rx.next()) {
+            Some(Event::Found { entries, .. }) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].source.as_deref(), Some("词典乙"));
+            }
+            _ => panic!("expected single-dictionary Found event"),
+        }
+
+        engine
+            .commands
+            .send(Command::Lookup {
+                request: 13,
+                term: "shared".to_string(),
+            })
+            .unwrap();
+        match futures::executor::block_on(rx.next()) {
+            Some(Event::NotFound { .. }) => {}
+            _ => panic!("disabled dictionary must not answer"),
+        }
+
+        configure(4, &[(first.clone(), true), (second.clone(), false)]);
+        match futures::executor::block_on(rx.next()) {
+            Some(Event::Configured { .. }) => {}
+            _ => panic!("expected Configured event"),
+        }
+        engine
+            .commands
+            .send(Command::Lookup {
+                request: 14,
+                term: "shared".to_string(),
+            })
+            .unwrap();
+        match futures::executor::block_on(rx.next()) {
+            Some(Event::Found { entries, .. }) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].source.as_deref(), Some("词典甲"));
+            }
+            _ => panic!("expected Found event"),
+        }
+
+        std::fs::remove_file(first).ok();
+        std::fs::remove_file(second).ok();
     }
 
     #[test]

@@ -11,6 +11,8 @@ pub struct DictEntry {
     pub headword: String,
     pub phonetic: Option<String>,
     pub blocks: Vec<Block>,
+    /// 命中的词典名（MDX 头部 Title，缺失时用文件名）；聚合查询时标注来源。
+    pub source: Option<String>,
 }
 
 impl DictEntry {

@@ -6,19 +6,32 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures::channel::mpsc::UnboundedSender;
 use pdfium_render::prelude::*;
 
-use crate::model::{CharBox, LinkBox, LinkTarget, OutlineItem, PageHits, PageSize, RectPt};
+use crate::model::{
+    CharBox, DocumentMetadata, LinkBox, LinkTarget, OutlineItem, PageHits, PageSize, RectPt,
+};
 use crate::text_match::count_matches;
 
 /// 发给 PDF 工作线程的命令。
 pub enum Command {
     Open(PathBuf),
-    Render {
+    /// 渲染一个页面瓦片。`origin_x`/`origin_y` 是瓦片左上角在整页像素坐标中的位置，
+    /// 由调用方按固定瓦片尺寸切分；`width`/`height` 是瓦片位图尺寸。
+    RenderTile {
         page: usize,
         scale: f32,
+        origin_x: i32,
+        origin_y: i32,
+        width: u32,
+        height: u32,
+        request: u64,
+    },
+    /// 提取页面的文字与链接覆盖层（与缩放无关，每页只需一次）。
+    PageElements {
+        page: usize,
         request: u64,
     },
     /// 全文搜索：逐页提取文本统计命中数（文本会缓存，重复搜索只算一遍）。
@@ -34,14 +47,22 @@ pub enum Event {
         path: PathBuf,
         pages: Vec<PageSize>,
         outline: Vec<OutlineItem>,
+        metadata: DocumentMetadata,
     },
-    Rendered {
+    RenderedTile {
         page: usize,
         request: u64,
+        origin_x: i32,
+        origin_y: i32,
         width: u32,
         height: u32,
         /// BGRA 像素，直接对应 GPUI `RenderImage` 的缓冲区约定。
         bgra: Vec<u8>,
+    },
+    /// 页面文字与链接覆盖层；坐标一律是整页点坐标，与瓦片无关。
+    PageElements {
+        page: usize,
+        request: u64,
         chars: Vec<CharBox>,
         links: Vec<LinkBox>,
     },
@@ -82,6 +103,8 @@ fn worker_loop(commands: Receiver<Command>, events: UnboundedSender<Event>) {
     let mut document: Option<PdfDocument<'static>> = None;
     // 每页的纯文本，全文搜索用；换文档时清空。
     let mut page_text: Vec<Option<String>> = Vec::new();
+    // 每页的文字/链接覆盖层，与缩放无关；换文档时清空。
+    let mut page_elements: Vec<Option<(Vec<CharBox>, Vec<LinkBox>)>> = Vec::new();
 
     while let Ok(command) = commands.recv() {
         match command {
@@ -90,42 +113,84 @@ fn worker_loop(commands: Receiver<Command>, events: UnboundedSender<Event>) {
                     match bind_pdfium() {
                         Ok(instance) => pdfium = Some(instance),
                         Err(error) => {
-                            let _ = events
-                                .unbounded_send(Event::Error(format!("加载 PDFium 失败: {error:#}")));
+                            let _ = events.unbounded_send(Event::Error(format!(
+                                "加载 PDFium 失败: {error:#}"
+                            )));
                             continue;
                         }
                     }
                 }
                 let instance = pdfium.expect("pdfium bound above");
                 match open_document(instance, &path) {
-                    Ok((opened, pages, outline)) => {
+                    Ok((opened, pages, outline, metadata)) => {
                         document = Some(opened);
                         page_text.clear();
-                        let _ = events.unbounded_send(Event::Opened { path, pages, outline });
+                        page_elements.clear();
+                        let _ = events.unbounded_send(Event::Opened {
+                            path,
+                            pages,
+                            outline,
+                            metadata,
+                        });
                     }
                     Err(error) => {
-                        let _ =
-                            events.unbounded_send(Event::Error(format!("打开 PDF 失败: {error:#}")));
+                        let _ = events
+                            .unbounded_send(Event::Error(format!("打开 PDF 失败: {error:#}")));
                     }
                 }
             }
-            Command::Render {
+            Command::RenderTile {
                 page,
                 scale,
+                origin_x,
+                origin_y,
+                width,
+                height,
                 request,
             } => {
                 let Some(document) = document.as_ref() else {
                     continue;
                 };
-                match render_page(document, page, scale, request) {
+                match render_tile(
+                    document, page, scale, origin_x, origin_y, width, height, request,
+                ) {
                     Ok(event) => {
                         let _ = events.unbounded_send(event);
                     }
                     Err(error) => {
-                        let _ = events
-                            .unbounded_send(Event::Error(format!("渲染页面失败: {error:#}")));
+                        let _ =
+                            events.unbounded_send(Event::Error(format!("渲染页面失败: {error:#}")));
                     }
                 }
+            }
+            Command::PageElements { page, request } => {
+                let Some(document) = document.as_ref() else {
+                    continue;
+                };
+                if page_elements.len() <= page {
+                    page_elements.resize_with(page + 1, || None);
+                }
+                let elements = match &page_elements[page] {
+                    Some(elements) => elements.clone(),
+                    None => match extract_elements(document, page) {
+                        Ok(elements) => {
+                            page_elements[page] = Some(elements.clone());
+                            elements
+                        }
+                        Err(error) => {
+                            let _ = events.unbounded_send(Event::Error(format!(
+                                "提取页面内容失败: {error:#}"
+                            )));
+                            continue;
+                        }
+                    },
+                };
+                let _ = events.unbounded_send(Event::PageElements {
+                    page,
+                    request,
+                    chars: elements.0,
+                    links: elements.1,
+                });
             }
             Command::Search { query, request } => {
                 let Some(document) = document.as_ref() else {
@@ -185,10 +250,7 @@ fn search_document(
             let count = count_matches(&text.to_lowercase(), &needle);
             if count > 0 {
                 total += count;
-                pages.push(PageHits {
-                    page: index,
-                    count,
-                });
+                pages.push(PageHits { page: index, count });
             }
 
             let scanned = index + 1;
@@ -248,7 +310,12 @@ fn bind_pdfium() -> Result<&'static Pdfium> {
 fn open_document(
     pdfium: &'static Pdfium,
     path: &Path,
-) -> Result<(PdfDocument<'static>, Vec<PageSize>, Vec<OutlineItem>)> {
+) -> Result<(
+    PdfDocument<'static>,
+    Vec<PageSize>,
+    Vec<OutlineItem>,
+    DocumentMetadata,
+)> {
     let document = pdfium
         .load_pdf_from_file(path, None)
         .map_err(|error| anyhow!(error))
@@ -267,13 +334,37 @@ fn open_document(
         collect_bookmark(&bookmark, 0, &mut outline);
     }
 
-    Ok((document, pages, outline))
+    let metadata = DocumentMetadata {
+        title: metadata_value(&document, PdfDocumentMetadataTagType::Title),
+        author: metadata_value(&document, PdfDocumentMetadataTagType::Author),
+        subject: metadata_value(&document, PdfDocumentMetadataTagType::Subject),
+        keywords: metadata_value(&document, PdfDocumentMetadataTagType::Keywords),
+        creator: metadata_value(&document, PdfDocumentMetadataTagType::Creator),
+        producer: metadata_value(&document, PdfDocumentMetadataTagType::Producer),
+        creation_date: metadata_value(&document, PdfDocumentMetadataTagType::CreationDate),
+        // pdfium-render 0.9.4 查错了键名（用的是 ModificationDate），标准键是 ModDate；
+        // 先走高层 API（将来修复后自动生效），失败再从原始字节补读。
+        modification_date: metadata_value(&document, PdfDocumentMetadataTagType::ModificationDate)
+            .or_else(|| crate::metadata::read_modification_date(path)),
+    };
+
+    Ok((document, pages, outline, metadata))
+}
+
+/// 读取一个元数据标签，去掉首尾空白；空字符串按缺失处理。
+fn metadata_value(
+    document: &PdfDocument<'static>,
+    tag: PdfDocumentMetadataTagType,
+) -> Option<String> {
+    document
+        .metadata()
+        .get(tag)
+        .map(|tag| tag.value().trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn collect_bookmark(bookmark: &PdfBookmark, depth: usize, output: &mut Vec<OutlineItem>) {
-    let title = bookmark
-        .title()
-        .unwrap_or_else(|| "（无标题）".to_string());
+    let title = bookmark.title().unwrap_or_else(|| "（无标题）".to_string());
     let page = bookmark
         .destination()
         .and_then(|destination| destination.page_index().ok())
@@ -286,10 +377,14 @@ fn collect_bookmark(bookmark: &PdfBookmark, depth: usize, output: &mut Vec<Outli
     }
 }
 
-fn render_page(
+fn render_tile(
     document: &PdfDocument<'static>,
     page_index: usize,
     scale: f32,
+    origin_x: i32,
+    origin_y: i32,
+    width: u32,
+    height: u32,
     request: u64,
 ) -> Result<Event> {
     let page = document
@@ -297,26 +392,50 @@ fn render_page(
         .get(page_index as PdfPageIndex)
         .map_err(|error| anyhow!(error))?;
 
-    let target_width = (page.width().value * scale).round().max(1.0) as i32;
-    let target_height = (page.height().value * scale).round().max(1.0) as i32;
+    let full_width = (page.width().value * scale).round().max(1.0) as i32;
+    let full_height = (page.height().value * scale).round().max(1.0) as i32;
+    let width = width.max(1) as i32;
+    let height = height.max(1) as i32;
+    // 页面的逻辑尺寸仍是整页，负的 origin 把目标区域平移到瓦片上；
+    // 这样表单、注释和文字坐标都保持整页坐标系，和覆盖层完全对齐。
     let config = PdfRenderConfig::new()
-        .set_target_width(target_width)
-        .set_target_height(target_height)
+        .set_fixed_size(full_width, full_height)
+        .set_origin(-origin_x, -origin_y)
         .render_annotations(true)
         .render_form_data(true)
         // GPUI 的 RenderImage 缓冲区是 BGRA；不要让 Pdfium 把字节序反转成 RGBA。
         .set_reverse_byte_order(false);
-    let bitmap = page
-        .render_with_config(&config)
+    let mut bitmap = PdfBitmap::empty(width, height, PdfBitmapFormat::BGRA)
+        .map_err(|error| anyhow!(error))?;
+    page.render_into_bitmap_with_config(&mut bitmap, &config)
         .map_err(|error| anyhow!(error))?;
     log::debug!(
-        "page {} has {} annotations",
+        "page {} tile ({origin_x},{origin_y}) {}x{}",
         page_index,
-        page.annotations().len()
+        width,
+        height
     );
-    let width = bitmap.width() as u32;
-    let height = bitmap.height() as u32;
-    let bgra = bitmap.as_raw_bytes();
+
+    Ok(Event::RenderedTile {
+        page: page_index,
+        request,
+        origin_x,
+        origin_y,
+        width: width as u32,
+        height: height as u32,
+        bgra: bitmap.as_raw_bytes(),
+    })
+}
+
+/// 提取整页的字符与链接。两者都是 PDF 点坐标，可直接用于整页覆盖层。
+fn extract_elements(
+    document: &PdfDocument<'static>,
+    page_index: usize,
+) -> Result<(Vec<CharBox>, Vec<LinkBox>)> {
+    let page = document
+        .pages()
+        .get(page_index as PdfPageIndex)
+        .map_err(|error| anyhow!(error))?;
 
     let mut chars = Vec::new();
     if let Ok(text) = page.text() {
@@ -359,15 +478,7 @@ fn render_page(
         }
     }
 
-    Ok(Event::Rendered {
-        page: page_index,
-        request,
-        width,
-        height,
-        bgra,
-        chars,
-        links,
-    })
+    Ok((chars, links))
 }
 
 fn rect_from_pdfium(rect: PdfRect) -> RectPt {

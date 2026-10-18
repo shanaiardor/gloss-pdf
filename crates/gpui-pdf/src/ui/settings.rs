@@ -64,96 +64,204 @@ impl AppState {
                 ),
         );
 
-        // 词典
-        let path = self.settings.current.dictionary_path.clone();
-        let status = match &self.dictionary.load_state {
-            DictLoadState::Unconfigured => "未选择词典".to_string(),
-            DictLoadState::Loading => "正在加载…".to_string(),
-            DictLoadState::Ready { title, entries } => match title {
-                Some(title) => format!("已加载 {entries} 条 · {title}"),
-                None => format!("已加载 {entries} 条"),
-            },
-            DictLoadState::Failed(message) => format!("加载失败：{message}"),
-        };
-
-        let mut dictionary_section = div().flex().flex_col().gap(px(6.)).child(
+        // 文档信息：只读展示 PDF 元数据，缺失字段用「—」。
+        let mut metadata_section = div().flex().flex_col().gap(px(4.)).child(
             div()
                 .text_size(px(13.))
                 .font_weight(FontWeight::MEDIUM)
-                .child("词典"),
+                .child("文档信息"),
+        );
+        match &self.viewer.doc {
+            Some(document) => {
+                for (label, value) in document.metadata.fields() {
+                    metadata_section = metadata_section.child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap(px(8.))
+                            .text_size(px(11.))
+                            .child(
+                                div()
+                                    .w(px(56.))
+                                    .flex_shrink_0()
+                                    .text_color(theme.text_muted)
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(0.))
+                                    .flex_1()
+                                    .truncate()
+                                    .text_color(theme.text)
+                                    .child(value.unwrap_or("—").to_string()),
+                            ),
+                    );
+                }
+            }
+            None => {
+                metadata_section = metadata_section.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.text_muted)
+                        .child("未打开文档"),
+                );
+            }
+        }
+
+        // 词典
+        let dictionaries = self.settings.current.dictionaries.clone();
+        let mut dictionary_section = div().flex().flex_col().gap(px(8.)).child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("词典"),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(theme.text_muted)
+                        .child("按顺序查询，全部启用词典的结果都会显示"),
+                ),
         );
 
-        if let Some(path) = &path {
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.display().to_string());
+        if dictionaries.is_empty() {
+            dictionary_section = dictionary_section.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_muted)
+                    .child("添加一本或多本 .mdx 词典，双击 PDF 中的字词即可查询。"),
+            );
+        } else {
+            for (index, dictionary) in dictionaries.iter().enumerate() {
+                let name = dictionary
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| dictionary.path.display().to_string());
+                let state = self
+                    .dictionary
+                    .status_for(&dictionary.path)
+                    .cloned()
+                    .unwrap_or(DictLoadState::Unconfigured);
+                let status = dictionary_status_label(dictionary.enabled, &state);
+                let status_color = if matches!(state, DictLoadState::Failed(_)) {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                };
 
-            dictionary_section = dictionary_section
-                .child(
-                    div()
-                        .min_w(px(0.))
-                        .truncate()
-                        .text_size(px(12.))
-                        .text_color(theme.text)
-                        .child(name),
-                )
-                .child(
-                    div()
-                        .min_w(px(0.))
-                        .truncate()
-                        .text_size(px(11.))
-                        .text_color(theme.text_muted)
-                        .child(path.display().to_string()),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(theme.text_muted)
-                        .child(status),
-                )
-                .child(
+                dictionary_section = dictionary_section.child(
                     div()
                         .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .mt(px(4.))
-                        .child(action_button(
-                            "settings-pick-dictionary",
-                            "更换词典",
-                            theme,
-                            cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                                this.choose_dictionary(cx);
-                            }),
-                        ))
-                        .child(action_button(
-                            "settings-clear-dictionary",
-                            "清除",
-                            theme,
-                            cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                                this.clear_dictionary(cx);
-                            }),
-                        )),
+                        .flex_col()
+                        .gap(px(2.))
+                        .p_2()
+                        .rounded_md()
+                        .bg(theme.surface_hover)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_size(px(12.))
+                                        .text_color(if dictionary.enabled {
+                                            theme.text
+                                        } else {
+                                            theme.text_muted
+                                        })
+                                        .child(name),
+                                )
+                                .child(mini_button(
+                                    ("settings-dict-toggle", index),
+                                    if dictionary.enabled {
+                                        "停用"
+                                    } else {
+                                        "启用"
+                                    },
+                                    theme,
+                                    cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                                        this.toggle_dictionary(index, cx);
+                                    }),
+                                ))
+                                .child(mini_button(
+                                    ("settings-dict-up", index),
+                                    "↑",
+                                    theme,
+                                    cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                                        this.move_dictionary(index, -1, cx);
+                                    }),
+                                ))
+                                .child(mini_button(
+                                    ("settings-dict-down", index),
+                                    "↓",
+                                    theme,
+                                    cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                                        this.move_dictionary(index, 1, cx);
+                                    }),
+                                ))
+                                .child(mini_button(
+                                    ("settings-dict-remove", index),
+                                    "移除",
+                                    theme,
+                                    cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                                        this.remove_dictionary(index, cx);
+                                    }),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(10.))
+                                .text_color(theme.text_muted)
+                                .child(dictionary.path.display().to_string()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(status_color)
+                                .child(status),
+                        ),
                 );
-        } else {
-            dictionary_section = dictionary_section
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(theme.text_muted)
-                        .child("选择一本 .mdx 词典，双击 PDF 中的字词即可查询。"),
-                )
-                .child(div().mt(px(4.)).child(action_button(
+            }
+        }
+
+        dictionary_section = dictionary_section.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .mt(px(2.))
+                .child(action_button(
                     "settings-pick-dictionary",
-                    "选择 .mdx 文件",
+                    "添加词典",
                     theme,
                     cx.listener(|this, _event: &ClickEvent, _window, cx| {
                         this.choose_dictionary(cx);
                     }),
-                )));
-        }
+                ))
+                .child(action_button(
+                    "settings-clear-dictionary",
+                    "全部清除",
+                    theme,
+                    cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.clear_dictionary(cx);
+                    }),
+                )),
+        );
 
         body = body
+            .child(metadata_section)
             .child(dictionary_section)
             .child(self.update_section(theme, cx))
             .child(
@@ -362,6 +470,42 @@ fn status_line(text: impl Into<String>, theme: &Theme) -> gpui::Div {
         .text_size(px(11.))
         .text_color(theme.text_muted)
         .child(text.into())
+}
+
+fn dictionary_status_label(enabled: bool, state: &DictLoadState) -> String {
+    if !enabled {
+        return "已停用".to_string();
+    }
+    match state {
+        DictLoadState::Unconfigured => "未加载".to_string(),
+        DictLoadState::Loading => "正在加载…".to_string(),
+        DictLoadState::Ready { title, entries } => match title {
+            Some(title) => format!("已加载 {entries} 条 · {title}"),
+            None => format!("已加载 {entries} 条"),
+        },
+        DictLoadState::Failed(message) => format!("加载失败：{message}"),
+    }
+}
+
+fn mini_button(
+    id: impl Into<gpui::ElementId>,
+    label: &'static str,
+    theme: &Theme,
+    listener: impl Fn(&ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px_1()
+        .rounded_sm()
+        .cursor_pointer()
+        .text_size(px(10.))
+        .text_color(theme.text_muted)
+        .hover({
+            let hover_bg = theme.border;
+            move |style| style.bg(hover_bg)
+        })
+        .on_click(listener)
+        .child(label)
 }
 
 fn action_button(

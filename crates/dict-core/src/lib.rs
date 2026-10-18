@@ -9,7 +9,7 @@ pub mod html;
 pub mod model;
 
 pub use css::Stylesheet;
-pub use engine::{Command, DictEngine, Event};
+pub use engine::{Command, DictEngine, DictionaryConfig, DictionaryInfo, Event};
 pub use fonts::FontLibrary;
 pub use html::{NoResources, RenderContext, ResourceResolver, extract_phonetic, render, to_blocks};
 pub use model::{

@@ -1,4 +1,4 @@
-﻿//! 浮动界面组件：顶部胶囊、底部胶囊、窗口按钮、拖拽条。
+//! 浮动界面组件：顶部胶囊、底部胶囊、窗口按钮、拖拽条。
 
 use gpui::{
     App, ClickEvent, Context, Render, Window, WindowControlArea, div, prelude::*, px, rgb, svg,
@@ -149,6 +149,39 @@ impl AppState {
             format!("{} / {}", self.viewer.current_page + 1, page_count)
         };
 
+        // 页码默认是只读标签；点一下变成输入框，Enter 跳页、Esc 收起。
+        let page_control: gpui::AnyElement = if self.page_input_open {
+            div()
+                .h_full()
+                .w(px(64.))
+                .flex()
+                .items_center()
+                .child(self.page_input.clone())
+                .into_any_element()
+        } else {
+            div()
+                .id("page-jump")
+                .min_w(px(70.))
+                .px_2()
+                .py_1()
+                .rounded_full()
+                .text_center()
+                .font_family(theme.mono_font.clone())
+                .text_size(px(12.))
+                .text_color(theme.text_muted)
+                .cursor_pointer()
+                .hover({
+                    let hover_bg = theme.surface_hover;
+                    move |style| style.bg(hover_bg)
+                })
+                .aria_label("跳转到页码")
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.open_page_input(cx);
+                }))
+                .child(page_label)
+                .into_any_element()
+        };
+
         let capsule = div()
             .flex()
             .items_center()
@@ -171,15 +204,7 @@ impl AppState {
                     }
                 }),
             ))
-            .child(
-                div()
-                    .min_w(px(70.))
-                    .text_center()
-                    .font_family(theme.mono_font.clone())
-                    .text_size(px(12.))
-                    .text_color(theme.text_muted)
-                    .child(page_label),
-            )
+            .child(page_control)
             .child(pill_button(
                 "next",
                 "›",
@@ -396,6 +421,15 @@ impl Render for IconTooltip {
     }
 }
 
+/// 解析页码输入：非数字返回 `None`，数字夹取到 1..=page_count 后转成 0 基下标。
+pub(crate) fn parse_page_number(input: &str, page_count: usize) -> Option<usize> {
+    if page_count == 0 {
+        return None;
+    }
+    let number = input.trim().parse::<usize>().ok()?;
+    Some(number.clamp(1, page_count) - 1)
+}
+
 /// 适宽/适页按钮：当前生效的模式用强调色标出来。
 fn fit_button(
     id: &'static str,
@@ -429,4 +463,26 @@ fn window_control_dot(
         // 首页顶部整条都可拖动，窗口按钮要挡住拖拽命中区。
         .occlude()
         .window_control_area(area)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_page_number;
+
+    #[test]
+    fn page_number_is_clamped_into_range() {
+        assert_eq!(parse_page_number("5", 10), Some(4));
+        assert_eq!(parse_page_number("0", 10), Some(0));
+        assert_eq!(parse_page_number("99", 10), Some(9));
+        assert_eq!(parse_page_number(" 7 ", 10), Some(6));
+    }
+
+    #[test]
+    fn page_number_rejects_non_numbers_and_empty_documents() {
+        assert_eq!(parse_page_number("", 10), None);
+        assert_eq!(parse_page_number("abc", 10), None);
+        assert_eq!(parse_page_number("-1", 10), None);
+        assert_eq!(parse_page_number("1.5", 10), None);
+        assert_eq!(parse_page_number("3", 0), None);
+    }
 }

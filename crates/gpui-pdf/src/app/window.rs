@@ -113,9 +113,9 @@ impl super::AppState {
         }
 
         self.dictionary_window = None;
-        if self.settings.current.dictionary_path.is_none() {
+        if !self.settings.current.has_enabled_dictionary() {
             self.settings_open = true;
-            self.set_status("请先在设置中选择 MDX 词典", cx);
+            self.set_status("请先在设置中添加并启用 MDX 词典", cx);
             cx.notify();
             return;
         }
@@ -125,7 +125,9 @@ impl super::AppState {
     }
 
     pub(super) fn ensure_dictionary_window(&mut self, cx: &mut Context<Self>) {
-        let view = DictionaryView::from(&self.dictionary);
+        let mut view = DictionaryView::from(&self.dictionary);
+        view.history = self.dict_history.entries().to_vec();
+        view.suggestions = self.dictionary.suggestions.clone();
         let theme = self.theme.clone();
 
         if let Some(handle) = self.dictionary_window {
@@ -168,7 +170,9 @@ impl super::AppState {
             ..Default::default()
         };
 
-        let view = DictionaryView::from(&self.dictionary);
+        let mut view = DictionaryView::from(&self.dictionary);
+        view.history = self.dict_history.entries().to_vec();
+        view.suggestions = self.dictionary.suggestions.clone();
         let theme = self.theme.clone();
         let dict_query = self.dict_query.clone();
 
@@ -191,7 +195,9 @@ impl super::AppState {
         let Some(handle) = self.dictionary_window else {
             return;
         };
-        let view = DictionaryView::from(&self.dictionary);
+        let mut view = DictionaryView::from(&self.dictionary);
+        view.history = self.dict_history.entries().to_vec();
+        view.suggestions = self.dictionary.suggestions.clone();
         let theme = self.theme.clone();
 
         if handle

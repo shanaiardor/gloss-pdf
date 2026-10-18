@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/dict-core", "crates/pdf-core", "crates/gpui-pdf"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/shanaiardor/gpui-pdf"
@@ -22,4 +22,7 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "4bd1993783703e92a
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "4bd1993783703e92affb781503916d1f152f599f", package = "gpui_platform" }
 
 [profile.release]
-debug = true
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

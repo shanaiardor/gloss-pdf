@@ -21,6 +21,17 @@ pub const PREFETCH_PAGES: usize = 1;
 /// 阅读锚线在视口里的纵向位置比例：取中线，页码在页面过半时切换。
 pub const ANCHOR_RATIO: f32 = 0.5;
 
+/// Ctrl + 滚轮每一格（约 3 行）的缩放倍率。
+pub(crate) const WHEEL_ZOOM_STEP: f32 = 1.15;
+
+/// 把滚轮行数换算成缩放倍率；一格约 3 行，触控板的小增量按比例折算。
+pub(crate) fn wheel_zoom_factor(lines: f32) -> f32 {
+    if !lines.is_finite() {
+        return 1.0;
+    }
+    WHEEL_ZOOM_STEP.powf((lines / 3.0).clamp(-2.0, 2.0))
+}
+
 pub const MIN_ZOOM: f32 = 0.25;
 pub const MAX_ZOOM: f32 = 4.0;
 
@@ -237,6 +248,37 @@ impl DocumentLayout {
 
         let start = first.saturating_sub(overscan);
         start..(end + overscan).min(self.boxes.len())
+    }
+
+    /// 内容坐标 `(x, y)` 落在哪一页、页内横纵比例各是多少。
+    ///
+    /// 比例夹在 0..1：指针落在页边留白或页间空隙时，仍以最近的一页为锚。
+    pub fn page_ratios(&self, x: f32, y: f32) -> Option<(usize, f32, f32)> {
+        let page = self.page_at(y);
+        let page_box = self.page_box(page)?;
+        let ratio_x = ((x - page_box.left) / page_box.width.max(1.0)).clamp(0.0, 1.0);
+        let ratio_y = ((y - page_box.top) / page_box.height.max(1.0)).clamp(0.0, 1.0);
+        Some((page, ratio_x, ratio_y))
+    }
+
+    /// 让「第 `page` 页的 `(ratio_x, ratio_y)` 点」落在视口 `(screen_x, screen_y)` 处
+    /// 所需的滚动偏移（左、上，单位像素），已夹在内容范围内。
+    pub fn scroll_for_ratios(
+        &self,
+        page: usize,
+        ratio_x: f32,
+        ratio_y: f32,
+        screen_x: f32,
+        screen_y: f32,
+        viewport_width: f32,
+        viewport_height: f32,
+    ) -> Option<(f32, f32)> {
+        let page_box = self.page_box(page)?;
+        let left = page_box.left + ratio_x.clamp(0.0, 1.0) * page_box.width - screen_x;
+        let top = page_box.top + ratio_y.clamp(0.0, 1.0) * page_box.height - screen_y;
+        let max_left = (self.content_width - viewport_width.max(0.0)).max(0.0);
+        let max_top = (self.content_height - viewport_height.max(0.0)).max(0.0);
+        Some((left.clamp(0.0, max_left), top.clamp(0.0, max_top)))
     }
 
     /// 把滚动位置夹到合法范围，返回内容坐标下的顶部偏移（≥ 0）。
@@ -525,5 +567,62 @@ mod tests {
         // 旧记录只有「页顶比例 0」，恢复后页顶要落在顶部留白处，而不是被推到屏幕中间。
         let top = layout.scroll_top_for_anchor(1, 0.0, 600.0);
         assert!((top - (second_top - TOP_INSET)).abs() < 0.001);
+    }
+}
+
+#[cfg(test)]
+mod point_anchor_tests {
+    use super::*;
+
+    #[test]
+    fn zooming_keeps_the_pointer_over_the_same_content_point() {
+        let pages = [PageSize {
+            width: 600.0,
+            height: 800.0,
+        }];
+        let old = DocumentLayout::new(&pages, 1.0, 800.0);
+
+        // 指针在视口 (300, 400)，滚动到第 0 页页内 30% 处。
+        let (page, ratio_x, ratio_y) = old.page_ratios(300.0, 400.0).unwrap();
+        let (left, top) = old
+            .scroll_for_ratios(page, ratio_x, ratio_y, 300.0, 400.0, 800.0, 600.0)
+            .unwrap();
+        let content_x = left + 300.0;
+        let content_y = top + 400.0;
+
+        let new = DocumentLayout::new(&pages, 2.0, 800.0);
+        let (page, ratio_x, ratio_y) = new.page_ratios(content_x, content_y).unwrap();
+        let (left, top) = new
+            .scroll_for_ratios(page, ratio_x, ratio_y, 300.0, 400.0, 800.0, 600.0)
+            .unwrap();
+
+        // 缩放后指针下仍是同一个内容点。
+        assert!((left + 300.0 - content_x).abs() < 0.01);
+        assert!((top + 400.0 - content_y).abs() < 0.01);
+    }
+
+    #[test]
+    fn one_wheel_notch_zooms_by_fifteen_percent() {
+        assert!((wheel_zoom_factor(3.0) - 1.15).abs() < 0.0001);
+        assert!((wheel_zoom_factor(-3.0) - 1.0 / 1.15).abs() < 0.0001);
+        assert!((wheel_zoom_factor(0.0) - 1.0).abs() < f32::EPSILON);
+        // 极大增量夹在两格以内，避免一次事件把缩放甩到底。
+        assert!((wheel_zoom_factor(300.0) - 1.15_f32.powi(2)).abs() < 0.0001);
+        assert!((wheel_zoom_factor(f32::NAN) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn anchor_scroll_is_clamped_to_content() {
+        let pages = [PageSize {
+            width: 600.0,
+            height: 800.0,
+        }];
+        let layout = DocumentLayout::new(&pages, 1.0, 800.0);
+        let (left, top) = layout
+            .scroll_for_ratios(0, 1.0, 1.0, 0.0, 0.0, 800.0, 600.0)
+            .unwrap();
+        assert!(left >= 0.0);
+        assert!(top >= 0.0);
+        assert!(top <= layout.content_height);
     }
 }

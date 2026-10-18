@@ -11,9 +11,9 @@
 - **首页**：左侧导航 + 顶部搜索 + 拖拽打开区 + 「最近阅读」网格；最近打开的文件和阅读位置都会持久化
 - **没有 Windows 原生标题栏**：左上角自绘红黄绿窗口按钮，顶部 46px 透明拖拽区
 - 打开文档后切换为阅读器：顶部居中一颗浮动胶囊（首页、打开、目录、搜索、高亮、保存、主题）
-- 底部居中浮动胶囊：上一页 / 页码 / 下一页 / 缩放 / 适宽 / 适页
+- 底部居中浮动胶囊：上一页 / 页码 / 下一页 / 缩放 / 适宽 / 适页；点击页码可直接输入跳转
 - 目录和搜索都是浮层，按需出现
-- **词典是独立窗口**：同样没有系统标题栏，顶部一条自绘窄标题栏；窗口可自由拖动，靠近主窗口边缘时自动吸附贴合，不遮挡 PDF 页面
+- **词典是独立窗口**：同样没有系统标题栏，顶部一条自绘窄标题栏；窗口可自由拖动，靠近主窗口边缘时自动吸附贴合，不遮挡 PDF 页面。可同时启用多本 MDX 词典，查询结果按设置顺序聚合并标注来源
 - 拖动窗口：首页顶部整条（搜索框和窗口按钮除外）都可拖动；阅读器顶部 46px（浮动胶囊除外）也可拖动，可拖动区域显示手型光标。双击顶部可最大化。
 - 关闭文档或点胶囊里的「首页」回到首页
 
@@ -21,9 +21,12 @@
 
 ## 功能
 
-- **页面渲染**：PDFium 渲染成位图 → GPUI 纹理，缩放/适宽/适页即时重渲染（独立工作线程，UI 不卡）
+- **页面渲染**：PDFium 按 512×512 瓦片渲染成位图 → GPUI 纹理，只请求与视口相交的瓦片；缩放/适宽/适页即时重渲染（独立工作线程，UI 不卡）
+- **内存预算**：瓦片位图缓存默认上限 256 MiB，超限时先淘汰离可视区域最远的页/瓦片；400% 放大浏览多页时内存不会随页数线性增长
+- **跳页**：点击底部页码出现输入框，`Enter` 跳转并夹取到 1..总页数，`Esc` 取消；输入框聚焦时不会误触阅读快捷键
 - **整页适应**：打开文档默认按整页显示，宽高同时适应；窗口尺寸变化时自动重新计算（手动缩放后不再跟随）
 - **按纸张选窗口**：打开文档时按页面比例调整窗口大小，横版/竖版 PDF 都不会在两侧或上下留出大片空白
+- **文档信息**：读取并展示 PDF 的标题、作者、主题、关键词、创建者、生成器、创建时间与修改时间；窗口标题和最近阅读优先使用标题，缺失时回退文件名
 - **首页与最近阅读**：拖拽 PDF 到窗口任意位置即可打开；最近阅读按时间倒序持久化，支持搜索过滤、复制路径、移除记录；卡片显示上次读到的页码与百分比
 - **阅读进度**：页码、页内滚动位置、缩放（或适宽/适页模式）按文件保存，下次打开同一个 PDF 自动恢复；切页、缩放、滚动和退出时都会落盘
 - **文本选择**：鼠标拖选、双击选词、`Ctrl+C` 复制（按行重建换行与空格）
@@ -36,8 +39,10 @@
 - **高亮批注**：选中文字按 `H` 加高亮，`Ctrl+S` 保存；存在 PDF 旁边的 sidecar JSON，下次打开自动恢复。
   `Ctrl+H` 打开批注侧栏：按页列出高亮、点击跳页、右侧 ✕ 删除（删除会立即写盘）
 - **词典查词**：双击 PDF 中的字词，或直接在词典窗口里输入（支持中文输入法）后回车，
-  在独立的无边框词典窗口里按 MDX 自带的 HTML/CSS 渲染释义
-- **缩放/主题**：`Ctrl+=` / `Ctrl+-` 缩放，`Ctrl+0` 适页，`Ctrl+1` 适宽；`Ctrl+D` 深/浅色切换
+  在独立的无边框词典窗口里按 MDX 自带的 HTML/CSS 渲染释义。设置中可添加/移除/排序/启停多本 MDX，
+  查询按顺序聚合且每条释义标注来源；输入时给出来自各词典的前缀联想（去重、最多 8 条），
+  查词历史持久化、倒序去重、上限 50 条，可点击重查或一键清空
+- **缩放/主题**：`Ctrl+=` / `Ctrl+-` 缩放，`Ctrl+0` 适页，`Ctrl+1` 适宽；`Ctrl+滚轮` 以指针下的页面点为锚缩放（每格 1.15 倍，范围 25%–400%），普通滚轮仍只滚动；`Ctrl+D` 深/浅色切换
 
 ## 运行
 
@@ -69,12 +74,15 @@ Windows 安装包由 Inno Setup 生成，脚本在 `installer/gpui-pdf.iss`；CI
 ```powershell
 # 1. 改 Cargo.toml 里的 [workspace.package] version（CI 会校验 tag 与它一致）
 # 2. 提交后打 tag 并推送
-git tag v0.1.0
+git tag v0.1.1
 git push origin main --tags
 ```
 
-CI 会编译 release、生成 `gpui-pdf-0.1.0-setup.exe`，并作为 release 资产上传。
+CI 会编译 release、生成 `gpui-pdf-0.1.1-setup.exe`，并作为 release 资产上传。
 普通 push 与 PR 只上传构建产物（artifact），不发 release。
+
+release 构建关闭 debug 信息，并启用 fat LTO、单 codegen unit、`panic = "abort"` 与
+`strip = true`，在保证功能不变的前提下明显缩小 exe。
 
 安装包安装到当前用户的 `%LOCALAPPDATA%\Programs\gpui-pdf`，不触发 UAC；
 `pdfium.dll` 与 exe 放在同一目录，运行时按「exe 目录 → 当前目录 → 系统库」
@@ -91,8 +99,8 @@ CI 会编译 release、生成 `gpui-pdf-0.1.0-setup.exe`，并作为 release 资
 ```powershell
 cargo build --release -p gpui-pdf
 & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
-  "/DAPP_VERSION=0.1.0" "installer\gpui-pdf.iss"
-# 输出：dist\gpui-pdf-0.1.0-setup.exe
+  "/DAPP_VERSION=0.1.1" "installer\gpui-pdf.iss"
+# 输出：dist\gpui-pdf-0.1.1-setup.exe
 ```
 
 不放安装包、直接发绿包时，需要带上：
@@ -118,6 +126,8 @@ crates/gpui-pdf/assets/fonts/lxgw-wenkai-tc/OFL.txt   # 字体许可（OFL 要�
 | `Ctrl+S` | 保存高亮 |
 | `Ctrl+H` | 批注侧栏（高亮列表，可跳转/删除） |
 | `Ctrl+=` / `Ctrl+-` | 放大 / 缩小 |
+| `Ctrl+滚轮` | 以指针位置为锚缩放（25%–400%） |
+| 点击底部页码 | 输入页码后 `Enter` 跳转，`Esc` 取消 |
 | `Ctrl+0` / `Ctrl+1` | 适页（整页可见） / 适宽 |
 | `Ctrl+D` | 切换深色/浅色 |
 | `PageDown` / `PageUp` | 下一页 / 上一页 |
@@ -132,8 +142,11 @@ Cargo.toml                 # workspace
 crates/
 ├── pdf-core/              # PDF 引擎（不依赖 UI，可单独测试）
 │   └── src/
-│       ├── engine.rs      # PDFium worker：打开、渲染、文本/链接/目录提取、全文搜索
-│       └── model.rs       # RectPt / CharBox / Link / Outline / PageHits
+│       ├── engine.rs      # PDFium worker：打开、瓦片渲染、文本/链接/目录提取、全文搜索
+│       ├── metadata.rs    # 兜底读取 /ModDate 等文件尾元数据
+│       └── model.rs       # RectPt / CharBox / Link / Outline / PageHits / DocumentMetadata
+├── dict-core/             # MDX 词典引擎（不依赖 UI）
+│   └── src/engine.rs      # 多词典加载、聚合查询、前缀联想、MDD/CSS/字体
 └── gpui-pdf/              # GPUI 应用
     ├── assets/
     │   ├── icons/         # 内嵌 SVG 图标
@@ -145,10 +158,15 @@ crates/
         ├── app.rs         # 控制器：状态容器、订阅、顶层 Render
         ├── app/update.rs  # 更新状态机：检查/下载/启动安装器
         ├── update.rs      # GitHub Releases 检查与下载（self_update）
-        ├── layout.rs      # 适宽/适页缩放、页边距、按纸张选择窗口尺寸
+        ├── layout.rs      # 适宽/适页缩放、页边距、按纸张选择窗口尺寸、锚点换算
+        ├── tiles.rs       # 512×512 瓦片网格与可视瓦片计算
         ├── home.rs        # 首页状态：最近阅读持久化、搜索过滤、侧栏选中项
+        ├── settings.rs    # 设置读写：主题、多词典列表、自动更新
+        ├── dictionary.rs  # 词典窗口状态：多词典、历史、联想、查询结果
+        ├── dict_history.rs # 查词历史持久化（JSON，上限 50）
+        ├── dict_suggest.rs # 联想去重/限长/防抖常量
         ├── progress.rs    # 阅读进度模型：页码/页内滚动/缩放/适应模式
-        ├── viewer.rs      # 阅读器状态：文档/页/缩放/滚动/页面缓存
+        ├── viewer.rs      # 阅读器状态：文档/页/瓦片缓存/缩放/滚动/内存预算
         ├── selection.rs   # 选区、文本重建、双击选词
         ├── search.rs      # 搜索状态：本页匹配 + 全文命中 + 跨页跳转
         ├── highlights.rs  # 高亮 + sidecar JSON（稳定 id、可删除）
@@ -156,12 +174,14 @@ crates/
         ├── theme.rs       # 配色与字体
         └── ui/            # 纯呈现层
             ├── home.rs    # 首页：侧栏、搜索、拖拽区、最近阅读卡片
-            ├── chrome.rs  # 顶部/底部胶囊、窗口按钮、拖拽条
-            ├── page.rs    # 滚动容器、页面、覆盖层
+            ├── chrome.rs  # 顶部/底部胶囊、页码输入、窗口按钮、拖拽条
+            ├── page.rs    # 滚动容器、瓦片页面、覆盖层
             ├── outline.rs # 目录浮层
             ├── annotations.rs # 批注侧栏：高亮列表、跳转、删除
             ├── text_input.rs  # 单行输入框：EntityInputHandler + 自定义 Element
             ├── search_bar.rs
+            ├── settings.rs    # 设置面板：文档信息、多词典、更新
+            ├── dictionary.rs  # 独立词典窗口：释义、历史、联想
             ├── toast.rs
             └── empty.rs
 pdfium.dll                 # PDFium 动态库（运行时绑定）
@@ -176,8 +196,11 @@ samples/                   # 测试用 PDF（dummy.pdf / colors.pdf）
 测试：
 
 ```powershell
-cargo test -p gpui-pdf
+cargo test --workspace --locked
 ```
+
+当前基线：`gpui-pdf` 128 项通过（另 1 项联网测试忽略）、`dict-core` 50 项通过
+（另 1 项真实词典测试忽略）、`pdf-core` 15 项通过。
 
 手动验证文本选择：`cargo run -p gpui-pdf -- samples/dummy.pdf`，拖选或双击选词后松开鼠标，
 终端会打印页号、字符索引区间、字符数和选区文本（`Ctrl+C` 复制时同样打印），方便对照
@@ -186,9 +209,10 @@ cargo test -p gpui-pdf
 关键设计：
 
 - **PDFium 关在独立线程**：`PdfDocument` 生命周期绑定 `Pdfium`，所以 PDFium 被 leak 成
-  `'static`，文档只在工作线程里；UI 通过 channel 收 `Opened` / `Rendered` 事件。
+  `'static`，文档只在工作线程里；UI 通过 channel 收 `Opened` / `RenderedTile` / `PageElements` 事件。
 - **图片层 + 元素层**：位图只负责显示；字符包围盒（`tight_bounds`）与链接矩形单独保存，
-  用于命中测试和覆盖层绘制。
+  用于命中测试和覆盖层绘制。大页面按 512×512 瓦片渲染，覆盖层仍使用整页坐标，
+  因此文本选择、链接、搜索高亮与高亮批注在瓦片拼接后不会错位。
 - **颜色通道**：GPUI `RenderImage` 的缓冲区是 **BGRA**。渲染时对 Pdfium 关闭字节序反转
   （`.set_reverse_byte_order(false)`）并直接取 `as_raw_bytes()`；若用 `as_rgba_bytes()`，
   红蓝通道会互换。
@@ -235,6 +259,17 @@ samples/dummy.pdf.highlights.json
 旧版本进度里没有适应模式，会按适页打开一次，之后手动缩放会记录为 `free` 并照常恢复。
 如果文件被替换成页数不同的版本，会放弃旧页码、从头打开，避免跳到错误位置。
 
+设置与查词历史也放在同一目录：
+
+```
+%APPDATA%\gpui-pdf\settings.json
+%APPDATA%\gpui-pdf\dictionary_history.json
+```
+
+`settings.json` 内保存多词典列表（路径、启用状态、顺序）。旧版本的单本 `dictionary_path`
+会在读取时自动迁移成一条启用记录，迁移后继续按新格式保存；词典历史与最近阅读一样做容错读取，
+文件损坏时从空历史开始，不影响启动。
+
 不修改原始 PDF。原因见「已知限制」。
 
 每条高亮带一个稳定的 `id` 和高亮时的选中文字，批注侧栏用它做列表和删除；旧版本只写
@@ -244,13 +279,14 @@ samples/dummy.pdf.highlights.json
 
 - **全文搜索要先把每页文本过一遍**：第一次搜某个文档时 worker 会逐页调 PDFium 提取文本，
   大文档开头会有几秒延迟（之后按页缓存在 worker 里，改关键词只重算字符串匹配）。
-  搜索期间搜索框显示「搜索中…」。
+  搜索期间搜索框显示「已扫描 N/M 页」，结果返回后显示命中数。
 - **高亮没有写进 PDF 标准注释**：PDFium 的公开 C API 不提供 `FPDFAnnot_GenerateAppearance`，
   手工创建的 Highlight 注释缺少 `/AP` 外观流，其他阅读器不一定渲染。因此先用 sidecar 持久化；
   后续可以自己生成 `/AP` Form XObject。
 - **批注只有高亮一种**：下划线、便签、备注文字还没做；侧栏也没有编辑/搜索。
-- **单页视图**：一次显示一页，页内可滚动；没有连续多页滚动、缩略图侧栏。
 - **最近阅读缩略图是占位排版**：没有读取 PDF 首页生成真实缩略图，卡片里的图形只是按路径稳定选择的示意图。
+- **瓦片缓存按位图字节计**：默认预算 256 MiB；若视口大到连可见瓦片都放不下，会优先保住可见瓦片、暂时超出预算，而不是显示空白。
+- **未做页面旋转与双页并排**：目前固定竖排单页连续滚动。
 - **自动调窗口不改变窗口位置**：GPUI 只暴露了改尺寸的接口；窗口靠屏幕下方时会按剩余空间缩小，避免伸出屏幕。
 - **未做表单字段**：PDFium 能渲染 widget，但填写/保存还没接。
 

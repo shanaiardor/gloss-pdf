@@ -6,14 +6,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::home::user_data_dir;
 
+/// 设置里的一本词典：路径 + 是否参与查询。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DictionarySetting {
+    pub path: PathBuf,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     /// 上次使用的主题。
     #[serde(default)]
     pub dark: bool,
-    /// 用户选择的 `.mdx` 词典。
+    /// 旧版单词典字段；仅用于向后兼容，新代码以 `dictionaries` 为准。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dictionary_path: Option<PathBuf>,
+    /// 用户添加的词典，顺序就是查询顺序。
+    #[serde(default)]
+    pub dictionaries: Vec<DictionarySetting>,
     /// 启动后自动检查 GitHub 更新；默认开启。
     #[serde(default = "default_true")]
     pub auto_check_updates: bool,
@@ -24,8 +35,45 @@ impl Default for Settings {
         Self {
             dark: false,
             dictionary_path: None,
+            dictionaries: Vec::new(),
             auto_check_updates: true,
         }
+    }
+}
+
+impl Settings {
+    /// 兼容旧配置：只有 `dictionary_path` 时迁移成单本启用词典；去重重复路径。
+    pub fn migrate(&mut self) {
+        if self.dictionaries.is_empty()
+            && let Some(path) = self.dictionary_path.take()
+        {
+            self.dictionaries.push(DictionarySetting {
+                path,
+                enabled: true,
+            });
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        self.dictionaries
+            .retain(|dictionary| seen.insert(dictionary.path.clone()));
+
+        if let Some(path) = self
+            .dictionaries
+            .iter()
+            .find(|dictionary| dictionary.enabled)
+            .or_else(|| self.dictionaries.first())
+            .map(|dictionary| dictionary.path.clone())
+        {
+            self.dictionary_path = Some(path);
+        } else {
+            self.dictionary_path = None;
+        }
+    }
+
+    pub fn has_enabled_dictionary(&self) -> bool {
+        self.dictionaries
+            .iter()
+            .any(|dictionary| dictionary.enabled)
     }
 }
 
@@ -42,11 +90,12 @@ pub struct SettingsStore {
 impl SettingsStore {
     pub fn load() -> Self {
         let storage = user_data_dir().map(|directory| directory.join("settings.json"));
-        let current = storage
+        let mut current = storage
             .as_deref()
             .and_then(|path| std::fs::read_to_string(path).ok())
             .map(|text| parse_settings(&text))
             .unwrap_or_default();
+        current.migrate();
 
         Self { current, storage }
     }
@@ -62,7 +111,9 @@ impl SettingsStore {
             log::warn!("无法创建设置目录 {}: {error}", parent.display());
             return;
         }
-        match serde_json::to_string_pretty(&self.current) {
+        let mut snapshot = self.current.clone();
+        snapshot.migrate();
+        match serde_json::to_string_pretty(&snapshot) {
             Ok(json) => {
                 if let Err(error) = std::fs::write(path, json) {
                     log::warn!("无法写入设置 {}: {error}", path.display());
@@ -87,6 +138,10 @@ mod tests {
         let settings = Settings {
             dark: true,
             dictionary_path: Some(PathBuf::from("C:/dicts/oxford.mdx")),
+            dictionaries: vec![DictionarySetting {
+                path: PathBuf::from("C:/dicts/oxford.mdx"),
+                enabled: true,
+            }],
             auto_check_updates: false,
         };
         let json = serde_json::to_string(&settings).unwrap();
@@ -99,7 +154,77 @@ mod tests {
         let parsed: Settings = serde_json::from_str("{}").unwrap();
         assert!(!parsed.dark);
         assert!(parsed.dictionary_path.is_none());
+        assert!(parsed.dictionaries.is_empty());
         assert!(parsed.auto_check_updates, "旧设置默认开启自动检查");
+    }
+
+    #[test]
+    fn legacy_dictionary_path_migrates_to_one_enabled_entry() {
+        let mut settings: Settings =
+            serde_json::from_str(r#"{"dictionary_path":"C:/dicts/oxford.mdx"}"#).unwrap();
+        assert!(settings.dictionaries.is_empty());
+        settings.migrate();
+        assert_eq!(settings.dictionaries.len(), 1);
+        assert_eq!(
+            settings.dictionaries[0].path,
+            PathBuf::from("C:/dicts/oxford.mdx")
+        );
+        assert!(settings.dictionaries[0].enabled);
+        assert_eq!(
+            settings.dictionary_path,
+            Some(PathBuf::from("C:/dicts/oxford.mdx"))
+        );
+    }
+
+    #[test]
+    fn migration_keeps_order_enabled_flags_and_deduplicates() {
+        let mut settings = Settings {
+            dictionaries: vec![
+                DictionarySetting {
+                    path: PathBuf::from("C:/dicts/a.mdx"),
+                    enabled: false,
+                },
+                DictionarySetting {
+                    path: PathBuf::from("C:/dicts/b.mdx"),
+                    enabled: true,
+                },
+                DictionarySetting {
+                    path: PathBuf::from("C:/dicts/a.mdx"),
+                    enabled: true,
+                },
+            ],
+            ..Settings::default()
+        };
+        settings.migrate();
+        assert_eq!(settings.dictionaries.len(), 2);
+        assert_eq!(
+            settings.dictionaries[0].path,
+            PathBuf::from("C:/dicts/a.mdx")
+        );
+        assert!(!settings.dictionaries[0].enabled);
+        assert_eq!(
+            settings.dictionaries[1].path,
+            PathBuf::from("C:/dicts/b.mdx")
+        );
+        assert!(settings.dictionaries[1].enabled);
+        assert!(settings.has_enabled_dictionary());
+    }
+
+    #[test]
+    fn no_enabled_dictionary_clears_legacy_path() {
+        let mut settings = Settings {
+            dictionaries: vec![DictionarySetting {
+                path: PathBuf::from("C:/dicts/a.mdx"),
+                enabled: false,
+            }],
+            ..Settings::default()
+        };
+        settings.migrate();
+        assert!(!settings.has_enabled_dictionary());
+        assert_eq!(
+            settings.dictionary_path,
+            Some(PathBuf::from("C:/dicts/a.mdx"))
+        );
     }
 
     #[test]
@@ -132,6 +257,10 @@ mod tests {
             current: Settings {
                 dark: true,
                 dictionary_path: Some(PathBuf::from("C:/dicts/oxford.mdx")),
+                dictionaries: vec![DictionarySetting {
+                    path: PathBuf::from("C:/dicts/oxford.mdx"),
+                    enabled: true,
+                }],
                 auto_check_updates: false,
             },
             storage: Some(path.clone()),

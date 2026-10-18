@@ -21,7 +21,7 @@ use gpui::{
 #[cfg(target_os = "windows")]
 use gpui::{App, Bounds, MouseButton, MouseDownEvent, Pixels, Point, WindowId};
 
-use crate::dictionary::{DictLoadState, DictionaryView};
+use crate::dictionary::{DictLoadState, DictRequest, DictionaryView};
 use crate::theme::Theme;
 use crate::ui::text_input::{TextInput, TextInputEvent};
 #[cfg(target_os = "windows")]
@@ -29,8 +29,8 @@ use crate::window_layout::{RectF, snap_origin};
 #[cfg(target_os = "windows")]
 use crate::window_move;
 
-/// 把查询词送回主窗口的通道；释义里的链接复用它。
-type LookupSender = futures::channel::mpsc::UnboundedSender<String>;
+/// 把查词/清空历史请求送回主窗口的通道；释义里的链接复用查词部分。
+type LookupSender = futures::channel::mpsc::UnboundedSender<DictRequest>;
 
 pub(crate) struct DictionaryWindow {
     view: DictionaryView,
@@ -80,7 +80,7 @@ impl DictionaryWindow {
                     // Esc 清空输入框；释义保持不动，方便继续看。
                     this.input.update(cx, |input, cx| input.clear(cx));
                 }
-                TextInputEvent::Changed => {}
+                TextInputEvent::Changed => this.suggest(cx),
             },
         )
         .detach();
@@ -101,20 +101,49 @@ impl DictionaryWindow {
         if term.is_empty() {
             return;
         }
-        if self.lookup.unbounded_send(term).is_err() {
+        if self.lookup.unbounded_send(DictRequest::Lookup(term)).is_err() {
+            log::warn!("dictionary lookup channel closed");
+        }
+    }
+
+    /// 输入变化：把最新内容发给主窗口做防抖联想。
+    fn suggest(&mut self, cx: &mut Context<Self>) {
+        let term = self.input.read(cx).value().to_string();
+        if self.lookup.unbounded_send(DictRequest::Suggest(term)).is_err() {
+            log::warn!("dictionary lookup channel closed");
+        }
+    }
+
+    /// 点击历史/建议词条：回填输入框并立即重查。
+    fn query_history(&mut self, term: String, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |input, cx| input.set_value(term.clone(), cx));
+        if self
+            .lookup
+            .unbounded_send(DictRequest::Lookup(term))
+            .is_err()
+        {
+            log::warn!("dictionary lookup channel closed");
+        }
+    }
+
+    fn clear_history(&mut self) {
+        if self.lookup.unbounded_send(DictRequest::ClearHistory).is_err() {
             log::warn!("dictionary lookup channel closed");
         }
     }
 
     pub fn apply(&mut self, view: DictionaryView, theme: Theme, cx: &mut Context<Self>) {
+        // 只有“查询词变了”才回填输入框；联想/加载状态同步不能覆盖用户正在输入的内容。
+        let word_changed = self.view.word != view.word;
         self.view = view;
         self.theme = theme.clone();
         self.input
             .update(cx, |input, cx| input.set_theme(theme, cx));
 
-        // 双击查词时把词回填到输入框，方便接着改字继续查。
+        // 双击查词或点击历史/建议时把词回填到输入框，方便接着改字继续查。
         let word = self.view.word.clone();
-        if !word.is_empty() && self.input.read(cx).value() != word {
+        if word_changed && !word.is_empty() && self.input.read(cx).value() != word {
             self.input.update(cx, |input, cx| input.set_value(word, cx));
         }
 
@@ -276,6 +305,8 @@ impl Render for DictionaryWindow {
             .font_family(theme.font_family.clone())
             .child(self.titlebar(&theme, word, cx))
             .child(self.query_row(&theme, cx))
+            .child(self.suggestions_row(&theme, cx))
+            .child(self.history_row(&theme, cx))
             .child(body)
     }
 }
@@ -356,6 +387,116 @@ impl DictionaryWindow {
             )
     }
 
+    /// 前缀建议：跨词典、去重、最多 8 条，点击填入并查询。
+    fn suggestions_row(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .text_size(px(11.));
+
+        if self.view.suggestions.is_empty() {
+            return row;
+        }
+
+        row = row.child(div().text_color(theme.text_muted).child("建议"));
+        for (index, term) in self.view.suggestions.clone().into_iter().enumerate() {
+            let id = ElementId::NamedInteger("dict-suggestion".into(), index as u64);
+            let label = term.clone();
+            row = row.child(
+                div()
+                    .id(id)
+                    .max_w(px(180.))
+                    .truncate()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .bg(theme.surface)
+                    .border_1()
+                    .border_color(theme.border)
+                    .cursor_pointer()
+                    .hover({
+                        let hover = theme.accent_hover;
+                        move |style| style.bg(hover)
+                    })
+                    .on_click(cx.listener(move |this, _event: &gpui::ClickEvent, _window, cx| {
+                        this.query_history(label.clone(), cx);
+                    }))
+                    .child(term),
+            );
+        }
+        row
+    }
+
+    /// 查词历史：最新的在前，点击重查；右侧可一键清空。
+    fn history_row(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .pb_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .text_size(px(11.));
+
+        if self.view.history.is_empty() {
+            return row;
+        }
+
+        row = row.child(div().text_color(theme.text_muted).child("最近"));
+        for (index, term) in self.view.history.clone().into_iter().enumerate() {
+            let id = ElementId::NamedInteger("dict-history".into(), index as u64);
+            let label = term.clone();
+            row = row.child(
+                div()
+                    .id(id)
+                    .max_w(px(140.))
+                    .truncate()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .bg(theme.surface)
+                    .border_1()
+                    .border_color(theme.border)
+                    .cursor_pointer()
+                    .hover({
+                        let hover = theme.accent_hover;
+                        move |style| style.bg(hover)
+                    })
+                    .on_click(cx.listener(move |this, _event: &gpui::ClickEvent, _window, cx| {
+                        this.query_history(label.clone(), cx);
+                    }))
+                    .child(term),
+            );
+        }
+
+        row.child(
+            div()
+                .id("dict-history-clear")
+                .ml_auto()
+                .px_2()
+                .py(px(2.))
+                .rounded_md()
+                .text_color(theme.text_muted)
+                .cursor_pointer()
+                .hover({
+                    let hover = theme.accent_hover;
+                    move |style| style.bg(hover)
+                })
+                .on_click(cx.listener(|this, _event: &gpui::ClickEvent, _window, _cx| {
+                    this.clear_history();
+                }))
+                .child("清空"),
+        )
+    }
+
     /// 查词输入行：手动输入 + 「查」按钮。
     fn query_row(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let hover = theme.accent_hover;
@@ -405,6 +546,16 @@ impl DictionaryWindow {
 
 fn entry_element(entry: &DictEntry, theme: &Theme, lookup: &LookupSender) -> Div {
     let mut column = div().flex().flex_col().mb(px(12.)).min_w(px(0.)).w_full();
+
+    if let Some(source) = &entry.source {
+        column = column.child(
+            div()
+                .mb(px(2.))
+                .text_size(px(10.))
+                .text_color(theme.accent)
+                .child(format!("来源 · {source}")),
+        );
+    }
 
     // 很多词典把词头写进正文（`<h1>` / `.hwd`），这里避免再叠一行。
     let duplicate_headword = entry.blocks.first().is_some_and(|block| {
@@ -600,7 +751,10 @@ fn link_text(
         };
         match target {
             LinkTarget::Entry(term) => {
-                if lookup.unbounded_send(term.clone()).is_err() {
+                if lookup
+                    .unbounded_send(DictRequest::Lookup(term.clone()))
+                    .is_err()
+                {
                     log::warn!("dictionary lookup channel closed");
                 }
             }

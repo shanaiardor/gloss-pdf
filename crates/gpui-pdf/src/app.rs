@@ -17,9 +17,10 @@ mod render;
 mod update;
 mod window;
 
+use std::collections::HashSet;
 use std::time::Duration;
 
-use dict_core::{Command as DictCommand, DictEngine};
+use dict_core::{Command as DictCommand, DictEngine, DictionaryConfig};
 use futures::StreamExt;
 use gpui::{
     AnyWindowHandle, App, Bounds, Context, Entity, FocusHandle, Focusable, Render, Size, Window,
@@ -27,7 +28,8 @@ use gpui::{
 };
 use pdf_core::{Command, PageSize, PdfEngine};
 
-use crate::dictionary::{DictLoadState, DictionaryState};
+use crate::dict_history::DictHistory;
+use crate::dictionary::{DictLoadState, DictRequest, DictionaryState};
 use crate::home::{HomeNav, HomeState};
 use crate::progress::ReadingProgress;
 use crate::settings::SettingsStore;
@@ -45,6 +47,7 @@ pub(crate) enum FocusTarget {
     Root,
     Search,
     HomeSearch,
+    Page,
 }
 
 pub struct AppState {
@@ -55,13 +58,18 @@ pub struct AppState {
     pub(crate) home: HomeState,
     pub(crate) search_input: Entity<TextInput>,
     pub(crate) home_input: Entity<TextInput>,
+    /// 底部页码输入框；只有 `page_input_open` 为真时才出现在胶囊里。
+    pub(crate) page_input: Entity<TextInput>,
+    pub(crate) page_input_open: bool,
     pub(crate) pending_focus: Option<FocusTarget>,
     pub(crate) settings: SettingsStore,
     pub(crate) settings_open: bool,
     pub(crate) dict: DictEngine,
-    /// 词典窗口里手动输入查词时，把词送回主窗口。
-    dict_query: futures::channel::mpsc::UnboundedSender<String>,
+    /// 词典窗口里手动输入/点击历史时，把请求送回主窗口。
+    dict_query: futures::channel::mpsc::UnboundedSender<DictRequest>,
     pub(crate) dictionary: DictionaryState,
+    /// 持久化的查词历史，最新的在前。
+    pub(crate) dict_history: DictHistory,
     /// 独立词典窗口；关闭后保留的句柄会在下一次同步时清掉。
     pub(crate) dictionary_window: Option<WindowHandle<DictionaryWindow>>,
     /// 主窗口与显示器工作区，用来把词典窗口放到主窗口右侧。
@@ -77,6 +85,9 @@ pub struct AppState {
     pub(crate) highlight_panel_open: bool,
     pub(crate) status: String,
     pub(crate) status_version: u64,
+    /// 主窗口标题；文档标题在 `render` 里写入窗口，因为事件回调拿不到 `Window`。
+    window_title: String,
+    window_title_dirty: bool,
     /// 当前文档上一次采样到的阅读位置，用来跳过重复写盘。
     last_progress: Option<ReadingProgress>,
     /// 是否已经安排了一次延迟写盘。
@@ -90,6 +101,8 @@ pub struct AppState {
     /// 更新检查/下载的 worker 与界面状态。
     pub(crate) update_engine: UpdateEngine,
     pub(crate) update_phase: UpdatePhase,
+    /// 已注册到 GPUI 的词典字体签名，避免反复配置时重复注册。
+    registered_dict_fonts: HashSet<(usize, u64)>,
 }
 
 impl AppState {
@@ -119,8 +132,21 @@ impl AppState {
 
         let (dict_tx, mut dict_rx) = futures::channel::mpsc::unbounded();
         let dict = DictEngine::spawn(dict_tx);
-        if let Some(path) = settings.current.dictionary_path.clone() {
-            let _ = dict.commands.send(DictCommand::Load { path });
+        let mut configure_request = 0;
+        if settings.current.has_enabled_dictionary() {
+            configure_request = 1;
+            let _ = dict.commands.send(DictCommand::Configure {
+                request: configure_request,
+                dictionaries: settings
+                    .current
+                    .dictionaries
+                    .iter()
+                    .map(|dictionary| DictionaryConfig {
+                        path: dictionary.path.clone(),
+                        enabled: dictionary.enabled,
+                    })
+                    .collect(),
+            });
         }
 
         cx.spawn(async move |this, cx| {
@@ -135,8 +161,23 @@ impl AppState {
         })
         .detach();
 
+        let dict_history = DictHistory::load();
         let mut dictionary = DictionaryState::default();
-        if settings.current.dictionary_path.is_some() {
+        dictionary.configure_request = configure_request;
+        dictionary.statuses = settings
+            .current
+            .dictionaries
+            .iter()
+            .map(|dictionary| crate::dictionary::DictStatus {
+                path: dictionary.path.clone(),
+                state: if dictionary.enabled {
+                    DictLoadState::Loading
+                } else {
+                    DictLoadState::Unconfigured
+                },
+            })
+            .collect();
+        if settings.current.has_enabled_dictionary() {
             dictionary.load_state = DictLoadState::Loading;
         }
 
@@ -165,13 +206,16 @@ impl AppState {
         }
 
         // 词典窗口自己也有输入框：它只负责把词发回来，查词状态仍由主窗口维护。
-        let (dict_query, mut dict_query_rx) = futures::channel::mpsc::unbounded::<String>();
+        let (dict_query, mut dict_query_rx) =
+            futures::channel::mpsc::unbounded::<DictRequest>();
         cx.spawn(async move |this, cx| {
-            while let Some(term) = dict_query_rx.next().await {
-                if this
-                    .update(cx, |this, cx| this.lookup_word(term, cx))
-                    .is_err()
-                {
+            while let Some(request) = dict_query_rx.next().await {
+                let updated = this.update(cx, |this, cx| match request {
+                    DictRequest::Lookup(term) => this.lookup_word(term, cx),
+                    DictRequest::Suggest(term) => this.request_suggestions(term, cx),
+                    DictRequest::ClearHistory => this.clear_dict_history(cx),
+                });
+                if updated.is_err() {
                     break;
                 }
             }
@@ -228,6 +272,7 @@ impl AppState {
         let search_input =
             cx.new(|cx| TextInput::new("输入关键词，Enter 下一个", theme.clone(), 13.0, cx));
         let home_input = cx.new(|cx| TextInput::new("极简 PDF", theme.clone(), 13.0, cx));
+        let page_input = cx.new(|cx| TextInput::new("页码", theme.clone(), 12.0, cx));
 
         cx.subscribe(
             &search_input,
@@ -261,6 +306,16 @@ impl AppState {
         )
         .detach();
 
+        cx.subscribe(
+            &page_input,
+            |this, _input, event: &TextInputEvent, cx| match event {
+                TextInputEvent::Changed => {}
+                TextInputEvent::Submitted { .. } => this.commit_page_input(cx),
+                TextInputEvent::Cancelled => this.close_page_input(cx),
+            },
+        )
+        .detach();
+
         Self {
             theme,
             focus_handle: cx.focus_handle(),
@@ -269,12 +324,15 @@ impl AppState {
             home: HomeState::load(),
             search_input,
             home_input,
+            page_input,
+            page_input_open: false,
             pending_focus: None,
             settings,
             settings_open: false,
             dict,
             dict_query,
             dictionary,
+            dict_history,
             dictionary_window: None,
             main_window_bounds: None,
             display_bounds: None,
@@ -289,6 +347,8 @@ impl AppState {
             highlight_panel_open: false,
             status: String::new(),
             status_version: 0,
+            window_title: "极简 PDF".into(),
+            window_title_dirty: true,
             last_progress: None,
             progress_flush_scheduled: false,
             pending_window_fit: None,
@@ -296,6 +356,7 @@ impl AppState {
             reader_window_size: None,
             update_engine,
             update_phase: UpdatePhase::default(),
+            registered_dict_fonts: HashSet::new(),
         }
     }
 
@@ -328,6 +389,8 @@ impl AppState {
         self.search_input
             .update(cx, |input, cx| input.set_theme(theme.clone(), cx));
         self.home_input
+            .update(cx, |input, cx| input.set_theme(theme.clone(), cx));
+        self.page_input
             .update(cx, |input, cx| input.set_theme(theme, cx));
         self.sync_dictionary_window(cx);
         self.set_status(format!("主题：{}", self.theme.name()), cx);
@@ -356,6 +419,10 @@ impl Render for AppState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 窗口尺寸只能在拿到 Window 的地方改；改完等平台的 resize 事件再重算缩放。
         self.apply_pending_window_resize(window, &**cx);
+        if self.window_title_dirty {
+            window.set_window_title(&self.window_title);
+            self.window_title_dirty = false;
+        }
 
         let viewport_changed = self.sync_window_metrics(window, &**cx);
         if viewport_changed && self.viewer.has_document() {
@@ -427,6 +494,7 @@ impl Render for AppState {
                     FocusTarget::Root => this.focus_handle.clone(),
                     FocusTarget::Search => this.search_input.read(cx).focus_handle(cx),
                     FocusTarget::HomeSearch => this.home_input.read(cx).focus_handle(cx),
+                    FocusTarget::Page => this.page_input.read(cx).focus_handle(cx),
                 };
                 window.focus(&handle, cx);
             });

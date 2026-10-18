@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use dict_core::Event as DictEvent;
 use gpui::{
     ClipboardItem, Context, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Point, Window,
+    MouseUpEvent, Point, ScrollDelta, ScrollWheelEvent, Window,
 };
 use pdf_core::{CharBox, Event, LinkTarget};
 
@@ -26,16 +26,25 @@ impl super::AppState {
                 path,
                 pages,
                 outline,
-            } => self.on_document_opened(path, pages, outline, cx),
-            Event::Rendered {
+                metadata,
+            } => self.on_document_opened(path, pages, outline, metadata, cx),
+            Event::RenderedTile {
                 page,
                 request,
+                origin_x,
+                origin_y,
                 width,
                 height,
                 bgra,
+            } => self.on_tile_rendered(
+                page, request, origin_x, origin_y, width, height, bgra, cx,
+            ),
+            Event::PageElements {
+                page,
+                request,
                 chars,
                 links,
-            } => self.on_page_rendered(page, request, width, height, bgra, chars, links, cx),
+            } => self.on_page_elements(page, request, chars, links, cx),
             Event::SearchResults {
                 request,
                 query,
@@ -57,31 +66,101 @@ impl super::AppState {
 
     pub(super) fn handle_dict_event(&mut self, event: DictEvent, cx: &mut Context<Self>) {
         match event {
-            DictEvent::Loaded {
-                path: _,
-                title,
-                entries,
-                fonts,
+            DictEvent::Configured {
+                request,
+                dictionaries,
             } => {
-                if self.settings.current.dictionary_path.is_none() {
+                if request != self.dictionary.configure_request {
                     return;
+                }
+
+                let mut ready_entries = 0u64;
+                let mut ready_count = 0usize;
+                let mut first_title = None;
+                let mut first_failure = None;
+                let mut statuses = Vec::with_capacity(self.settings.current.dictionaries.len());
+                for setting in &self.settings.current.dictionaries {
+                    let info = dictionaries.iter().find(|info| info.path == setting.path);
+                    let state = if !setting.enabled {
+                        DictLoadState::Unconfigured
+                    } else {
+                        match info {
+                            Some(info) => match &info.error {
+                                Some(error) => {
+                                    if first_failure.is_none() {
+                                        first_failure = Some(error.clone());
+                                    }
+                                    DictLoadState::Failed(error.clone())
+                                }
+                                None => {
+                                    ready_entries += info.entries;
+                                    ready_count += 1;
+                                    if first_title.is_none() {
+                                        first_title = info.title.clone();
+                                    }
+                                    DictLoadState::Ready {
+                                        title: info.title.clone(),
+                                        entries: info.entries,
+                                    }
+                                }
+                            },
+                            None => DictLoadState::Loading,
+                        }
+                    };
+                    statuses.push(crate::dictionary::DictStatus {
+                        path: setting.path.clone(),
+                        state,
+                    });
+                }
+                self.dictionary.statuses = statuses;
+
+                let mut fonts = Vec::new();
+                for info in &dictionaries {
+                    for font in &info.fonts {
+                        let signature = font_signature(font);
+                        if self.registered_dict_fonts.insert(signature) {
+                            fonts.push(Cow::Owned(font.clone()));
+                        }
+                    }
                 }
                 if !fonts.is_empty() {
                     let count = fonts.len();
-                    let fonts: Vec<Cow<'static, [u8]>> =
-                        fonts.into_iter().map(Cow::Owned).collect();
                     match cx.text_system().add_fonts(fonts) {
                         Ok(()) => log::info!("registered {count} dictionary fonts"),
                         Err(error) => log::warn!("注册词典字体失败: {error:#}"),
                     }
                 }
-                self.dictionary.load_state = DictLoadState::Ready { title, entries };
-                self.dictionary.loading = false;
-                if let Some(term) = self.dictionary.pending_term.take() {
-                    self.lookup_word(term, cx);
-                    return;
+
+                if !self.settings.current.has_enabled_dictionary() {
+                    self.dictionary.load_state = DictLoadState::Unconfigured;
+                    self.dictionary.loading = false;
+                } else if ready_count > 0 {
+                    let title = if ready_count == 1 {
+                        first_title
+                    } else {
+                        Some(format!("{ready_count} 本词典"))
+                    };
+                    self.dictionary.load_state = DictLoadState::Ready {
+                        title,
+                        entries: ready_entries,
+                    };
+                    self.dictionary.loading = false;
+                    if let Some(term) = self.dictionary.pending_term.take() {
+                        self.lookup_word(term, cx);
+                        return;
+                    }
+                    self.set_status(
+                        format!("词典已加载 · {ready_count} 本 · {ready_entries} 条"),
+                        cx,
+                    );
+                } else if let Some(error) = first_failure {
+                    self.dictionary.load_state = DictLoadState::Failed(error.clone());
+                    self.dictionary.loading = false;
+                    self.dictionary.error = Some(error.clone());
+                    self.set_status(error, cx);
+                } else {
+                    self.dictionary.load_state = DictLoadState::Loading;
                 }
-                self.set_status(format!("词典已加载 · {entries} 条"), cx);
             }
             DictEvent::Found {
                 request,
@@ -109,6 +188,17 @@ impl super::AppState {
                 self.dictionary.not_found = true;
                 self.dictionary.word = term;
             }
+            DictEvent::PrefixSuggestions {
+                request,
+                suggestions,
+                ..
+            } => {
+                if request != self.dictionary.suggest_request {
+                    return;
+                }
+                self.dictionary.suggestions = crate::dict_suggest::trim_suggestions(suggestions);
+                self.sync_dictionary_window(cx);
+            }
             DictEvent::Error { request, message } => {
                 if let Some(request) = request
                     && request != self.dictionary.request
@@ -117,7 +207,7 @@ impl super::AppState {
                 }
                 self.dictionary.loading = false;
                 if request.is_none() {
-                    if self.settings.current.dictionary_path.is_none() {
+                    if !self.settings.current.has_enabled_dictionary() {
                         return;
                     }
                     self.dictionary.load_state = DictLoadState::Failed(message.clone());
@@ -190,6 +280,10 @@ impl super::AppState {
         event: &MouseDownEvent,
         cx: &mut Context<Self>,
     ) {
+        // 点正文即离开页码输入；否则输入框会一直占着页码的位置。
+        if self.page_input_open {
+            self.close_page_input(cx);
+        }
         let Some(index) = self.char_at_point(page, event.position) else {
             return;
         };
@@ -204,6 +298,33 @@ impl super::AppState {
     }
 
     /// 拖选：挂在滚动容器上，指针滑出页面（甚至滑到别的页）也能继续扩展选区。
+    /// Ctrl + 滚轮缩放。滚轮一格约 3 行，按 1.15 倍缩放；触控板的小增量按比例折算。
+    pub(crate) fn on_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.modifiers.control {
+            return;
+        }
+        let line_height = f32::from(window.line_height()).max(1.0);
+        let lines = match event.delta {
+            ScrollDelta::Lines(delta) => delta.y,
+            ScrollDelta::Pixels(delta) => f32::from(delta.y) / line_height,
+        };
+        if lines.abs() < 0.05 {
+            return;
+        }
+        let factor = crate::layout::wheel_zoom_factor(lines);
+        if (factor - 1.0).abs() < f32::EPSILON {
+            return;
+        }
+        let scrolled = event.delta.pixel_delta(window.line_height());
+        self.zoom_at_pointer(factor, event.position, scrolled, cx);
+        cx.stop_propagation();
+    }
+
     pub(crate) fn on_page_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -290,6 +411,43 @@ impl super::AppState {
             return;
         };
         self.lookup_word(text, cx);
+    }
+
+    // ---------- 页码跳转 ----------
+
+    /// 点底部页码：把当前页填进输入框并请求焦点。
+    pub(crate) fn open_page_input(&mut self, cx: &mut Context<Self>) {
+        if !self.viewer.has_document() {
+            return;
+        }
+        let page = (self.viewer.current_page + 1).to_string();
+        self.page_input
+            .update(cx, |input, cx| input.set_value(page, cx));
+        self.page_input_open = true;
+        self.pending_focus = Some(FocusTarget::Page);
+        cx.notify();
+    }
+
+    /// Enter：解析、夹取并跳页；非法输入留在输入框里，不改变阅读位置。
+    pub(crate) fn commit_page_input(&mut self, cx: &mut Context<Self>) {
+        let text = self.page_input.read(cx).value().to_string();
+        let Some(page) = crate::ui::chrome::parse_page_number(&text, self.viewer.page_count())
+        else {
+            self.set_status("请输入有效页码", cx);
+            self.pending_focus = Some(FocusTarget::Page);
+            return;
+        };
+        self.page_input_open = false;
+        self.set_page(page, cx);
+        self.pending_focus = Some(FocusTarget::Root);
+        cx.notify();
+    }
+
+    /// Esc 或点到别处：收起输入框，把焦点还给阅读器。
+    pub(crate) fn close_page_input(&mut self, cx: &mut Context<Self>) {
+        self.page_input_open = false;
+        self.pending_focus = Some(FocusTarget::Root);
+        cx.notify();
     }
 
     // ---------- 键盘 ----------
@@ -381,6 +539,15 @@ impl super::AppState {
 
         let keystroke = &event.keystroke;
         let control = keystroke.modifiers.control || keystroke.modifiers.platform;
+
+        // 页码输入框有焦点时，数字、退格、Enter、Esc 归 TextInput；否则
+        // PageDown / H 之类的快捷键会把正在输入的数字当成翻页指令。
+        if self.page_input_open
+            && self.page_input.read(cx).focus_handle(cx).is_focused(window)
+            && !control
+        {
+            return;
+        }
 
         // 搜索框有焦点时，字符输入和编辑键都由 TextInput 处理，这里不能重复处理，
         // 也不能让 PageDown / H 之类的页面快捷键抢走空格、回车。带 Ctrl 的全局
@@ -531,4 +698,12 @@ impl super::AppState {
             }
         }
     }
+}
+
+/// 字体字节的轻量签名：长度 + 内容哈希，用来避免反复配置时重复注册字体。
+fn font_signature(bytes: &[u8]) -> (usize, u64) {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    (bytes.len(), hasher.finish())
 }

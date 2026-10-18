@@ -8,5 +8,7 @@ screenshot*.png
 /output/
 /logs/
 .commandcode/
+# pi 会话状态（仅本地）
+.pi/
 # 安装包产物：installer/gpui-pdf.iss 的输出目录
 /dist/
