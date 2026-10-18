@@ -3,6 +3,7 @@ name = "gpui-pdf"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "A GPU-accelerated PDF reader built with GPUI"
 
 [dependencies]
@@ -19,7 +20,11 @@ futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 unicode-segmentation.workspace = true
+self_update = { version = "1.3", default-features = false, features = ["github", "ureq", "rustls"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6"
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }

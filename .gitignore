@@ -8,3 +8,5 @@ screenshot*.png
 /output/
 /logs/
 .commandcode/
+# 安装包产物：installer/gpui-pdf.iss 的输出目录
+/dist/

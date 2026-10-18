@@ -1,10 +1,11 @@
-//! 设置面板：主题与 MDX 词典路径。从首页侧栏或阅读器顶部打开。
+//! 设置面板：主题、MDX 词典路径与更新。从首页侧栏或阅读器顶部打开。
 
 use gpui::{ClickEvent, Context, FontWeight, div, prelude::*, px};
 
-use crate::app::AppState;
+use crate::app::{AppState, UpdatePhase};
 use crate::dictionary::DictLoadState;
 use crate::theme::Theme;
+use crate::update::CURRENT_VERSION;
 
 impl AppState {
     pub(crate) fn settings_panel(
@@ -152,12 +153,15 @@ impl AppState {
                 )));
         }
 
-        body = body.child(dictionary_section).child(
-            div()
-                .text_size(px(11.))
-                .text_color(theme.text_muted)
-                .child("提示：双击单词或汉字查词，Esc 关闭面板。"),
-        );
+        body = body
+            .child(dictionary_section)
+            .child(self.update_section(theme, cx))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_muted)
+                    .child("提示：双击单词或汉字查词，Esc 关闭面板。"),
+            );
 
         Some(
             div()
@@ -213,14 +217,160 @@ impl AppState {
                 ),
         )
     }
+
+    /// 更新区块：当前版本、检查/下载/安装按钮、自动检查开关。
+    fn update_section(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let mut section = div().flex().flex_col().gap(px(6.)).child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("更新"),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.text_muted)
+                        .child(format!("当前版本 {CURRENT_VERSION}")),
+                ),
+        );
+
+        let percent = self.update_phase.percent();
+        section = match &self.update_phase {
+            UpdatePhase::Idle => section
+                .child(status_line("检查 GitHub 上是否有新版本。", theme))
+                .child(action_button(
+                    "settings-check-update",
+                    "检查更新",
+                    theme,
+                    cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.check_for_updates(cx);
+                    }),
+                )),
+            UpdatePhase::Checking => section.child(status_line("正在检查更新…", theme)),
+            UpdatePhase::UpToDate { version } => section
+                .child(status_line(format!("已是最新版本（{version}）。"), theme))
+                .child(action_button(
+                    "settings-check-update-again",
+                    "再次检查",
+                    theme,
+                    cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.check_for_updates(cx);
+                    }),
+                )),
+            UpdatePhase::Available(info) => {
+                let notes = if info.notes.trim().is_empty() {
+                    "可以下载并安装。".to_string()
+                } else {
+                    info.notes.clone()
+                };
+                section
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.text)
+                            .child(format!("发现新版本 {}", info.version)),
+                    )
+                    .child(status_line(notes, theme))
+                    .child(action_button(
+                        "settings-download-update",
+                        "下载并安装",
+                        theme,
+                        cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                            this.download_update(cx);
+                        }),
+                    ))
+            }
+            UpdatePhase::Downloading { downloaded, total } => {
+                let progress = match (percent, total.filter(|total| *total > 0)) {
+                    (Some(percent), Some(total)) => format!(
+                        "正在下载 {:.1} / {:.1} MB（{percent}%）",
+                        *downloaded as f64 / 1_048_576.0,
+                        total as f64 / 1_048_576.0
+                    ),
+                    _ => format!("正在下载 {:.1} MB…", *downloaded as f64 / 1_048_576.0),
+                };
+                section.child(status_line(progress, theme))
+            }
+            UpdatePhase::Downloaded(path) => {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                section
+                    .child(status_line(format!("安装包已下载：{name}"), theme))
+                    .child(action_button(
+                        "settings-install-update",
+                        "安装并重启",
+                        theme,
+                        cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                            this.install_update(cx);
+                        }),
+                    ))
+            }
+            UpdatePhase::Failed(message) => section
+                .child(status_line(format!("更新失败：{message}"), theme))
+                .child(action_button(
+                    "settings-check-update-retry",
+                    "重试",
+                    theme,
+                    cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.check_for_updates(cx);
+                    }),
+                )),
+        };
+
+        let auto = self.settings.current.auto_check_updates;
+        let mut checkbox = div()
+            .w(px(12.))
+            .h(px(12.))
+            .rounded_sm()
+            .border_1()
+            .border_color(theme.border);
+        if auto {
+            checkbox = checkbox.bg(theme.accent).border_color(theme.accent);
+        }
+
+        section.child(
+            div()
+                .id("settings-auto-update")
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .mt(px(2.))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.toggle_auto_update_check(cx);
+                }))
+                .child(checkbox)
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.text_muted)
+                        .child("启动时自动检查更新"),
+                ),
+        )
+    }
+}
+
+fn status_line(text: impl Into<String>, theme: &Theme) -> gpui::Div {
+    div()
+        .text_size(px(11.))
+        .text_color(theme.text_muted)
+        .child(text.into())
 }
 
 fn action_button(
     id: &'static str,
-    label: &'static str,
+    label: impl Into<gpui::SharedString>,
     theme: &Theme,
     listener: impl Fn(&ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
+    let label = label.into();
     div()
         .id(id)
         .px_3()

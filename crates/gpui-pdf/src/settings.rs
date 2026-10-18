@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::home::user_data_dir;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     /// 上次使用的主题。
     #[serde(default)]
@@ -14,6 +14,23 @@ pub struct Settings {
     /// 用户选择的 `.mdx` 词典。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dictionary_path: Option<PathBuf>,
+    /// 启动后自动检查 GitHub 更新；默认开启。
+    #[serde(default = "default_true")]
+    pub auto_check_updates: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            dark: false,
+            dictionary_path: None,
+            auto_check_updates: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub struct SettingsStore {
@@ -70,6 +87,7 @@ mod tests {
         let settings = Settings {
             dark: true,
             dictionary_path: Some(PathBuf::from("C:/dicts/oxford.mdx")),
+            auto_check_updates: false,
         };
         let json = serde_json::to_string(&settings).unwrap();
         let parsed: Settings = serde_json::from_str(&json).unwrap();
@@ -81,6 +99,7 @@ mod tests {
         let parsed: Settings = serde_json::from_str("{}").unwrap();
         assert!(!parsed.dark);
         assert!(parsed.dictionary_path.is_none());
+        assert!(parsed.auto_check_updates, "旧设置默认开启自动检查");
     }
 
     #[test]
@@ -113,6 +132,7 @@ mod tests {
             current: Settings {
                 dark: true,
                 dictionary_path: Some(PathBuf::from("C:/dicts/oxford.mdx")),
+                auto_check_updates: false,
             },
             storage: Some(path.clone()),
         };

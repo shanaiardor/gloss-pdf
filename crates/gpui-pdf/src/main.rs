@@ -14,6 +14,7 @@ mod selection;
 mod settings;
 mod theme;
 mod ui;
+mod update;
 mod viewer;
 mod window_layout;
 #[cfg(target_os = "windows")]

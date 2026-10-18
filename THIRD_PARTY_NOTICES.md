@@ -14,6 +14,20 @@
 
 分发本项目的二进制时，请保留 `pdfium.dll` 同目录的许可说明，或在“关于/第三方许可”中展示上述许可文本。
 
+## LXGW 文楷 TC / LXGW WenKai TC（界面字体）
+
+- 版本：`1.522`（2026-03-17）
+- 文件：`crates/gpui-pdf/assets/fonts/lxgw-wenkai-tc/LXGWWenKaiTC-Regular.ttf`、
+  `LXGWWenKaiMonoTC-Regular.ttf`
+- 版权：Copyright 2022-2026 The LXGW WenKai Project Authors
+  （<https://github.com/lxgw/LxgwWenkaiTC>，字形源自 The Klee Project Authors）
+- 许可：SIL Open Font License 1.1，完整文本见字体同目录的 `OFL.txt`
+- 上游：<https://github.com/lxgw/LxgwWenkaiTC>
+
+字体数据编译进 `gpui-pdf` 二进制。按 OFL 第 2 条，分发二进制时需要一并提供
+版权声明与许可文本：发布包里请保留 `crates/gpui-pdf/assets/fonts/lxgw-wenkai-tc/OFL.txt`
+和本文件。
+
 ## pdfium-render
 
 - 许可：MIT OR Apache-2.0
@@ -23,6 +37,14 @@
 
 - 许可：Apache-2.0
 - 上游：<https://github.com/zed-industries/zed/tree/main/crates/gpui>
+
+## self_update（应用内更新）
+
+- 版本：`1.3`
+- 许可：MIT
+- 上游：<https://github.com/jaemk/self_update>
+- 说明：通过 GitHub Releases 检查版本并下载安装包；HTTP 由 `ureq` + `rustls`
+  （均为 MIT OR Apache-2.0 / ISC 等宽松许可）完成。
 
 ## 其他 Rust crate
 

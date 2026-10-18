@@ -14,6 +14,7 @@
 mod document;
 mod events;
 mod render;
+mod update;
 mod window;
 
 use std::time::Duration;
@@ -33,7 +34,10 @@ use crate::settings::SettingsStore;
 use crate::theme::Theme;
 use crate::ui::dictionary::DictionaryWindow;
 use crate::ui::text_input::{TextInput, TextInputEvent};
+use crate::update::UpdateEngine;
 use crate::viewer::Viewer;
+
+pub(crate) use update::UpdatePhase;
 
 /// 输入框需要焦点时，交给下一次 `render` 去设置（事件回调里拿不到 `Window`）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +87,9 @@ pub struct AppState {
     pending_window_resize: Option<Size<gpui::Pixels>>,
     /// 进入阅读器之前的窗口尺寸，关闭文档时恢复。
     reader_window_size: Option<Size<gpui::Pixels>>,
+    /// 更新检查/下载的 worker 与界面状态。
+    pub(crate) update_engine: UpdateEngine,
+    pub(crate) update_phase: UpdatePhase,
 }
 
 impl AppState {
@@ -103,6 +110,7 @@ impl AppState {
         .detach();
 
         let settings = SettingsStore::load();
+        let auto_check_updates = settings.current.auto_check_updates;
         let theme = if settings.current.dark {
             Theme::dark()
         } else {
@@ -130,6 +138,30 @@ impl AppState {
         let mut dictionary = DictionaryState::default();
         if settings.current.dictionary_path.is_some() {
             dictionary.load_state = DictLoadState::Loading;
+        }
+
+        // 更新检查：worker 负责联网，事件回到主线程改状态。
+        let (update_tx, mut update_rx) = futures::channel::mpsc::unbounded();
+        let update_engine = UpdateEngine::spawn(update_tx);
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = update_rx.next().await {
+                if this
+                    .update(cx, |this, cx| this.handle_update_event(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        // 延迟几秒再查，避免和文档渲染抢启动时的资源；开发构建不自动联网。
+        if auto_check_updates && !cfg!(debug_assertions) {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_secs(4)).await;
+                let _ = this.update(cx, |this, cx| this.check_for_updates(cx));
+            })
+            .detach();
         }
 
         // 词典窗口自己也有输入框：它只负责把词发回来，查词状态仍由主窗口维护。
@@ -262,6 +294,8 @@ impl AppState {
             pending_window_fit: None,
             pending_window_resize: None,
             reader_window_size: None,
+            update_engine,
+            update_phase: UpdatePhase::default(),
         }
     }
 

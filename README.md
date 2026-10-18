@@ -50,10 +50,62 @@ cargo run -p gpui-pdf -- samples/dummy.pdf
 首次编译 GPUI 较慢。`pdfium.dll`（约 7.5 MB）已放在项目根目录，运行时按
 「exe 目录 → 当前目录 → 系统库」顺序查找。
 
-界面默认使用 **LXGW 文楷 TC**。字体不打包在仓库里，启动时从
-`C:\Users\shanay\Downloads\lxgw-wenkai-tc-v1.522` 读取；也可以用
-`GPUI_PDF_FONT_DIR` 指向其他字体目录（需包含 `LXGWWenKaiTC-Regular.ttf`
-和 `LXGWWenKaiMonoTC-Regular.ttf`）。找不到字体时自动回退到系统字体。
+界面默认使用 **LXGW 文楷 TC**。字体文件在
+`crates/gpui-pdf/assets/fonts/lxgw-wenkai-tc/`，编译时直接嵌进二进制，
+分发的 exe 自带字体，不再依赖本机的下载目录。需要换字体版本时，把
+`GPUI_PDF_FONT_DIR` 指向包含 `LXGWWenKaiTC-Regular.ttf` 和
+`LXGWWenKaiMonoTC-Regular.ttf` 的目录即可（重启生效）；目录不完整或读取失败时
+使用内置字体，内置字体也注册失败时回退到系统字体。
+
+字体以 SIL Open Font License 1.1 分发，许可文本在字体同目录的 `OFL.txt`。
+
+## 分发与自动更新
+
+Windows 安装包由 Inno Setup 生成，脚本在 `installer/gpui-pdf.iss`；CI 在
+`.github/workflows/windows.yml`，推 tag 时自动打包并发布到 GitHub Releases。
+
+发布一个新版本：
+
+```powershell
+# 1. 改 Cargo.toml 里的 [workspace.package] version（CI 会校验 tag 与它一致）
+# 2. 提交后打 tag 并推送
+git tag v0.1.0
+git push origin main --tags
+```
+
+CI 会编译 release、生成 `gpui-pdf-0.1.0-setup.exe`，并作为 release 资产上传。
+普通 push 与 PR 只上传构建产物（artifact），不发 release。
+
+安装包安装到当前用户的 `%LOCALAPPDATA%\Programs\gpui-pdf`，不触发 UAC；
+`pdfium.dll` 与 exe 放在同一目录，运行时按「exe 目录 → 当前目录 → 系统库」
+顺序查找。
+
+**应用内更新**：设置面板的「更新」区块会调用 GitHub API 读取最新正式版
+（跳过带 `-` 的预发布），发现新版本后用 `self_update` 下载安装包，再以
+`/SILENT` 运行安装器并退出应用。仓库坐标在 CI 构建时由 `GITHUB_REPOSITORY`
+注入，本地构建回落到 `shanaiardor/gpui-pdf`。启动 4 秒后自动检查（发布构建
+才启用），可以在设置里关掉。
+
+本地手工打包（需要装 Inno Setup 6）：
+
+```powershell
+cargo build --release -p gpui-pdf
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+  "/DAPP_VERSION=0.1.0" "installer\gpui-pdf.iss"
+# 输出：dist\gpui-pdf-0.1.0-setup.exe
+```
+
+不放安装包、直接发绿包时，需要带上：
+
+```
+gpui-pdf.exe
+pdfium.dll
+THIRD_PARTY_NOTICES.md
+third_party/                        # PDFium 及其第三方许可
+crates/gpui-pdf/assets/fonts/lxgw-wenkai-tc/OFL.txt   # 字体许可（OFL 要求）
+```
+
+字体已经嵌进 exe，不需要再带 `fonts/` 目录；`pdfium.dll` 仍必须与 exe 同目录。
 
 ## 快捷键
 
@@ -83,11 +135,16 @@ crates/
 │       ├── engine.rs      # PDFium worker：打开、渲染、文本/链接/目录提取、全文搜索
 │       └── model.rs       # RectPt / CharBox / Link / Outline / PageHits
 └── gpui-pdf/              # GPUI 应用
+    ├── assets/
+    │   ├── icons/         # 内嵌 SVG 图标
+    │   └── fonts/lxgw-wenkai-tc/  # 文楷常规体/等宽体 + OFL.txt
     └── src/
         ├── main.rs        # 入口：日志、无边框窗口、命令行参数
-        ├── assets.rs      # 内嵌 SVG 图标
-        ├── fonts.rs       # 启动时加载 LXGW 文楷
-        ├── app.rs         # 控制器：引擎事件、键盘/鼠标、生命周期
+        ├── assets.rs      # 内嵌静态资源
+        ├── fonts.rs       # 内嵌 LXGW 文楷，GPUI_PDF_FONT_DIR 可覆盖
+        ├── app.rs         # 控制器：状态容器、订阅、顶层 Render
+        ├── app/update.rs  # 更新状态机：检查/下载/启动安装器
+        ├── update.rs      # GitHub Releases 检查与下载（self_update）
         ├── layout.rs      # 适宽/适页缩放、页边距、按纸张选择窗口尺寸
         ├── home.rs        # 首页状态：最近阅读持久化、搜索过滤、侧栏选中项
         ├── progress.rs    # 阅读进度模型：页码/页内滚动/缩放/适应模式
@@ -108,6 +165,8 @@ crates/
             ├── toast.rs
             └── empty.rs
 pdfium.dll                 # PDFium 动态库（运行时绑定）
+installer/gpui-pdf.iss     # Inno Setup 安装包定义
+.github/workflows/         # GitHub Actions：测试、打包、发布 release
 samples/                   # 测试用 PDF（dummy.pdf / colors.pdf）
 ```
 
@@ -199,7 +258,9 @@ samples/dummy.pdf.highlights.json
 
 - `gpui` / `gpui_platform`：锁定 Zed `4bd19937`，Apache-2.0
 - `pdfium-render` 0.9.4：MIT OR Apache-2.0
+- `self_update` 1.3（GitHub Releases 检查与下载，底层 `ureq` + `rustls`）：MIT
 - PDFium（`pdfium.dll`）：BSD-3-Clause，另含 freetype / harfbuzz / icu 等第三方组件
+- LXGW 文楷 TC（界面字体，已嵌入二进制）：SIL Open Font License 1.1
 - 其他：`image`、`serde`、`serde_json`、`futures`、`anyhow`、`log`、`env_logger`、`unicode-segmentation`
 
 本项目以 **MIT OR Apache-2.0** 发布：MIT 见 `LICENSE` / `LICENSE-MIT`，Apache-2.0 见 `LICENSE-APACHE`。
