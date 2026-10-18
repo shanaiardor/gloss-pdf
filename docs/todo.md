@@ -41,7 +41,7 @@
 | ☐ 待办  | P2  | 高亮写入标准注释               | `pdf-core`、`highlights.rs`                                 | 需手写外观流  |
 | ✅ 已完成 | P2  | 词典渲染三处缺口               | `dict-core/css.rs`、`dict-core/fonts.rs`、`ui/dictionary.rs` | 改动分散    |
 | ☐ 待办  | P2  | 表单字段、打印导出              | `pdf-core`、`ui/chrome.rs`                                  | 新增能力    |
-| ✅ 已完成 | 低   | 汉字搜索空格容错               | `pdf-core/text_match.rs`、`search.rs`                       | 小，需两侧一致 |
+| ✅ 已完成 | 低   | 搜索空白容错（所有空格/换行）     | `pdf-core/text_match.rs`、`search.rs`                       | 小，需两侧一致 |
 | ✅ 已完成 | 低   | 光标闪烁、全文扫描进度            | `ui/text_input.rs`、`pdf-core/engine.rs`、`ui/search_bar.rs` | 体验打磨    |
 | ☐ 待办  | 低   | 批注侧栏增强                 | `ui/annotations.rs`                                        | 体验打磨    |
 | ✅ 已完成 | 工程  | `app.rs` 按职责拆分          | `app.rs`、`app/{events,document,render,window}.rs`          | 架构改动    |
@@ -54,18 +54,22 @@ P0 与连续滚动完成后，阅读主链路已闭环。连续滚动的实现�
 - 基于 `EntityInputHandler` 的单行输入组件（`ui/text_input.rs`），支持中文输入法组合输入、选区、复制粘贴与横向滚动。
 - 阅读器搜索框与首页筛选框共用该组件；`Ctrl+F` 聚焦并全选，`Enter` 与 `Shift+Enter` 跨页跳转。
 - 词典窗口可手动输入词条并回车查词，双击 PDF 选词会把词回填到输入框。
+- 词典浮窗贴着主窗口左右侧时会跟着主窗口走：主窗口的 `observe_window_bounds` 通知里调 `AppState::follow_dictionary_window`，用 `window_layout::Anchor::place` 按锚点（贴哪边、水平间距、竖直偏移）重新贴边 + `clamp_inside` 夹进工作区，所以拖动、按纸张比例改大小、最大化都不会把浮窗落下；被工作区边缘夹住时锚点不变，主窗口移回来浮窗回到原位。锚点只在两处算：创建时用 `Anchor::from_geometry` 从当时几何读出（竖直有交集且水平间距在 -2–24px，即吸附后的 0 间距与初始摆放的 12px 空隙都算），用户拖动浮窗后由 `DictRequest::FloatPlaced` 把新位置报回主窗口重算：拖远就不再跟随，拖回来自动恢复。移动窗口的 `SetWindowPos` 跑在 `window_move.rs` 的专用线程上（队列只留最后一次请求）：它在主窗口的 bounds 回调里直接调会同步触发浮窗的 `bounds_changed`，那边再借一次 `App` 必然失败（日志刷 `RefCell already borrowed`），窗口内部位置状态也不更新；`cx.defer` / `cx.spawn` 也不行——延迟效果和前台任务同样是拿着 `&mut App` 执行闭包，只有换线程才能让 `WM_MOVE` 落到借用释放之后。
 - 高亮带稳定 id 与选中文字，可删除；新增批注侧栏（`Ctrl+H`）按页列出并跳转。
 - 跨页全文搜索：worker 逐页提取文本并缓存，界面按「全局序号与页内序号」换算。
 - 中文查询有回归测试覆盖（`search.rs` 中三项用例），匹配按字符下标而非字节下标。
-- 汉字间被插入空格时（「汉 字」）仍能命中「汉字」，高亮区间覆盖空格；页内匹配与全文计数共用 `pdf-core/text_match.rs` 的同一套规则。
+- 查询串与文本层里的空白（空格、制表符、换行、全角空格等）都不参与匹配：「汉 字」「T 细胞」「医\n生」分别能被「汉字」「T细胞」「医生」命中，高亮区间覆盖中间空白；页内匹配与全文计数共用 `pdf-core/text_match.rs` 的同一套规则。
 - 全文搜索按页回报扫描进度，搜索框显示「已扫描 N/M 页」；输入框光标以 500ms 为半周期闪烁，输入后立即回亮。
 - 点击底部页码可输入跳转，`Enter` 夹取到 1..总页数，`Esc` 取消；输入框聚焦时阅读快捷键不误触。
-- `Ctrl+滚轮` 以指针下的页面点为锚缩放，每格 1.15 倍，clamp 25%–400%，并退出适宽/适页模式；普通滚轮仍只滚动。
+- 缩放按百分点步进：`Ctrl+=` / `Ctrl+-` 与底部胶囊的 ± 按钮每次 1%（先把当前比例对齐到整百分点，适页留下的小数比例也一样），`Ctrl+滚轮` 每行 1%（一格约 3%）；以指针下的页面点为锚缩放，clamp 25%–400%，并退出适宽/适页模式；普通滚轮仍只滚动。
+- 按住鼠标中键（滚轮键）拖动可平移页面：指针变抓手光标，位移按 `layout::PAN_RATIO = 0.5` 半速跟随（指针走 2px，内容走 1px），纵横向都夹在内容范围内；中键在容器外松开时下一次移动会自动退出拖动。
+- 窗口几何跟着设置走：`settings.json` 里存 `window.{x,y,width,height,maximized}`，启动时按当前显示器工作区恢复（多点显示器取重叠最多的那块，副屏拔掉后自动居中），尺寸夹在 640×520 与工作区之间；尺寸/位置变化后 400ms 去抖落盘，退出时兜底写一次。全屏或 Windows 最小化（-32000 哨兵坐标）不写，避免把好几何覆盖掉。
 - PDF 元数据读取 Title/Author/Subject/Keywords/Creator/Producer/CreationDate/ModDate；窗口标题与最近阅读优先 Title，缺失回退文件名；设置面板展示全部字段。
 - 多词典：设置中可添加/移除/排序/启停 MDX，查询按顺序聚合并标注来源；每本 MDD/CSS/字体独立；旧 `dictionary_path` 自动迁移。
 - 查词历史持久化、倒序、去重、上限 50，可点击重查或清空；输入时跨词典前缀联想，去重、最多 8 条、160ms 防抖，精确前缀无结果时回退近似前缀。
 - 大页面按 512×512 瓦片渲染，只请求与视口相交的瓦片；瓦片位图缓存默认 256 MiB，超限按距可视范围由远及近淘汰，400% 浏览多页内存不随页数线性增长。覆盖层仍按整页坐标，文本/链接/选区/高亮不错位。
 - `app.rs` 已按职责拆为 `app/{events,document,render,window}.rs`，`app.rs` 只保留状态容器与装配（505 行）。
+- 浮动胶囊（顶部按钮条、底部页码/缩放条）自动隐身：判定逻辑全在无 GPUI 依赖的 `chrome_visibility.rs` 里（`band_at` 几何感应带 + `ChromeVisibility` 状态机，13 项单测）。隐藏延迟 `HIDE_DELAY = 1500ms`（在模块顶部，可调），感应带高 `TOP_BAND_HEIGHT = 56.0` / `BOTTOM_BAND_HEIGHT = 64.0`（`Bands::STANDARD`，都比胶囊实际占位略大一圈，鼠标扫过就能唤醒）。唤醒有三条路径，都会重置倒计时：鼠标进入感应带；参数签名变化（`ChromeSignature` 摘要缩放、页码、页数、适宽/适页、各面板开关、主题、搜索开合、高亮数、页码输入框，`PartialEq` 比较，首帧采样不算变化）；以及每帧 `render` 的兜底结算。计时用 `cx.spawn` + `background_executor().timer`，以代数计数器（`generation`）作废过期定时器，旧定时器到期时代数对不上就直接返回，不会把刚显示的胶囊又藏掉。隐藏走 `hidden()`（`display: none`）而不是 `invisible()`：后者仍占布局位置、仍在命中树里，会吞掉页面的点击/滚轮/拖选/中键平移。鼠标位置来自窗口级 `Window::on_mouse_event::<MouseMoveEvent>`，但注册点不能放在 `render` 里：`Render::render` 跑在布局阶段，而 `on_mouse_event` 带 `debug_assert_paint`，在那里注册会 panic `this method can only be called during paint`（panic 展开时还留着借用的 `App`，之后所有 `AsyncApp` 操作都会 `RefCell already borrowed`）。所以挪进 `canvas` 的 paint 回调（`ui/chrome.rs` 的 `chrome_mouse_watch`，作为零尺寸子元素挂在 `root` 上），监听器每帧清空、每帧重注册，并且只吃 `DispatchPhase::Capture` 那一遍（否则同一次移动会被派发两次）。另外：见过第一次鼠标移动之前不开始计时（`ChromeInput::pointer_moved` / `ChromeVisibility::pointer_seen`），否则应用一开屏胶囊就自己藏起来，不用元素级 `on_hover`——顶部 46px 拖拽条是 `WindowControlArea::Drag`，Windows 上是 HTCAPTION 非客户区，元素 hover 收不到，而 `gpui_windows` 会把 `WM_NCMOUSEMOVE` 翻译成同样的 `MouseMoveEvent` 走统一输入管线。页码输入框打开、中键平移、拖选进行时不隐身。
 
 ## 三、P1 阅读体验
 
@@ -155,15 +159,15 @@ P0 与连续滚动完成后，阅读主链路已闭环。连续滚动的实现�
 
 本节四项不是新功能，是上一批实现留下的明确边界，建议随对应模块的改动一并处理。
 
-### （一）汉字搜索的空格容错 ✅
+### （一）搜索的空白容错 ✅
 
-部分排版软件导出的 PDF，文本层会在汉字之间插入空格，此时搜索「汉字」无法命中「汉 字」。
+部分排版软件导出的 PDF，文本层会在汉字之间插入空格或换行；用户从 PDF 里复制出来的词条也常夹带空格、回车。此时搜索「汉字」无法命中「汉 字」，粘上带空格的查询串也一律落空。
 
-**已实现**：匹配规则集中到 `pdf-core/text_match.rs`。对中日韩查询，`find_matches` 同时跑直接匹配与「去掉空白」匹配，再按起点合并、保持不重叠，并把压缩后的下标映射回原字符位置（高亮区间因此覆盖中间的空格）。`search.rs` 的页内匹配与 `pdf-core/engine.rs` 的全文计数都调用这一份实现，不再各留一套。
+**已实现**：匹配规则集中到 `pdf-core/text_match.rs`。`find_matches` 先把查询串里的空白**全部去掉**（空格、制表符、换行、回车、不间断空格、全角空格等，判据是 `char::is_whitespace`），再把被搜文本同样去空白后比对，最后把压缩后的下标映射回原字符位置（高亮区间因此覆盖中间的空格与换行）。规则不再区分语种：拉丁查询「a b」现在也能命中「ab」，因为用户要的是「排除掉所有空格再查」。`search.rs` 的页内匹配与 `pdf-core/engine.rs` 的全文计数都调用这一份实现，不再各留一套。
 
 > **关键约束**：页内匹配（`search.rs`）与 worker 计数（`pdf-core/engine.rs`）必须使用同一套映射，否则全文总数与页内高亮数量会不一致，跨页跳转会定位错位。
 
-**验收标准**：① 文本层为「这 是 汉 字」时搜索「汉字」命中 1 处，高亮从「汉」覆盖到「字」；② 同一页同时存在「汉字」与「汉 字」时命中 2 处；③ 同一页的页内命中数与 `count_matches` 结果相等；④ 拉丁查询「a b」不会命中「ab」（空格有语义，不启用压缩）。
+**验收标准**：① 文本层为「这 是 汉 字」时搜索「汉字」命中 1 处，高亮从「汉」覆盖到「字」；② 同一页同时存在「汉字」与「汉 字」时命中 2 处；③ 同一页的页内命中数与 `count_matches` 结果相等；④ 查询串中的空白不影响命中：「医 生」「医\n生」均命中「医生」，「T 细胞」命中「T细胞」；⑤ 纯空白查询不产生任何命中。
 
 ### （二）光标不闪烁 ✅
 

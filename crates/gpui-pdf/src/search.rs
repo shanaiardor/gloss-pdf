@@ -78,6 +78,14 @@ impl SearchState {
         self.active_page
     }
 
+    /// 查询串里是否有可搜的字符。
+    ///
+    /// 匹配时会去掉全部空白（见 `pdf_core::text_match`），所以纯空格的查询
+    /// 等同于没输入：不扫全文、不报「没有匹配」，搜索框也不显示计数。
+    pub fn has_query(&self) -> bool {
+        !self.query.trim().is_empty()
+    }
+
     /// 某一页的匹配区间，画高亮用。
     pub fn matches_for(&self, page: usize) -> &[RangeInclusive<usize>] {
         self.page_matches
@@ -108,7 +116,7 @@ impl SearchState {
 
     /// 缓存非活动页的匹配，不动 `matches` / `current`。
     pub fn cache_page(&mut self, chars: &[CharBox], page: usize) {
-        if !self.open || self.query.is_empty() {
+        if !self.open || !self.has_query() {
             self.page_matches.remove(&page);
             return;
         }
@@ -222,7 +230,7 @@ impl SearchState {
 
 /// 页内匹配：把 `CharBox` 序列交给 [`pdf_core::text_match`] 的共享规则。
 ///
-/// 规则（大小写折叠、汉字空格容错、不重叠）只在那里定义一次，worker 的全文
+/// 规则（大小写折叠、空白全部忽略、不重叠）只在那里定义一次，worker 的全文
 /// 计数走同一份实现，避免两侧命中数对不上。
 fn find_matches(query: &str, chars: &[CharBox]) -> Vec<RangeInclusive<usize>> {
     let plain: Vec<char> = chars.iter().map(|character| character.ch).collect();
@@ -291,6 +299,27 @@ mod tests {
         assert_eq!(search.matches.len(), 1);
         assert_eq!(*search.matches[0].start(), 0);
         assert_eq!(*search.matches[0].end(), 2);
+    }
+
+    #[test]
+    fn query_whitespace_is_ignored() {
+        // 查询串中间的空格、换行都不参与匹配；高亮区间仍用原字符下标。
+        let mut search = SearchState {
+            open: true,
+            query: "医 生\n责 任".into(),
+            ..Default::default()
+        };
+        search.recompute(&chars("医生责任重大"), 0);
+        assert_eq!(search.matches.len(), 1);
+        assert_eq!(*search.matches[0].start(), 0);
+        assert_eq!(*search.matches[0].end(), 3);
+
+        // 原文里插入的空白同样不参与匹配。
+        search.query = "医生责任".into();
+        search.recompute(&chars("医 生 责 任"), 0);
+        assert_eq!(search.matches.len(), 1);
+        assert_eq!(*search.matches[0].start(), 0);
+        assert_eq!(*search.matches[0].end(), 6);
     }
 
     #[test]
@@ -405,6 +434,24 @@ mod tests {
         };
         search.recompute(&chars("anything"), 0);
         assert!(search.matches.is_empty());
+    }
+
+    #[test]
+    fn blank_query_is_treated_as_no_query() {
+        // 纯空格/换行等同于没输入：不产生命中，也不缓存逐页结果。
+        let mut search = SearchState {
+            open: true,
+            query: " \n\t ".into(),
+            ..Default::default()
+        };
+        assert!(!search.has_query());
+        search.recompute(&chars("anything"), 0);
+        assert!(search.matches.is_empty());
+        search.cache_page(&chars("anything"), 1);
+        assert!(search.matches_for(1).is_empty());
+
+        search.query = "a".into();
+        assert!(search.has_query());
     }
 
     #[test]

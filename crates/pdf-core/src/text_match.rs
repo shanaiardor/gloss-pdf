@@ -1,68 +1,44 @@
 //! 文本匹配规则：UI 页内高亮与 worker 全文计数共用这一份实现。
 //!
 //! 两份实现走偏的后果很具体：全文总数与页内高亮数量对不上，跨页跳转会定位错位。
-//! 所以匹配规则（大小写折叠、不重叠、汉字空格容错）只在这里定义一次。
+//! 所以匹配规则（大小写折叠、忽略空白、不重叠）只在这里定义一次。
 //!
-//! 汉字空格容错针对的是排版软件在汉字间插空格的情况：对中日韩查询额外做一次
-//! 「去掉空白」的匹配，再与直接匹配按起点合并（保持不重叠），并把压缩后的
-//! 下标映射回**原字符序列**，这样高亮区间既包含中间的空格，也能直接拿去索引
-//! `CharBox`。同一页里既有「汉字」又有「汉 字」时，两种写法都会命中。
+//! 空白字符一律不参与匹配：查询串里的空白先整串去掉，被搜文本也去掉空白后再比对，
+//! 命中下标再映射回**原字符序列**。这样排版软件插的空格、「回车」换行、制表符都
+//! 不会让搜索落空——「汉 字」能被「汉字」命中，「T\n细胞」能被「T 细胞」命中；
+//! 同时高亮区间仍覆盖中间那些空白，可以直接拿去索引 `CharBox`。
 
 use std::ops::RangeInclusive;
 
 /// 在字符序列里找所有不重叠的命中，返回原序列的字符下标区间。
+///
+/// 查询串与文本都先去掉空白再比对（见模块文档），返回的区间映射回原始序列，
+/// 因此覆盖命中内部的空白。
 pub fn find_matches(query: &str, chars: &[char]) -> Vec<RangeInclusive<usize>> {
-    let needle: Vec<char> = query.to_lowercase().chars().collect();
+    let needle: Vec<char> = query
+        .to_lowercase()
+        .chars()
+        .filter(|ch| !is_ignorable_space(*ch))
+        .collect();
     if needle.is_empty() {
         return Vec::new();
     }
 
-    let haystack: Vec<char> = chars.iter().copied().map(fold_char).collect();
-    let direct = scan(&needle, &haystack);
-    if !allow_space_insensitive(query) {
-        return direct;
-    }
-
-    // 去掉空白再匹配；`origins` 记住每个保留字符在原序列里的位置。
-    let mut compact = Vec::with_capacity(haystack.len());
-    let mut origins = Vec::with_capacity(haystack.len());
-    for (index, ch) in haystack.iter().copied().enumerate() {
-        if !is_ignorable_space(ch) {
-            compact.push(ch);
-            origins.push(index);
-        }
-    }
-
-    let compact_needle: Vec<char> = needle
-        .iter()
-        .copied()
-        .filter(|ch| !is_ignorable_space(*ch))
-        .collect();
-    if compact_needle.is_empty() {
-        return direct;
-    }
-
-    let mut candidates = direct;
-    candidates.extend(
-        scan(&compact_needle, &compact)
-            .into_iter()
-            .map(|range| origins[*range.start()]..=origins[*range.end()]),
-    );
-
-    // 直接匹配与压缩匹配可能指向同一处；按起点排序后贪心保留不重叠的区间，
-    // 起点相同则保留先加入的直接匹配。
-    candidates.sort_by(|a, b| a.start().cmp(b.start()).then(a.end().cmp(b.end())));
-    let mut matches: Vec<RangeInclusive<usize>> = Vec::with_capacity(candidates.len());
-    for range in candidates {
-        if matches
-            .last()
-            .is_some_and(|last| range.start() <= last.end())
-        {
+    // 文本去空白后逐字符折叠；`origins` 记住每个保留字符在原序列里的位置。
+    let mut compact = Vec::with_capacity(chars.len());
+    let mut origins = Vec::with_capacity(chars.len());
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if is_ignorable_space(ch) {
             continue;
         }
-        matches.push(range);
+        compact.push(fold_char(ch));
+        origins.push(index);
     }
-    matches
+
+    scan(&needle, &compact)
+        .into_iter()
+        .map(|range| origins[*range.start()]..=origins[*range.end()])
+        .collect()
 }
 
 /// 统计不重叠命中数；worker 全文计数用。
@@ -95,35 +71,10 @@ fn scan(needle: &[char], haystack: &[char]) -> Vec<RangeInclusive<usize>> {
     matches
 }
 
+/// 匹配前要去掉的字符：所有 Unicode 空白（空格、制表符、换行、回车、
+/// 不间断空格、全角空格等）。
 fn is_ignorable_space(ch: char) -> bool {
     ch.is_whitespace()
-}
-
-/// 是否允许「去掉空白再匹配一次」。
-///
-/// 只对中日韩文本启用：拉丁字母与数字混排时，空格本身有语义（「a b」不能
-/// 命中「ab」），贸然压缩会造出用户没要的匹配。
-fn allow_space_insensitive(query: &str) -> bool {
-    let mut has_cjk = false;
-    for ch in query.chars().filter(|ch| !ch.is_whitespace()) {
-        if is_cjk(ch) {
-            has_cjk = true;
-        } else if ch.is_alphanumeric() {
-            return false;
-        }
-    }
-    has_cjk
-}
-
-fn is_cjk(ch: char) -> bool {
-    matches!(ch as u32,
-        0x3040..=0x30FF     // 平假名、片假名
-        | 0x3400..=0x4DBF   // 扩展 A
-        | 0x4E00..=0x9FFF   // 基本区
-        | 0xAC00..=0xD7AF   // 谚文音节
-        | 0xF900..=0xFAFF   // 兼容表意文字
-        | 0x20000..=0x2FA1F // 扩展 B 及以后
-    )
 }
 
 #[cfg(test)]
@@ -164,7 +115,7 @@ mod tests {
 
     #[test]
     fn chinese_query_matches_both_spaced_and_unspaced_occurrences() {
-        // 直接匹配到一处时，不能漏掉同页里空格写法的另一处。
+        // 同一页里既有「汉字」又有「汉 字」时两处都要命中。
         let matches = find_matches("汉字", &chars("汉字 汉 字"));
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[0], 0..=1);
@@ -173,18 +124,37 @@ mod tests {
     }
 
     #[test]
-    fn direct_match_wins_over_compact_match() {
-        // 文本里本来就有「汉 字」时，直接匹配优先，不去动其他空白。
+    fn query_with_spaces_matches_spaced_text_and_covers_whitespace() {
+        // 查询串与文本都带空格时命中一处，高亮仍从「汉」盖到「字」。
         let matches = find_matches("汉 字", &chars("汉 字"));
         assert_eq!(matches, vec![0..=2]);
     }
 
     #[test]
-    fn latin_query_does_not_ignore_spaces() {
-        assert!(find_matches("ab", &chars("a b")).is_empty());
-        assert!(find_matches("a b", &chars("ab")).is_empty());
-        // 中英混排同样按精确规则处理。
-        assert!(find_matches("汉a", &chars("汉 a")).is_empty());
+    fn whitespace_in_query_is_ignored_for_every_script() {
+        // 用户从 PDF 里复制出来的词条常带空格、换行：查询串里的空白一律去掉。
+        assert_eq!(find_matches("ab", &chars("a b")), vec![0..=2]);
+        assert_eq!(find_matches("a b", &chars("ab")), vec![0..=1]);
+        assert_eq!(find_matches("T 细胞", &chars("T细胞")), vec![0..=2]);
+        assert_eq!(find_matches("汉a", &chars("汉 a")), vec![0..=2]);
+        // 行首行尾空白同样不参与匹配。
+        assert_eq!(
+            find_matches("  hello \n", &chars("helloworld")),
+            vec![0..=4]
+        );
+        // 纯空白查询不产生任何命中。
+        assert!(find_matches(" \n\t", &chars("a b")).is_empty());
+    }
+
+    #[test]
+    fn newlines_and_tabs_are_ignored_on_both_sides() {
+        // 文本层换行（「回车」）不能把词拆开。
+        assert_eq!(find_matches("hello", &chars("he\nllo")), vec![0..=5]);
+        assert_eq!(find_matches("he\tllo", &chars("hello")), vec![0..=4]);
+        assert_eq!(find_matches("发现", &chars("发\r\n现")), vec![0..=3]);
+        // 全角空格与不间断空格也算空白。
+        assert_eq!(find_matches("汉字", &chars("汉\u{3000}字")), vec![0..=2]);
+        assert_eq!(find_matches("汉字", &chars("汉\u{00a0}字")), vec![0..=2]);
     }
 
     #[test]

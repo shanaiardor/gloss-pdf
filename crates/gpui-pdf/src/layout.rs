@@ -21,15 +21,45 @@ pub const PREFETCH_PAGES: usize = 1;
 /// 阅读锚线在视口里的纵向位置比例：取中线，页码在页面过半时切换。
 pub const ANCHOR_RATIO: f32 = 0.5;
 
-/// Ctrl + 滚轮每一格（约 3 行）的缩放倍率。
-pub(crate) const WHEEL_ZOOM_STEP: f32 = 1.15;
+/// 缩放步长（百分点）：键盘/胶囊 ± 按钮一次一步，Ctrl + 滚轮一行一步。
+pub const ZOOM_STEP_PERCENT: f32 = 1.0;
 
-/// 把滚轮行数换算成缩放倍率；一格约 3 行，触控板的小增量按比例折算。
-pub(crate) fn wheel_zoom_factor(lines: f32) -> f32 {
-    if !lines.is_finite() {
-        return 1.0;
+/// 按住中键拖动时内容的跟随比例：指针走 2px，内容滚 1px。
+///
+/// 取的是一半速度而不是 1:1，拖起来慢而稳，长文档里也容易停在某一行上。
+pub const PAN_RATIO: f32 = 0.5;
+
+/// 中键拖动时指针位移换算成滚动位移：反方向、半速。
+pub fn pan_delta(distance: f32) -> f32 {
+    if !distance.is_finite() {
+        return 0.0;
     }
-    WHEEL_ZOOM_STEP.powf((lines / 3.0).clamp(-2.0, 2.0))
+    -distance * PAN_RATIO
+}
+
+/// 按百分点步进缩放：先把当前比例对齐到整百分点，再加减 `percent`。
+///
+/// 键盘与底部胶囊的 ± 按钮用它，保证每次刚好变 1%；适页/适宽算出来的
+/// 小数比例也先对齐，显示出来的百分比才会一格一格地走。
+pub fn zoom_step(zoom: f32, percent: f32) -> f32 {
+    let base = (zoom * 100.0).round();
+    ((base + percent) / 100.0).clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+/// 在现有比例上连续加减百分点。
+///
+/// Ctrl + 滚轮用它：触控板的细小增量也能累积，不会因为量化成整百分点而丢掉。
+pub fn zoom_add(zoom: f32, percent: f32) -> f32 {
+    (zoom + percent / 100.0).clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+/// 把滚轮行数换算成缩放百分点：一行 1%，一格约 3 行（即 3%）。
+/// 单次事件最多夹到两格，避免触控板一次报个大增量就把缩放甩到底。
+pub(crate) fn wheel_zoom_percent(lines: f32) -> f32 {
+    if !lines.is_finite() {
+        return 0.0;
+    }
+    lines.clamp(-6.0, 6.0) * ZOOM_STEP_PERCENT
 }
 
 pub const MIN_ZOOM: f32 = 0.25;
@@ -602,13 +632,71 @@ mod point_anchor_tests {
     }
 
     #[test]
-    fn one_wheel_notch_zooms_by_fifteen_percent() {
-        assert!((wheel_zoom_factor(3.0) - 1.15).abs() < 0.0001);
-        assert!((wheel_zoom_factor(-3.0) - 1.0 / 1.15).abs() < 0.0001);
-        assert!((wheel_zoom_factor(0.0) - 1.0).abs() < f32::EPSILON);
+    fn one_wheel_notch_zooms_by_three_percent() {
+        // 一行 1%，一格约 3 行。
+        assert!((wheel_zoom_percent(3.0) - 3.0).abs() < 0.0001);
+        assert!((wheel_zoom_percent(-3.0) + 3.0).abs() < 0.0001);
+        assert!((wheel_zoom_percent(1.0) - 1.0).abs() < 0.0001);
+        assert!((wheel_zoom_percent(0.0)).abs() < f32::EPSILON);
         // 极大增量夹在两格以内，避免一次事件把缩放甩到底。
-        assert!((wheel_zoom_factor(300.0) - 1.15_f32.powi(2)).abs() < 0.0001);
-        assert!((wheel_zoom_factor(f32::NAN) - 1.0).abs() < f32::EPSILON);
+        assert!((wheel_zoom_percent(300.0) - 6.0).abs() < 0.0001);
+        assert!((wheel_zoom_percent(f32::NAN)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn zoom_steps_are_one_percent() {
+        assert!((zoom_step(1.0, 1.0) - 1.01).abs() < 0.0001);
+        assert!((zoom_step(1.0, -1.0) - 0.99).abs() < 0.0001);
+        // 适页算出的小数比例先对齐到整百分点，再加减 1%。
+        assert!((zoom_step(0.6245, 1.0) - 0.63).abs() < 0.0001);
+        assert!((zoom_step(0.6245, -1.0) - 0.61).abs() < 0.0001);
+        // 刚好卡在两个百分点之间时向上对齐（round 远离零），之后每次都是整数。
+        assert!((zoom_step(0.625, 1.0) - 0.64).abs() < 0.0001);
+        assert!((zoom_step(0.625, -1.0) - 0.62).abs() < 0.0001);
+        // 夹在 25%–400%。
+        assert!((zoom_step(MAX_ZOOM, 1.0) - MAX_ZOOM).abs() < f32::EPSILON);
+        assert!((zoom_step(MIN_ZOOM, -1.0) - MIN_ZOOM).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn continuous_zoom_keeps_small_trackpad_deltas() {
+        assert!((zoom_add(1.0, 0.5) - 1.005).abs() < 0.0001);
+        assert!((zoom_add(1.0, -3.0) - 0.97).abs() < 0.0001);
+        assert!((zoom_add(MAX_ZOOM, 3.0) - MAX_ZOOM).abs() < f32::EPSILON);
+        assert!((zoom_add(MIN_ZOOM, -3.0) - MIN_ZOOM).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn middle_drag_pans_at_half_speed() {
+        // 指针下移 100px：内容跟着往下 50px，即「滚顶」减少 50px。
+        assert!((pan_delta(100.0) + 50.0).abs() < 0.0001);
+        // 指针上移：内容往上，滚顶增加。
+        assert!((pan_delta(-100.0) - 50.0).abs() < 0.0001);
+        assert!(pan_delta(0.0).abs() < f32::EPSILON);
+        assert!(pan_delta(f32::NAN).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn middle_drag_stops_at_the_document_edges() {
+        let layout = DocumentLayout::new(
+            &vec![
+                PageSize {
+                    width: 600.0,
+                    height: 800.0,
+                };
+                3
+            ],
+            1.0,
+            1000.0,
+        );
+        let top = 100.0;
+
+        // 往上拖过头停在底部，不会滚出内容范围。
+        let bottom = layout.clamp_scroll_top(top + pan_delta(-100_000.0), 400.0);
+        assert!((bottom - (layout.content_height - 400.0)).abs() < 0.001);
+        // 往下拖过头停在顶部。
+        let top_again = layout.clamp_scroll_top(top + pan_delta(100_000.0), 400.0);
+        assert!(top_again.abs() < 0.001);
     }
 
     #[test]

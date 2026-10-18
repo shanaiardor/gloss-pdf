@@ -128,6 +128,10 @@ impl super::AppState {
         self.dictionary.clear_results();
         self.sync_dictionary_window(cx);
         self.search_input.update(cx, |input, cx| input.clear(cx));
+        self.panning = None;
+        // 换文档时重置胶囊可见性：新文档先亮着让用户看见按钮，
+        // 否则上一份文档留下的「已隐身」会直接沿用过来。
+        self.chrome = crate::chrome_visibility::ChromeVisibility::new();
         self.viewer.reset(
             Document {
                 path,
@@ -185,6 +189,7 @@ impl super::AppState {
     pub(crate) fn close_document(&mut self, cx: &mut Context<Self>) {
         self.flush_progress();
         self.viewer.close();
+        self.panning = None;
         self.page_input_open = false;
         self.search_input.update(cx, |input, cx| input.clear(cx));
         self.pending_focus = Some(FocusTarget::Root);
@@ -395,7 +400,8 @@ impl super::AppState {
         let query = self.viewer.search.query.clone();
         self.search_request_id = self.search_request_id.wrapping_add(1);
 
-        if query.is_empty() {
+        if query.trim().is_empty() {
+            // 纯空白与空串等价：匹配时空白会被全部去掉，没必要扫全文。
             self.viewer.search.clear_results();
             cx.notify();
             return;
@@ -458,7 +464,7 @@ impl super::AppState {
             return;
         }
 
-        if self.viewer.search.query.is_empty() {
+        if !self.viewer.search.has_query() {
             return;
         }
         self.set_status("没有匹配", cx);

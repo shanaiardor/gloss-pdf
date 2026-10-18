@@ -17,6 +17,8 @@ mod render;
 mod update;
 mod window;
 
+pub use window::initial_window_bounds;
+
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -28,11 +30,12 @@ use gpui::{
 };
 use pdf_core::{Command, PageSize, PdfEngine};
 
+use crate::chrome_visibility::ChromeVisibility;
 use crate::dict_history::DictHistory;
 use crate::dictionary::{DictLoadState, DictRequest, DictionaryState};
 use crate::home::{HomeNav, HomeState};
 use crate::progress::ReadingProgress;
-use crate::settings::SettingsStore;
+use crate::settings::{SettingsStore, WindowState};
 use crate::theme::Theme;
 use crate::ui::dictionary::DictionaryWindow;
 use crate::ui::text_input::{TextInput, TextInputEvent};
@@ -72,17 +75,23 @@ pub struct AppState {
     pub(crate) dict_history: DictHistory,
     /// 独立词典窗口；关闭后保留的句柄会在下一次同步时清掉。
     pub(crate) dictionary_window: Option<WindowHandle<DictionaryWindow>>,
+    /// 词典浮窗相对主窗口的吸附锚点；`None` 表示没吸附、不跟随。
+    dictionary_follow: Option<crate::window_layout::Anchor>,
     /// 主窗口与显示器工作区，用来把词典窗口放到主窗口右侧。
     main_window_bounds: Option<Bounds<gpui::Pixels>>,
     display_bounds: Option<Bounds<gpui::Pixels>>,
     pub(crate) viewport: Size<gpui::Pixels>,
     pub(crate) scale_factor: f32,
+    /// 按住中键拖动时的上一次指针位置；`None` 表示没在拖。
+    pub(crate) panning: Option<gpui::Point<gpui::Pixels>>,
     pub(crate) request_id: u64,
     /// 全文搜索的请求代号，用来丢掉过期结果。
     search_request_id: u64,
     pub(crate) outline_open: bool,
     /// 批注（高亮）侧栏是否展开。
     pub(crate) highlight_panel_open: bool,
+    /// 浮动胶囊的自动隐身状态机；纯逻辑在 [`crate::chrome_visibility`] 里。
+    pub(crate) chrome: ChromeVisibility,
     pub(crate) status: String,
     pub(crate) status_version: u64,
     /// 主窗口标题；文档标题在 `render` 里写入窗口，因为事件回调拿不到 `Window`。
@@ -98,6 +107,10 @@ pub struct AppState {
     pending_window_resize: Option<Size<gpui::Pixels>>,
     /// 进入阅读器之前的窗口尺寸，关闭文档时恢复。
     reader_window_size: Option<Size<gpui::Pixels>>,
+    /// 最近一次采样到的窗口几何；改动后在去抖计时器里落盘。
+    pending_window_state: Option<WindowState>,
+    /// 是否已经安排了一次窗口几何写盘。
+    window_state_save_scheduled: bool,
     /// 更新检查/下载的 worker 与界面状态。
     pub(crate) update_engine: UpdateEngine,
     pub(crate) update_phase: UpdatePhase,
@@ -106,7 +119,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    /// 构造应用状态。
+    ///
+    /// 设置由 `main` 先读好再传进来：窗口几何要在 `open_window` 之前用到，
+    /// 两处各读一遍磁盘会不一致，也会白读一次。
+    pub fn with_settings(cx: &mut Context<Self>, settings: SettingsStore) -> Self {
         let (event_tx, mut event_rx) = futures::channel::mpsc::unbounded();
         let engine = PdfEngine::spawn(event_tx).commands;
 
@@ -122,7 +139,7 @@ impl AppState {
         })
         .detach();
 
-        let settings = SettingsStore::load();
+        let settings = settings;
         let auto_check_updates = settings.current.auto_check_updates;
         let theme = if settings.current.dark {
             Theme::dark()
@@ -206,14 +223,14 @@ impl AppState {
         }
 
         // 词典窗口自己也有输入框：它只负责把词发回来，查词状态仍由主窗口维护。
-        let (dict_query, mut dict_query_rx) =
-            futures::channel::mpsc::unbounded::<DictRequest>();
+        let (dict_query, mut dict_query_rx) = futures::channel::mpsc::unbounded::<DictRequest>();
         cx.spawn(async move |this, cx| {
             while let Some(request) = dict_query_rx.next().await {
                 let updated = this.update(cx, |this, cx| match request {
                     DictRequest::Lookup(term) => this.lookup_word(term, cx),
                     DictRequest::Suggest(term) => this.request_suggestions(term, cx),
                     DictRequest::ClearHistory => this.clear_dict_history(cx),
+                    DictRequest::FloatPlaced(rect) => this.dictionary_float_placed(rect, cx),
                 });
                 if updated.is_err() {
                     break;
@@ -263,6 +280,7 @@ impl AppState {
         // 关窗/退出时兜底保存一次，避免最后不到一秒的滚动丢失。
         cx.on_release(|this, cx| {
             this.flush_progress();
+            this.flush_window_state();
             if let Some(handle) = this.dictionary_window.take() {
                 let _ = handle.update(cx, |_view, window, _cx| window.remove_window());
             }
@@ -334,6 +352,7 @@ impl AppState {
             dictionary,
             dict_history,
             dictionary_window: None,
+            dictionary_follow: None,
             main_window_bounds: None,
             display_bounds: None,
             viewport: Size {
@@ -341,10 +360,12 @@ impl AppState {
                 height: px(720.),
             },
             scale_factor: 1.0,
+            panning: None,
             request_id: 0,
             search_request_id: 0,
             outline_open: false,
             highlight_panel_open: false,
+            chrome: ChromeVisibility::new(),
             status: String::new(),
             status_version: 0,
             window_title: "极简 PDF".into(),
@@ -354,6 +375,8 @@ impl AppState {
             pending_window_fit: None,
             pending_window_resize: None,
             reader_window_size: None,
+            pending_window_state: None,
+            window_state_save_scheduled: false,
             update_engine,
             update_phase: UpdatePhase::default(),
             registered_dict_fonts: HashSet::new(),
@@ -434,6 +457,13 @@ impl Render for AppState {
             // 滚动条每帧都在动：先把「读到第几页」对齐到最新偏移，再补渲染可视页。
             self.sync_current_page();
             self.ensure_visible_pages();
+
+            // 浮动胶囊的自动隐身：鼠标位置靠窗口级监听（`chrome_mouse_watch`，只能在
+            // 绘制阶段注册），这里只负责“鼠标没动但参数变了”和首帧的结算。
+            // 为什么需要窗口级监听：顶部 46px 拖拽条是 `WindowControlArea::Drag`，Windows
+            // 上是 HTCAPTION（非客户区），鼠标在它上面收不到元素的 hover/move；
+            // gpui_windows 会把 `WM_NCMOUSEMOVE` 翻译成同一种 `MouseMoveEvent` 走统一输入管线。
+            self.settle_chrome(window.mouse_position(), false, cx);
         }
 
         let theme = self.theme.clone();
@@ -471,7 +501,9 @@ impl Render for AppState {
         if self.viewer.has_document() {
             root = root
                 .child(self.floating_top(&theme, cx))
-                .child(self.floating_bottom(&theme, cx));
+                .child(self.floating_bottom(&theme, cx))
+                // 零尺寸，只在绘制阶段注册窗口级鼠标监听（胶囊隐身用）。
+                .child(crate::ui::chrome::chrome_mouse_watch(cx));
         }
 
         if let Some(panel) = self.outline_panel(&theme, cx) {

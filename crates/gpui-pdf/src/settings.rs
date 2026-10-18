@@ -14,7 +14,30 @@ pub struct DictionarySetting {
     pub enabled: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowState {
+    /// 窗口左上角在全局屏幕坐标中的位置（逻辑像素）。
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    /// 退出时是否处于最大化；`true` 时上面四个值是“还原后”的窗口框。
+    #[serde(default)]
+    pub maximized: bool,
+}
+
+impl WindowState {
+    pub fn is_finite(self) -> bool {
+        self.x.is_finite()
+            && self.y.is_finite()
+            && self.width.is_finite()
+            && self.height.is_finite()
+            && self.width > 0.0
+            && self.height > 0.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     /// 上次使用的主题。
     #[serde(default)]
@@ -28,6 +51,9 @@ pub struct Settings {
     /// 启动后自动检查 GitHub 更新；默认开启。
     #[serde(default = "default_true")]
     pub auto_check_updates: bool,
+    /// 上次使用的窗口尺寸与位置；`None` 表示首次启动，按默认尺寸居中。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<WindowState>,
 }
 
 impl Default for Settings {
@@ -37,6 +63,7 @@ impl Default for Settings {
             dictionary_path: None,
             dictionaries: Vec::new(),
             auto_check_updates: true,
+            window: None,
         }
     }
 }
@@ -143,10 +170,76 @@ mod tests {
                 enabled: true,
             }],
             auto_check_updates: false,
+            window: Some(WindowState {
+                x: 120.0,
+                y: 80.0,
+                width: 1280.0,
+                height: 860.0,
+                maximized: false,
+            }),
         };
         let json = serde_json::to_string(&settings).unwrap();
         let parsed: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, settings);
+    }
+
+    #[test]
+    fn window_state_round_trips_and_defaults_to_none() {
+        let text =
+            r#"{"window":{"x":-1600.0,"y":40.0,"width":1000.0,"height":700.0,"maximized":true}}"#;
+        let parsed = parse_settings(text);
+        assert_eq!(
+            parsed.window,
+            Some(WindowState {
+                x: -1600.0,
+                y: 40.0,
+                width: 1000.0,
+                height: 700.0,
+                maximized: true,
+            }),
+            "副屏（负坐标）与最大化状态都要能存回来"
+        );
+
+        // 没存过窗口几何（首次启动 / 旧配置）时是 `None`，也回退成默认居中。
+        assert!(parse_settings("{}").window.is_none());
+
+        // 旧配置没有 `maximized` 字段，按未最大化处理。
+        let parsed = parse_settings(r#"{"window":{"x":0.0,"y":0.0,"width":800.0,"height":600.0}}"#);
+        assert!(parsed.window.is_some_and(|window| !window.maximized));
+    }
+
+    #[test]
+    fn non_finite_window_state_is_rejected() {
+        assert!(
+            !WindowState {
+                x: f32::NAN,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+                maximized: false,
+            }
+            .is_finite()
+        );
+        assert!(
+            !WindowState {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 600.0,
+                maximized: false,
+            }
+            .is_finite()
+        );
+        assert!(
+            WindowState {
+                x: -1920.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+                maximized: false,
+            }
+            .is_finite()
+        );
     }
 
     #[test]
@@ -262,6 +355,7 @@ mod tests {
                     enabled: true,
                 }],
                 auto_check_updates: false,
+                window: None,
             },
             storage: Some(path.clone()),
         };

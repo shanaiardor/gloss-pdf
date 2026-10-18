@@ -1,10 +1,12 @@
 //! 浮动界面组件：顶部胶囊、底部胶囊、窗口按钮、拖拽条。
 
 use gpui::{
-    App, ClickEvent, Context, Render, Window, WindowControlArea, div, prelude::*, px, rgb, svg,
+    App, ClickEvent, Context, MouseMoveEvent, Pixels, Point, Render, Window, WindowControlArea,
+    div, prelude::*, px, rgb, svg,
 };
 
 use crate::app::AppState;
+use crate::chrome_visibility::{ChromeInput, ChromeSignature, ChromeUpdate, HIDE_DELAY, band_at};
 use crate::layout::FitMode;
 use crate::theme::Theme;
 
@@ -131,14 +133,17 @@ impl AppState {
                 }),
             ));
 
-        div()
-            .absolute()
-            .top(px(8.))
-            .left_0()
-            .right_0()
-            .flex()
-            .justify_center()
-            .child(capsule)
+        chrome_wrapper(
+            div()
+                .absolute()
+                .top(px(8.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(capsule),
+            self.chrome.is_visible(),
+        )
     }
 
     pub(crate) fn floating_bottom(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
@@ -220,8 +225,7 @@ impl AppState {
                 "−",
                 theme,
                 cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                    let zoom = this.viewer.zoom / 1.15;
-                    this.set_zoom(zoom, cx);
+                    this.step_zoom(-crate::layout::ZOOM_STEP_PERCENT, cx);
                 }),
             ))
             .child(
@@ -238,8 +242,7 @@ impl AppState {
                 "＋",
                 theme,
                 cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                    let zoom = this.viewer.zoom * 1.15;
-                    this.set_zoom(zoom, cx);
+                    this.step_zoom(crate::layout::ZOOM_STEP_PERCENT, cx);
                 }),
             ))
             .child(div().w(px(1.)).h(px(16.)).bg(theme.border))
@@ -262,14 +265,94 @@ impl AppState {
                 }),
             ));
 
-        div()
-            .absolute()
-            .bottom(px(16.))
-            .left_0()
-            .right_0()
-            .flex()
-            .justify_center()
-            .child(capsule)
+        chrome_wrapper(
+            div()
+                .absolute()
+                .bottom(px(16.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(capsule),
+            self.chrome.is_visible(),
+        )
+    }
+
+    /// 影响胶囊可见性的阅读参数摘要。任何一项变化都会把胶囊叫回来。
+    fn chrome_signature(&self) -> ChromeSignature {
+        ChromeSignature {
+            zoom: self.viewer.zoom,
+            current_page: self.viewer.current_page,
+            page_count: self.viewer.page_count(),
+            fit_mode: self.viewer.fit_mode,
+            outline_open: self.outline_open,
+            highlight_panel_open: self.highlight_panel_open,
+            settings_open: self.settings_open,
+            page_input_open: self.page_input_open,
+            search_open: self.viewer.search.open,
+            highlight_count: self.viewer.highlights.len(),
+            dark: self.theme.dark,
+        }
+    }
+
+    /// 正在进行的交互：这些时候不许隐身，否则页码输入框会跟着胶囊一起消失。
+    fn chrome_interacting(&self) -> bool {
+        self.page_input_open || self.panning.is_some() || self.viewer.selection.dragging
+    }
+
+    /// 结算一次胶囊可见性。鼠标事件回调和每帧 `render` 都走这里，所以必须幂等。
+    pub(crate) fn settle_chrome(
+        &mut self,
+        mouse: Point<Pixels>,
+        pointer_moved: bool,
+        cx: &mut Context<Self>,
+    ) -> ChromeUpdate {
+        let viewport = (
+            f32::from(self.viewport.width),
+            f32::from(self.viewport.height),
+        );
+        let mouse = (f32::from(mouse.x), f32::from(mouse.y));
+        let parameters_changed = self.chrome.observe_parameters(self.chrome_signature());
+        let update = self.chrome.update(ChromeInput {
+            mouse_in_band: band_at(mouse, viewport, self.chrome.bands()).is_some(),
+            parameters_changed,
+            interacting: self.chrome_interacting(),
+            pointer_moved,
+        });
+        if let Some(generation) = update.countdown {
+            self.schedule_chrome_hide(generation, cx);
+        }
+        update
+    }
+
+    /// 排一个隐藏倒计时；到期时只有代数还对得上才真的隐藏（防止旧定时器
+    /// 把刚刚因为鼠标回来而显示的胶囊又藏掉）。
+    fn schedule_chrome_hide(&mut self, generation: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HIDE_DELAY).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.chrome.on_countdown_elapsed(generation) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 窗口级鼠标移动：胶囊可见性的实时输入。
+    ///
+    /// 为什么用窗口级监听而不是胶囊上的 `on_hover`：顶部的 46px `drag_strip()` 是
+    /// `WindowControlArea::Drag`，Windows 上对应 HTCAPTION（非客户区），鼠标可能在它
+    /// 上面收不到普通元素的 hover/move 事件。gpui_windows 会把 `WM_NCMOUSEMOVE` 翻译
+    /// 成同样的 `MouseMoveEvent` 走统一输入管线，窗口级监听两种移动都能收到；再把位置
+    /// 和几何感应带（[`band_at`]）比一下，就不依赖任何元素的命中测试。
+    pub(crate) fn on_global_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.viewer.has_document() {
+            return;
+        }
+        if self.settle_chrome(event.position, true, cx).changed {
+            cx.notify();
+        }
     }
 
     pub(crate) fn window_controls(&self, _theme: &Theme) -> gpui::Div {
@@ -296,6 +379,41 @@ impl AppState {
                 rgb(0x28c840),
             ))
     }
+}
+
+/// 注册窗口级鼠标监听的零尺寸元素。
+///
+/// `Window::on_mouse_event` 自带 `debug_assert_paint`：**只能在绘制阶段**调用。
+/// `Render::render` 是布局阶段跑的（`EntityRenderer::request_layout` 里调 `render`），
+/// 在那里注册会直接 panic（`this method can only be called during paint`），并且会让
+/// 已经借用的 `App` 在 panic 展开时泄漏，之后所有 `AsyncApp` 操作都跟着炸。
+/// 所以放到 `canvas` 的 paint 回调里：那是真正的绘制阶段，`in_paint` 为真。
+///
+/// 监听器每帧开画前会被清空，因此每帧都要重新注册一次。
+pub(crate) fn chrome_mouse_watch(cx: &mut Context<AppState>) -> impl gpui::IntoElement {
+    let view = cx.entity().downgrade();
+    gpui::canvas(
+        |_bounds, _window, _cx| {},
+        move |_bounds, (), window, _cx| {
+            let view = view.clone();
+            // 同一个监听器在捕获阶段和冒泡阶段各被调一次，这里只吃捕获阶段那一遍。
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+                if phase != gpui::DispatchPhase::Capture {
+                    return;
+                }
+                let _ = view.update(cx, |this, cx| this.on_global_mouse_move(event, cx));
+            });
+        },
+    )
+}
+
+/// 胶囊外层的可见性包装。
+///
+/// 隐身必须用 `hidden()`（`display: none`），不能 `invisible()`（`visibility: hidden`）：
+/// 后者仍然占着布局位置、仍然在命中测试树里，会把页面的点击、滚轮、拖选和中键平移全吞掉；
+/// `display: none` 的子树既不参与布局也不参与 hit-test，胶囊才算真的“隐身”。
+fn chrome_wrapper(wrapper: gpui::Div, visible: bool) -> gpui::Div {
+    if visible { wrapper } else { wrapper.hidden() }
 }
 
 pub(crate) fn drag_strip() -> gpui::Stateful<gpui::Div> {

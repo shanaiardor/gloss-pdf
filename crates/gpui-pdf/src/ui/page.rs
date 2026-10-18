@@ -1,4 +1,4 @@
-﻿//! 页面区域：连续滚动的页面列、每页位图与选择/搜索/高亮/链接覆盖层。
+//! 页面区域：连续滚动的页面列、每页位图与选择/搜索/高亮/链接覆盖层。
 //!
 //! 整篇文档是**一列绝对定位的页面**：每页的 top/left 由 `DocumentLayout` 算好，
 //! 总高度固定，所以只渲染可视范围附近的几页也不影响滚动条长度和滚动位移。
@@ -18,7 +18,7 @@ impl AppState {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let container = div()
+        let mut container = div()
             .id("page-scroll")
             .size_full()
             .overflow_scroll()
@@ -26,7 +26,14 @@ impl AppState {
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             // 拖选挂在容器上：指针滑出页面甚至滑到别的页也能继续扩展选区。
             .on_mouse_move(cx.listener(Self::on_page_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_page_mouse_up));
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_page_mouse_up))
+            // 按住中键拖动阅读：像抓着纸往下拖，半速跟随指针。
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_page_middle_down))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_page_middle_up));
+
+        if self.panning.is_some() {
+            container = container.cursor(gpui::CursorStyle::ClosedHand);
+        }
 
         let Some(layout) = self.doc_layout() else {
             return container.child(empty_state(theme, cx));
@@ -173,13 +180,7 @@ impl AppState {
     }
 }
 
-fn page_placeholder(
-    left: f32,
-    top: f32,
-    width: f32,
-    height: f32,
-    theme: &Theme,
-) -> gpui::Div {
+fn page_placeholder(left: f32, top: f32, width: f32, height: f32, theme: &Theme) -> gpui::Div {
     div()
         .absolute()
         .left(px(left))

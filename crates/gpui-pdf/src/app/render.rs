@@ -169,13 +169,10 @@ impl super::AppState {
         for tile in tiles {
             visible.insert((page, tile.origin_x, tile.origin_y));
             let request = self.request_id + 1;
-            if !self.viewer.begin_tile_request(
-                page,
-                tile.origin_x,
-                tile.origin_y,
-                request,
-                scale,
-            ) {
+            if !self
+                .viewer
+                .begin_tile_request(page, tile.origin_x, tile.origin_y, request, scale)
+            {
                 continue;
             }
             self.request_id = request;
@@ -311,6 +308,15 @@ impl super::AppState {
         cx.notify();
     }
 
+    /// 按百分点步进缩放（键盘快捷键与底部胶囊的 ± 按钮）：每次刚好 1%。
+    ///
+    /// 用 `zoom_step` 而不是直接相加，是为了先把适页/适宽留下的小数比例
+    /// 对齐到整百分点，连按几下就能落到 100%、125% 这种整数百分比。
+    pub(crate) fn step_zoom(&mut self, percent: f32, cx: &mut Context<Self>) {
+        let zoom = crate::layout::zoom_step(self.viewer.zoom, percent);
+        self.set_zoom(zoom, cx);
+    }
+
     pub(crate) fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
         // 缩放前后保持锚点不动，读者视线不会因缩放跳走。
         let anchor = self.doc_layout().map(|layout| self.reading_anchor(&layout));
@@ -325,12 +331,15 @@ impl super::AppState {
 
     /// 以指针为锚点缩放：指针下的内容点缩放后仍停在指针下。
     ///
+    /// `percent` 是缩放百分点变化量（1 表示放大 1%）；Ctrl + 滚轮传的是
+    /// `wheel_zoom_percent` 算出的带小数的值，触控板的细小增量也能生效。
+    ///
     /// `scrolled` 是内建滚动监听已经施加到滚动偏移上的像素量。同一个元素上
     /// GPUI 先跑内建滚动、再跑用户监听，所以这里先减回去，得到事件发生前的
     /// 滚动位置；否则锚点会带上一次滚轮的位移。
     pub(super) fn zoom_at_pointer(
         &mut self,
-        factor: f32,
+        percent: f32,
         position: Point<gpui::Pixels>,
         scrolled: Point<gpui::Pixels>,
         cx: &mut Context<Self>,
@@ -352,8 +361,7 @@ impl super::AppState {
             return;
         };
 
-        let zoom =
-            (self.viewer.zoom * factor).clamp(crate::layout::MIN_ZOOM, crate::layout::MAX_ZOOM);
+        let zoom = crate::layout::zoom_add(self.viewer.zoom, percent);
         if (zoom - self.viewer.zoom).abs() < 0.0001 {
             return;
         }
@@ -373,6 +381,36 @@ impl super::AppState {
         ) else {
             return;
         };
+        self.viewer
+            .scroll
+            .set_offset(Point::new(px(-left), px(-top)));
+
+        self.ensure_visible_pages();
+        self.sync_current_page();
+        self.flush_progress();
+        cx.notify();
+    }
+
+    /// 按住中键拖动：把指针位移换算成滚动偏移（反方向、半速）。
+    ///
+    /// 两个轴都夹在内容范围内，拖到文档头/尾或左右边界就停住；
+    /// 每步只处理增量，不记「按下时的原点」，所以指针在容器外丢过几次
+    /// 事件再回来也不会跳一段。
+    pub(super) fn pan_by(&mut self, delta: Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        let Some(layout) = self.doc_layout() else {
+            return;
+        };
+        let max_left = (layout.content_width - f32::from(self.viewport.width)).max(0.0);
+        let max_top = (layout.content_height - f32::from(self.viewport.height)).max(0.0);
+        let offset = self.viewer.scroll.offset();
+        let left = (-f32::from(offset.x) + crate::layout::pan_delta(f32::from(delta.x)))
+            .clamp(0.0, max_left);
+        let top = (-f32::from(offset.y) + crate::layout::pan_delta(f32::from(delta.y)))
+            .clamp(0.0, max_top);
+        if (f32::from(offset.x) + left).abs() < 0.01 && (f32::from(offset.y) + top).abs() < 0.01 {
+            // 已经在边界上：不重设偏移，免得每帧都把滚动句柄推回同一个值。
+            return;
+        }
         self.viewer
             .scroll
             .set_offset(Point::new(px(-left), px(-top)));

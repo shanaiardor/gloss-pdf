@@ -9,7 +9,7 @@ impl AppState {
     pub(crate) fn search_overlay(&self, theme: &Theme) -> gpui::Div {
         let search = &self.viewer.search;
 
-        let status = if search.query.is_empty() {
+        let status = if !search.has_query() {
             String::new()
         } else if search.scanning {
             if search.scanned_total > 0 {

@@ -36,9 +36,7 @@ impl super::AppState {
                 width,
                 height,
                 bgra,
-            } => self.on_tile_rendered(
-                page, request, origin_x, origin_y, width, height, bgra, cx,
-            ),
+            } => self.on_tile_rendered(page, request, origin_x, origin_y, width, height, bgra, cx),
             Event::PageElements {
                 page,
                 request,
@@ -297,8 +295,8 @@ impl super::AppState {
         cx.notify();
     }
 
-    /// 拖选：挂在滚动容器上，指针滑出页面（甚至滑到别的页）也能继续扩展选区。
-    /// Ctrl + 滚轮缩放。滚轮一格约 3 行，按 1.15 倍缩放；触控板的小增量按比例折算。
+    /// Ctrl + 滚轮缩放。滚轮一格约 3 行，每行 1%（一格约 3%）；
+    /// 触控板的小增量按比例折算，不量化成整百分点。
     pub(crate) fn on_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,
@@ -316,13 +314,56 @@ impl super::AppState {
         if lines.abs() < 0.05 {
             return;
         }
-        let factor = crate::layout::wheel_zoom_factor(lines);
-        if (factor - 1.0).abs() < f32::EPSILON {
+        let percent = crate::layout::wheel_zoom_percent(lines);
+        if percent == 0.0 {
             return;
         }
         let scrolled = event.delta.pixel_delta(window.line_height());
-        self.zoom_at_pointer(factor, event.position, scrolled, cx);
+        self.zoom_at_pointer(percent, event.position, scrolled, cx);
         cx.stop_propagation();
+    }
+
+    /// 按住中键（滚轮键）：进入拖动平移，指针变抓手。
+    pub(crate) fn on_page_middle_down(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.viewer.has_document() {
+            return;
+        }
+        self.panning = Some(event.position);
+        // 中键按下不再往下传，避免别的元素拿它当「粘贴/快捷滚」一类快捷键。
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// 中键拖动：按指针位移平移页面（半速），松手后停住。
+    fn pan_with(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
+        let Some(last) = self.panning else {
+            return false;
+        };
+        // 中键在窗口外松开时收不到 mouse_up，这里捎带把状态清掉。
+        if event.pressed_button != Some(MouseButton::Middle) {
+            self.panning = None;
+            cx.notify();
+            return false;
+        }
+        self.panning = Some(event.position);
+        self.pan_by(event.position - last, cx);
+        true
+    }
+
+    pub(crate) fn on_page_middle_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.panning.take().is_some() {
+            cx.notify();
+        }
     }
 
     pub(crate) fn on_page_mouse_move(
@@ -331,6 +372,10 @@ impl super::AppState {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.pan_with(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if !self.viewer.selection.dragging || event.pressed_button != Some(MouseButton::Left) {
             return;
         }
@@ -601,13 +646,11 @@ impl super::AppState {
                 "o" => self.open_pdf(window, cx),
                 "c" => self.copy_selection(cx),
                 "=" | "+" => {
-                    let zoom = self.viewer.zoom * 1.15;
-                    self.set_zoom(zoom, cx);
+                    self.step_zoom(crate::layout::ZOOM_STEP_PERCENT, cx);
                     return;
                 }
                 "-" => {
-                    let zoom = self.viewer.zoom / 1.15;
-                    self.set_zoom(zoom, cx);
+                    self.step_zoom(-crate::layout::ZOOM_STEP_PERCENT, cx);
                     return;
                 }
                 "0" => {

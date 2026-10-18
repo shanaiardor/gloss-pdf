@@ -1,7 +1,8 @@
-﻿//! 入口：初始化日志，打开主窗口，把错误收敛到日志里。
+//! 入口：初始化日志，打开主窗口，把错误收敛到日志里。
 
 mod app;
 mod assets;
+mod chrome_visibility;
 mod dict_history;
 mod dict_suggest;
 mod dictionary;
@@ -25,8 +26,7 @@ mod window_move;
 
 use anyhow::Context as _;
 use gpui::{
-    App, AppContext as _, Bounds, Focusable as _, KeyBinding, SharedString, TitlebarOptions,
-    WindowBounds, WindowOptions, px, size,
+    App, AppContext as _, Focusable as _, KeyBinding, SharedString, TitlebarOptions, WindowOptions,
 };
 use gpui_platform::application;
 
@@ -61,29 +61,38 @@ fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
     fonts::install(cx);
     bind_text_input_keys(cx);
 
-    let bounds = Bounds::centered(None, size(px(1040.), px(720.)), cx);
+    // 先读设置：窗口位置和尺寸必须在 `open_window` 之前定下来，
+    // 读到的这份设置再交给 `AppState`，避免两处各读一遍。
+    let settings = settings::SettingsStore::load();
+    let window_bounds = app::initial_window_bounds(settings.current.window, cx);
 
-    cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions {
-                title: Some(SharedString::from("极简 PDF")),
-                // 隐藏 Windows 原生标题栏，改用自绘的浮动控件。
-                appears_transparent: true,
+    let handle = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(window_bounds),
+                titlebar: Some(TitlebarOptions {
+                    title: Some(SharedString::from("极简 PDF")),
+                    // 隐藏 Windows 原生标题栏，改用自绘的浮动控件。
+                    appears_transparent: true,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        },
-        |window, cx| {
-            let view = cx.new(app::AppState::new);
-            if let Some(path) = std::env::args().nth(1) {
-                view.update(cx, |view, _cx| view.open_path(path.into()));
-            }
-            window.focus(&view.focus_handle(cx), cx);
-            view
-        },
-    )
-    .context("open main window")?;
+            },
+            |window, cx| {
+                let view = cx.new(|cx| app::AppState::with_settings(cx, settings));
+                if let Some(path) = std::env::args().nth(1) {
+                    view.update(cx, |view, _cx| view.open_path(path.into()));
+                }
+                window.focus(&view.focus_handle(cx), cx);
+                view
+            },
+        )
+        .context("open main window")?;
+
+    // 之后每次改窗口尺寸/位置都记一笔，下次启动按这里恢复。
+    handle
+        .update(cx, |view, window, cx| view.watch_window_bounds(window, cx))
+        .context("watch main window bounds")?;
 
     cx.activate(true);
     log::info!("main window opened");

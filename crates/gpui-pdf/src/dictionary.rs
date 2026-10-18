@@ -11,6 +11,8 @@ pub enum DictRequest {
     /// 输入框内容变化后请求前缀联想；主窗口负责防抖。
     Suggest(String),
     ClearHistory,
+    /// 用户刚把浮窗拖到新位置（全局逻辑像素）：主窗口据此重算跟随锚点。
+    FloatPlaced(crate::window_layout::RectF),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

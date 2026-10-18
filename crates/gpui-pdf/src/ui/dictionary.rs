@@ -48,6 +48,9 @@ pub(crate) struct DictionaryWindow {
 struct WindowDrag {
     /// 按下鼠标时，鼠标在窗口内的位置；拖动时让这个点一直跟着鼠标。
     cursor: Point<Pixels>,
+    /// 按下时窗口左上角的位置。目标位置一律从它加鼠标位移算出来：
+    /// 移动请求是异步执行、可能被丢弃的，不能拿当前（可能滞后的）位置累加。
+    origin: Point<Pixels>,
     /// 按下时主窗口的位置；拖拽期间主窗口不会移动。
     main: Option<RectF>,
     work: RectF,
@@ -101,7 +104,11 @@ impl DictionaryWindow {
         if term.is_empty() {
             return;
         }
-        if self.lookup.unbounded_send(DictRequest::Lookup(term)).is_err() {
+        if self
+            .lookup
+            .unbounded_send(DictRequest::Lookup(term))
+            .is_err()
+        {
             log::warn!("dictionary lookup channel closed");
         }
     }
@@ -109,7 +116,11 @@ impl DictionaryWindow {
     /// 输入变化：把最新内容发给主窗口做防抖联想。
     fn suggest(&mut self, cx: &mut Context<Self>) {
         let term = self.input.read(cx).value().to_string();
-        if self.lookup.unbounded_send(DictRequest::Suggest(term)).is_err() {
+        if self
+            .lookup
+            .unbounded_send(DictRequest::Suggest(term))
+            .is_err()
+        {
             log::warn!("dictionary lookup channel closed");
         }
     }
@@ -128,7 +139,11 @@ impl DictionaryWindow {
     }
 
     fn clear_history(&mut self) {
-        if self.lookup.unbounded_send(DictRequest::ClearHistory).is_err() {
+        if self
+            .lookup
+            .unbounded_send(DictRequest::ClearHistory)
+            .is_err()
+        {
             log::warn!("dictionary lookup channel closed");
         }
     }
@@ -167,6 +182,7 @@ impl DictionaryWindow {
 
         self.drag = Some(WindowDrag {
             cursor: event.position,
+            origin: window.bounds().origin,
             main,
             work,
         });
@@ -184,8 +200,8 @@ impl DictionaryWindow {
             return;
         };
 
-        // 窗口跟着鼠标走：保持按下时鼠标在窗口内的相对位置不变。
-        let raw_origin = window.bounds().origin + event.event.position - drag.cursor;
+        // 窗口跟着鼠标走：让按下时鼠标在窗口内的那个点一直跟着鼠标。
+        let raw_origin = drag.origin + event.event.position - drag.cursor;
         let size = window.bounds().size;
         let (x, y) = snap_origin(
             (f32::from(raw_origin.x), f32::from(raw_origin.y)),
@@ -195,6 +211,17 @@ impl DictionaryWindow {
         );
 
         window_move::move_window(window, point(px(x), px(y)));
+
+        // 告诉主窗口浮窗现在在哪：贴边状态（和间距）只有它那边算得准，
+        // 拖动结束后主窗口移动时浮窗才会继续跟随。
+        self.lookup
+            .unbounded_send(DictRequest::FloatPlaced(RectF::new(
+                x,
+                y,
+                f32::from(size.width),
+                f32::from(size.height),
+            )))
+            .ok();
     }
 }
 
@@ -424,9 +451,11 @@ impl DictionaryWindow {
                         let hover = theme.accent_hover;
                         move |style| style.bg(hover)
                     })
-                    .on_click(cx.listener(move |this, _event: &gpui::ClickEvent, _window, cx| {
-                        this.query_history(label.clone(), cx);
-                    }))
+                    .on_click(
+                        cx.listener(move |this, _event: &gpui::ClickEvent, _window, cx| {
+                            this.query_history(label.clone(), cx);
+                        }),
+                    )
                     .child(term),
             );
         }
@@ -470,9 +499,11 @@ impl DictionaryWindow {
                         let hover = theme.accent_hover;
                         move |style| style.bg(hover)
                     })
-                    .on_click(cx.listener(move |this, _event: &gpui::ClickEvent, _window, cx| {
-                        this.query_history(label.clone(), cx);
-                    }))
+                    .on_click(
+                        cx.listener(move |this, _event: &gpui::ClickEvent, _window, cx| {
+                            this.query_history(label.clone(), cx);
+                        }),
+                    )
                     .child(term),
             );
         }
@@ -490,9 +521,11 @@ impl DictionaryWindow {
                     let hover = theme.accent_hover;
                     move |style| style.bg(hover)
                 })
-                .on_click(cx.listener(|this, _event: &gpui::ClickEvent, _window, _cx| {
-                    this.clear_history();
-                }))
+                .on_click(
+                    cx.listener(|this, _event: &gpui::ClickEvent, _window, _cx| {
+                        this.clear_history();
+                    }),
+                )
                 .child("清空"),
         )
     }
