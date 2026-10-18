@@ -565,10 +565,7 @@ fn tile_distance(
         None => (0, 0),
     };
 
-    (
-        page_distance,
-        (dx * dx + dy * dy) as u64,
-    )
+    (page_distance, (dx * dx + dy * dy) as u64)
 }
 
 /// 页号离可视范围有多少页，用来挑最远的缓存淘汰。

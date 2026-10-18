@@ -43,13 +43,7 @@ impl TileGrid {
     }
 
     /// 与页面像素矩形相交的瓦片。矩形按左上角为原点，超出页面的部分会被夹住。
-    pub fn tiles_for_rect(
-        &self,
-        left: f32,
-        top: f32,
-        right: f32,
-        bottom: f32,
-    ) -> Vec<TileRect> {
+    pub fn tiles_for_rect(&self, left: f32, top: f32, right: f32, bottom: f32) -> Vec<TileRect> {
         let left = left.max(0.0);
         let top = top.max(0.0);
         let right = right.min(self.full_width as f32);

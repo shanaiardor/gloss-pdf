@@ -1092,7 +1092,10 @@ mod tests {
         let second = write_simple_dictionary(
             "prefix-b",
             "词典乙",
-            &[("pre0", "<div>乙重复</div>"), ("prefix-two", "<div>乙</div>")],
+            &[
+                ("pre0", "<div>乙重复</div>"),
+                ("prefix-two", "<div>乙</div>"),
+            ],
         );
 
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
@@ -1135,8 +1138,10 @@ mod tests {
                 assert_eq!(request, 2);
                 assert_eq!(term, "pre");
                 assert_eq!(suggestions.len(), 8, "跨词典合并后最多 8 条");
-                let unique: HashSet<String> =
-                    suggestions.iter().map(|value| value.to_lowercase()).collect();
+                let unique: HashSet<String> = suggestions
+                    .iter()
+                    .map(|value| value.to_lowercase())
+                    .collect();
                 assert_eq!(unique.len(), suggestions.len(), "建议按忽略大小写去重");
                 assert_eq!(suggestions[0], "pre0");
             }

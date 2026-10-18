@@ -405,8 +405,8 @@ fn render_tile(
         .render_form_data(true)
         // GPUI 的 RenderImage 缓冲区是 BGRA；不要让 Pdfium 把字节序反转成 RGBA。
         .set_reverse_byte_order(false);
-    let mut bitmap = PdfBitmap::empty(width, height, PdfBitmapFormat::BGRA)
-        .map_err(|error| anyhow!(error))?;
+    let mut bitmap =
+        PdfBitmap::empty(width, height, PdfBitmapFormat::BGRA).map_err(|error| anyhow!(error))?;
     page.render_into_bitmap_with_config(&mut bitmap, &config)
         .map_err(|error| anyhow!(error))?;
     log::debug!(

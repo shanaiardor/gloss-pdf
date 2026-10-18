@@ -58,8 +58,7 @@ impl DictHistory {
             return;
         }
         let key = term.to_lowercase();
-        self.entries
-            .retain(|entry| entry.to_lowercase() != key);
+        self.entries.retain(|entry| entry.to_lowercase() != key);
         self.entries.insert(0, term.to_string());
         self.entries.truncate(MAX_HISTORY);
         self.save();
@@ -194,9 +193,7 @@ mod tests {
             parse_history(r#"["a","A","","b"]"#),
             vec!["a".to_string(), "b".to_string()]
         );
-        let long = (0..60)
-            .map(|index| format!("w{index}"))
-            .collect::<Vec<_>>();
+        let long = (0..60).map(|index| format!("w{index}")).collect::<Vec<_>>();
         assert_eq!(
             parse_history(&serde_json::to_string(&long).unwrap()).len(),
             MAX_HISTORY
