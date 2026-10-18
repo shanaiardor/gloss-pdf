@@ -2,10 +2,7 @@
 
 use gpui::{Rgba, SharedString, rgb, rgba};
 
-/// 界面默认字体，运行时由 [`crate::fonts`] 注册字体文件。
-const UI_FONT: &str = "LXGW WenKai TC";
-/// 页码、缩放百分比等数字显示用等宽体。
-const MONO_FONT: &str = "LXGW WenKai Mono TC";
+use crate::fonts::{MONO_FAMILY, UI_FAMILY};
 
 /// 一套完整的配色 + 字体。
 #[derive(Clone)]
@@ -46,8 +43,8 @@ impl Theme {
             search_current: rgba(0xfb923c88),
             highlight: rgba(0xfacc1566),
 
-            font_family: UI_FONT.into(),
-            mono_font: MONO_FONT.into(),
+            font_family: UI_FAMILY.into(),
+            mono_font: MONO_FAMILY.into(),
         }
     }
 
@@ -68,8 +65,8 @@ impl Theme {
             search_current: rgba(0xea580c88),
             highlight: rgba(0xfacc1566),
 
-            font_family: UI_FONT.into(),
-            mono_font: MONO_FONT.into(),
+            font_family: UI_FAMILY.into(),
+            mono_font: MONO_FAMILY.into(),
         }
     }
 
