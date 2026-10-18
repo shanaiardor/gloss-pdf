@@ -11,7 +11,8 @@ use kuchiki::{ElementData, NodeData, NodeDataRef, NodeRef};
 use crate::css::{self, Computed, Display, PseudoElement, ROOT_SIZE, Stylesheet};
 use crate::fonts::FontLibrary;
 use crate::model::{
-    Align, Block, BlockKind, BlockStyle, ImageFormat, ImageSpan, Paragraph, Span, SpanStyle, Table,
+    Align, AlignItems, Block, BlockKind, BlockStyle, Container, FlexDirection, FlexItem, FlexStyle,
+    FlexWrap, ImageFormat, ImageSpan, Justify, LinkTarget, Paragraph, Span, SpanStyle, Table,
     TableCell, TableRow, TextSpan,
 };
 
@@ -102,6 +103,7 @@ pub fn render(input: &str, context: &mut RenderContext<'_>) -> Vec<Block> {
         lists: Vec::new(),
         images: 0,
         image_bytes: 0,
+        link: None,
     };
 
     let mut inherited = Computed::default();
@@ -187,6 +189,8 @@ struct Converter<'a> {
     lists: Vec<ListState>,
     images: usize,
     image_bytes: usize,
+    /// 当前所在的 `<a href>` 目标；子节点的行内片段都继承它。
+    link: Option<LinkTarget>,
 }
 
 #[derive(Clone)]
@@ -311,6 +315,14 @@ impl Converter<'_> {
             return;
         }
 
+        // `<a>` 的 href 要传给所有后代片段，让它们共享同一个可点击目标。
+        let saved_link = self.link.clone();
+        if tag == "a"
+            && let Some(target) = attr(&attrs, "href").and_then(parse_link)
+        {
+            self.link = Some(target);
+        }
+
         let display = computed.display.unwrap_or_else(|| {
             if is_block_tag(&tag) {
                 Display::Block
@@ -318,17 +330,22 @@ impl Converter<'_> {
                 Display::Inline
             }
         });
-        if matches!(display, Display::Block) {
-            self.visit_block(node, &tag, &attrs, &computed, before, after);
-        } else {
-            self.push_inline_gap(&computed, ctx, false);
-            self.push_pseudo(before.as_ref(), &attrs, ctx, false);
-            for child in node.children() {
-                self.visit(&child, &computed, ctx);
+        match display {
+            Display::Flex => self.visit_flex(node, &attrs, &computed),
+            Display::Block => self.visit_block(node, &tag, &attrs, &computed, before, after),
+            Display::None => {}
+            Display::Inline => {
+                self.push_inline_gap(&computed, ctx, false);
+                self.push_pseudo(before.as_ref(), &attrs, ctx, false);
+                for child in node.children() {
+                    self.visit(&child, &computed, ctx);
+                }
+                self.push_pseudo(after.as_ref(), &attrs, ctx, true);
+                self.push_inline_gap(&computed, ctx, true);
             }
-            self.push_pseudo(after.as_ref(), &attrs, ctx, true);
-            self.push_inline_gap(&computed, ctx, true);
         }
+
+        self.link = saved_link;
     }
 
     fn style_for(
@@ -483,6 +500,123 @@ impl Converter<'_> {
         }
     }
 
+    /// `display: flex` 容器：直接子元素各成一个 flex 子项，行内子元素并进匿名项。
+    fn visit_flex(&mut self, node: &NodeRef, _attrs: &[(String, String)], computed: &Computed) {
+        self.flush();
+        let flex = flex_style(computed);
+        let style = block_style(computed, None);
+
+        let saved_blocks = std::mem::take(&mut self.blocks);
+        let saved_spans = std::mem::take(&mut self.spans);
+        let saved_ctx = self.ctx.take();
+        let saved_lists = std::mem::take(&mut self.lists);
+        let saved_pending = self.pending_space;
+        self.pending_space = false;
+
+        let ctx = ParaCtx {
+            kind: BlockKind::Paragraph,
+            style: style.clone(),
+        };
+        let mut items: Vec<FlexItem> = Vec::new();
+        let mut anonymous: Vec<Block> = Vec::new();
+        let anonymous_style = BlockStyle {
+            margin_top: Some(0.0),
+            margin_bottom: Some(0.0),
+            ..Default::default()
+        };
+
+        for child in node.children() {
+            let Some(data) = child.as_element() else {
+                // 纯文本直接进匿名项，和相邻的行内元素连成一段。
+                self.visit(&child, computed, &ctx);
+                continue;
+            };
+            let tag = data.name.local.as_ref().to_ascii_lowercase();
+            if SKIP_TAGS.contains(&tag.as_str()) {
+                continue;
+            }
+            let Some(element) = child.clone().into_element_ref() else {
+                continue;
+            };
+            let child_attrs = attributes(data);
+            // `<img>` 不是块级元素，直接当行内内容并进匿名项，别让 capture 丢掉它。
+            if tag == "img" {
+                self.visit(&child, computed, &ctx);
+                continue;
+            }
+            let child_computed = self.style_for(&tag, &element, &child_attrs, computed);
+            if matches!(child_computed.display, Some(Display::None)) {
+                continue;
+            }
+            let child_display = child_computed.display.unwrap_or_else(|| {
+                if is_block_tag(&tag) {
+                    Display::Block
+                } else {
+                    Display::Inline
+                }
+            });
+
+            if matches!(child_display, Display::Inline) {
+                self.push_inline_gap(&child_computed, &ctx, false);
+                let before = self.pseudo_style(&element, &child_computed, PseudoElement::Before);
+                let after = self.pseudo_style(&element, &child_computed, PseudoElement::After);
+                let saved_link = self.link.clone();
+                if tag == "a"
+                    && let Some(target) = attr(&child_attrs, "href").and_then(parse_link)
+                {
+                    self.link = Some(target);
+                }
+                self.push_pseudo(before.as_ref(), &child_attrs, &ctx, false);
+                for grand in child.children() {
+                    self.visit(&grand, &child_computed, &ctx);
+                }
+                self.push_pseudo(after.as_ref(), &child_attrs, &ctx, true);
+                self.link = saved_link;
+                self.push_inline_gap(&child_computed, &ctx, true);
+                continue;
+            }
+
+            self.flush();
+            anonymous.extend(std::mem::take(&mut self.blocks));
+            if !anonymous.is_empty() {
+                items.push(FlexItem {
+                    style: anonymous_style.clone(),
+                    blocks: std::mem::take(&mut anonymous),
+                });
+            }
+
+            let before = self.pseudo_style(&element, &child_computed, PseudoElement::Before);
+            let after = self.pseudo_style(&element, &child_computed, PseudoElement::After);
+            let blocks = self.capture_cell(&child, &child_attrs, &child_computed, before, after);
+            if !blocks.is_empty() {
+                items.push(FlexItem {
+                    style: block_style(&child_computed, None),
+                    blocks,
+                });
+            }
+        }
+
+        self.flush();
+        anonymous.extend(std::mem::take(&mut self.blocks));
+        if !anonymous.is_empty() {
+            items.push(FlexItem {
+                style: anonymous_style,
+                blocks: anonymous,
+            });
+        }
+
+        self.blocks = saved_blocks;
+        self.spans = saved_spans;
+        self.ctx = saved_ctx;
+        self.lists = saved_lists;
+        self.pending_space = saved_pending;
+
+        if !items.is_empty() {
+            self.blocks
+                .push(Block::Container(Container { style, flex, items }));
+        }
+    }
+
     fn visit_table(&mut self, node: &NodeRef, computed: &Computed) {
         let style = block_style(computed, None);
         let mut rows = Vec::new();
@@ -601,12 +735,19 @@ impl Converter<'_> {
         }
     }
 
+    /// 行内样式：CSS 计算值加上当前所在的链接目标。
+    fn span_style(&self, computed: &Computed) -> SpanStyle {
+        let mut style = base_span_style(computed);
+        style.link = self.link.clone();
+        style
+    }
+
     fn push_text(&mut self, text: &str, computed: &Computed, ctx: &ParaCtx) {
         if text.is_empty() {
             return;
         }
         self.ensure_ctx(ctx);
-        let base = span_style(computed);
+        let base = self.span_style(computed);
         let families = computed.font_family.as_deref();
         let mut current = base.clone();
         let mut current_family: Option<String> = None;
@@ -677,7 +818,7 @@ impl Converter<'_> {
             return;
         }
         self.ensure_ctx(ctx);
-        let base = span_style(computed);
+        let base = self.span_style(computed);
         let families = computed.font_family.as_deref();
         let mut current = base.clone();
         let mut current_family: Option<String> = None;
@@ -742,7 +883,7 @@ impl Converter<'_> {
         let font_size = computed.size.unwrap_or(ROOT_SIZE);
         if gap > font_size * 0.2 {
             self.ensure_ctx(ctx);
-            let style = span_style(computed);
+            let style = self.span_style(computed);
             self.push_space(&style);
         }
     }
@@ -750,7 +891,7 @@ impl Converter<'_> {
     fn push_image(&mut self, attrs: &[(String, String)], computed: &Computed, ctx: &ParaCtx) {
         self.ensure_ctx(ctx);
         if self.pending_space {
-            let style = span_style(computed);
+            let style = self.span_style(computed);
             self.push_space(&style);
             self.pending_space = false;
         }
@@ -800,7 +941,7 @@ impl Converter<'_> {
     }
 
     fn push_alt(&mut self, alt: &str, computed: &Computed) {
-        let mut style = span_style(computed);
+        let mut style = self.span_style(computed);
         style.italic = true;
         let text = if alt.is_empty() { "[图片]" } else { alt };
         for ch in text.chars() {
@@ -874,7 +1015,7 @@ fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-fn span_style(computed: &Computed) -> SpanStyle {
+fn base_span_style(computed: &Computed) -> SpanStyle {
     let border_bottom = computed.border_bottom.filter(|border| border.width > 0.0);
     SpanStyle {
         bold: computed.bold,
@@ -887,6 +1028,8 @@ fn span_style(computed: &Computed) -> SpanStyle {
         color: computed.color,
         background: computed.background,
         family: None,
+        link: None,
+        decorated: computed.decoration_explicit,
     }
 }
 
@@ -908,7 +1051,46 @@ fn block_style(computed: &Computed, marker: Option<String>) -> BlockStyle {
         border_left: computed.border_left,
         width: computed.width,
         marker,
+        grow: computed.flex_grow,
+        shrink: computed.flex_shrink,
+        basis: computed.flex_basis,
+        align_self: computed.align_self,
     }
+}
+
+fn flex_style(computed: &Computed) -> FlexStyle {
+    FlexStyle {
+        direction: computed.flex_direction.unwrap_or(FlexDirection::Row),
+        wrap: computed.flex_wrap.unwrap_or(FlexWrap::NoWrap),
+        justify: computed.justify.unwrap_or(Justify::Start),
+        align_items: computed.align_items.unwrap_or(AlignItems::Stretch),
+        gap: computed.gap.unwrap_or(0.0),
+    }
+}
+
+/// 把 `<a href>` 归一化成链接目标；认不出的协议直接忽略。
+fn parse_link(href: &str) -> Option<LinkTarget> {
+    let href = href.trim();
+    if href.is_empty() || href.starts_with('#') {
+        return None;
+    }
+    let lower = href.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:")
+    {
+        return Some(LinkTarget::Uri(href.to_string()));
+    }
+    let rest = lower
+        .starts_with("entry://")
+        .then(|| &href["entry://".len()..])
+        .or_else(|| {
+            lower
+                .starts_with("bword://")
+                .then(|| &href["bword://".len()..])
+        })?;
+    let rest = rest.split('#').next().unwrap_or_default();
+    let term = percent_decode(rest);
+    let term = term.trim();
+    (!term.is_empty()).then(|| LinkTarget::Entry(term.to_string()))
 }
 
 fn apply_presentational(computed: &mut Computed, tag: &str, attrs: &[(String, String)]) {
@@ -1105,7 +1287,7 @@ mod tests {
     fn paragraph(block: &Block) -> &Paragraph {
         match block {
             Block::Paragraph(paragraph) => paragraph,
-            Block::Table(_) => panic!("expected paragraph"),
+            Block::Table(_) | Block::Container(_) => panic!("expected paragraph"),
         }
     }
 
@@ -1341,5 +1523,127 @@ mod tests {
         );
         let size = paragraph(&blocks[0]).style.size.unwrap_or_default();
         assert!((size - 25.6).abs() < 0.1, "{size}");
+    }
+
+    fn link_of<'a>(blocks: &'a [Block], text: &str) -> &'a Option<LinkTarget> {
+        paragraph(&blocks[0])
+            .spans
+            .iter()
+            .find_map(|span| match span {
+                Span::Text(span) if span.text.contains(text) => Some(&span.style.link),
+                _ => None,
+            })
+            .expect("span with text")
+    }
+
+    #[test]
+    fn anchor_href_becomes_link_target() {
+        let blocks = to_blocks(
+            r#"<p>见<a href="entry://禮">禮</a>与<a href="https://example.com/x">外链</a>。</p>"#,
+        );
+        assert_eq!(
+            link_of(&blocks, "禮"),
+            &Some(LinkTarget::Entry("禮".to_string()))
+        );
+        assert_eq!(
+            link_of(&blocks, "外链"),
+            &Some(LinkTarget::Uri("https://example.com/x".to_string()))
+        );
+        assert!(link_of(&blocks, "见").is_none());
+    }
+
+    #[test]
+    fn anchor_href_is_decoded_and_stripped() {
+        let blocks = to_blocks(
+            r##"<p><a href="entry://%E7%A6%AE#top">a</a><a href="#local">b</a>
+               <a href="bword://WLK">c</a></p>"##,
+        );
+        assert_eq!(
+            link_of(&blocks, "a"),
+            &Some(LinkTarget::Entry("禮".to_string()))
+        );
+        assert!(link_of(&blocks, "b").is_none());
+        assert_eq!(
+            link_of(&blocks, "c"),
+            &Some(LinkTarget::Entry("WLK".to_string()))
+        );
+    }
+
+    #[test]
+    fn link_decoration_follows_css() {
+        let plain = to_blocks(r#"<p><a href="entry://x">x</a></p>"#);
+        let Span::Text(plain_span) = &paragraph(&plain[0]).spans[0] else {
+            panic!("expected text span");
+        };
+        assert!(!plain_span.style.decorated, "no css declaration");
+        assert!(!plain_span.style.underline);
+
+        let muted = to_blocks(
+            r#"<style>a { color: #114488; text-decoration: none; }</style>
+               <p><a href="entry://x">x</a></p>"#,
+        );
+        let span = &paragraph(&muted[0]).spans[0];
+        let Span::Text(span) = span else {
+            panic!("expected text span");
+        };
+        assert!(span.style.decorated);
+        assert!(!span.style.underline);
+        assert_eq!(
+            span.style.color,
+            Some(crate::model::Color::rgb(17, 68, 136))
+        );
+    }
+
+    #[test]
+    fn flex_container_builds_items_and_layout() {
+        let blocks = to_blocks(
+            r#"<div style="display:flex; flex-direction:column; gap:6px;
+                           justify-content:space-between; align-items:center">
+                 <div class="left">A</div>
+                 <div class="right" style="flex:1">B</div>
+               </div>"#,
+        );
+        let Block::Container(container) = &blocks[0] else {
+            panic!("expected container");
+        };
+        assert_eq!(container.flex.direction, FlexDirection::Column);
+        assert_eq!(container.flex.gap, 6.0);
+        assert_eq!(container.flex.justify, Justify::SpaceBetween);
+        assert_eq!(container.flex.align_items, AlignItems::Center);
+        assert_eq!(container.items.len(), 2);
+        assert_eq!(container.items[0].blocks[0].text(), "A");
+        assert_eq!(container.items[1].blocks[0].text(), "B");
+        assert_eq!(container.items[1].style.grow, Some(1.0));
+        assert_eq!(blocks[0].text(), "A\nB");
+    }
+
+    #[test]
+    fn flex_row_keeps_inline_siblings_in_one_item() {
+        let blocks = to_blocks(
+            r#"<div style="display:flex">
+                 <span>a</span><span>b</span>
+                 <div>c</div>
+               </div>"#,
+        );
+        let Block::Container(container) = &blocks[0] else {
+            panic!("expected container");
+        };
+        assert_eq!(container.items.len(), 2);
+        assert_eq!(container.items[0].blocks[0].text(), "ab");
+        assert_eq!(container.items[1].blocks[0].text(), "c");
+    }
+
+    #[test]
+    fn flex_basis_and_auto_grow() {
+        let blocks = to_blocks(
+            r#"<div style="display:flex"><div style="flex:0 0 120px">x</div><div>y</div></div>"#,
+        );
+        let Block::Container(container) = &blocks[0] else {
+            panic!("expected container");
+        };
+        assert_eq!(container.items[0].style.grow, Some(0.0));
+        assert_eq!(container.items[0].style.shrink, Some(0.0));
+        assert_eq!(container.items[0].style.basis, Some(120.0));
+        assert_eq!(container.items[1].style.grow, None);
     }
 }

@@ -7,13 +7,15 @@
 use std::sync::Arc;
 
 use dict_core::{
-    Align, Block, BlockKind, BlockStyle, Color as DictColor, DictEntry,
-    ImageFormat as DictImageFormat, ImageSpan, Paragraph, Span, SpanStyle, Table, TableCell,
+    Align, AlignItems, AlignSelf, Block, BlockKind, BlockStyle, Color as DictColor, Container,
+    DictEntry, FlexDirection, FlexWrap, ImageFormat as DictImageFormat, ImageSpan, Justify,
+    LinkTarget, Paragraph, Span, SpanStyle, Table, TableCell,
 };
 use gpui::{
-    AnyElement, Context, Div, Entity, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight,
-    Hsla, Image, ImageFormat, ObjectFit, Render, Rgba, StrikethroughStyle, StyledText, TextAlign,
-    TextRun, UnderlineStyle, Window, div, img, point, prelude::*, px, relative,
+    AnyElement, Context, Div, ElementId, Entity, Font, FontFallbacks, FontFeatures, FontStyle,
+    FontWeight, Hsla, Image, ImageFormat, InteractiveText, ObjectFit, Render, Rgba,
+    StrikethroughStyle, StyledText, TextAlign, TextRun, UnderlineStyle, Window, div, img, point,
+    prelude::*, px, relative,
 };
 
 #[cfg(target_os = "windows")]
@@ -27,13 +29,16 @@ use crate::window_layout::{RectF, snap_origin};
 #[cfg(target_os = "windows")]
 use crate::window_move;
 
+/// 把查询词送回主窗口的通道；释义里的链接复用它。
+type LookupSender = futures::channel::mpsc::UnboundedSender<String>;
+
 pub(crate) struct DictionaryWindow {
     view: DictionaryView,
     theme: Theme,
     /// 查词输入框：双击查词和手动输入共用同一个框。
     input: Entity<TextInput>,
     /// 把查询词送回主窗口（查词逻辑和状态都在 `AppState`）。
-    lookup: futures::channel::mpsc::UnboundedSender<String>,
+    lookup: LookupSender,
     /// 拖动标题栏时的起点快照（仅 Windows 手动移动窗口时需要）。
     #[cfg(target_os = "windows")]
     drag: Option<WindowDrag>,
@@ -56,7 +61,7 @@ impl DictionaryWindow {
     pub fn new(
         view: DictionaryView,
         theme: Theme,
-        lookup: futures::channel::mpsc::UnboundedSender<String>,
+        lookup: LookupSender,
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| {
@@ -67,14 +72,17 @@ impl DictionaryWindow {
             input
         });
 
-        cx.subscribe(&input, |this, _input, event: &TextInputEvent, cx| match event {
-            TextInputEvent::Submitted { .. } => this.submit_query(cx),
-            TextInputEvent::Cancelled => {
-                // Esc 清空输入框；释义保持不动，方便继续看。
-                this.input.update(cx, |input, cx| input.clear(cx));
-            }
-            TextInputEvent::Changed => {}
-        })
+        cx.subscribe(
+            &input,
+            |this, _input, event: &TextInputEvent, cx| match event {
+                TextInputEvent::Submitted { .. } => this.submit_query(cx),
+                TextInputEvent::Cancelled => {
+                    // Esc 清空输入框；释义保持不动，方便继续看。
+                    this.input.update(cx, |input, cx| input.clear(cx));
+                }
+                TextInputEvent::Changed => {}
+            },
+        )
         .detach();
 
         Self {
@@ -243,7 +251,7 @@ impl Render for DictionaryWindow {
                     body = body.child(muted("双击 PDF 中的单词或汉字开始查词", &theme));
                 } else {
                     for entry in &view.entries {
-                        body = body.child(entry_element(entry, &theme));
+                        body = body.child(entry_element(entry, &theme, &self.lookup));
                     }
                 }
 
@@ -387,17 +395,15 @@ impl DictionaryWindow {
                     .text_size(px(12.))
                     .cursor_pointer()
                     .hover(move |style| style.bg(hover))
-                    .on_click(
-                        cx.listener(|this, _event: &gpui::ClickEvent, _window, cx| {
-                            this.submit_query(cx);
-                        }),
-                    )
+                    .on_click(cx.listener(|this, _event: &gpui::ClickEvent, _window, cx| {
+                        this.submit_query(cx);
+                    }))
                     .child("查"),
             )
     }
 }
 
-fn entry_element(entry: &DictEntry, theme: &Theme) -> Div {
+fn entry_element(entry: &DictEntry, theme: &Theme, lookup: &LookupSender) -> Div {
     let mut column = div().flex().flex_col().mb(px(12.)).min_w(px(0.)).w_full();
 
     // 很多词典把词头写进正文（`<h1>` / `.hwd`），这里避免再叠一行。
@@ -434,21 +440,24 @@ fn entry_element(entry: &DictEntry, theme: &Theme) -> Div {
         column = column.child(px_gap(4.)).child(muted("（无释义）", theme));
     } else {
         for block in &entry.blocks {
-            column = column.child(block_element(block, theme));
+            column = column.child(block_element(block, theme, lookup));
         }
     }
 
     column
 }
 
-fn block_element(block: &Block, theme: &Theme) -> AnyElement {
+fn block_element(block: &Block, theme: &Theme, lookup: &LookupSender) -> AnyElement {
     match block {
-        Block::Paragraph(paragraph) => paragraph_element(paragraph, theme),
-        Block::Table(table) => table_element(table, theme).into_any_element(),
+        Block::Paragraph(paragraph) => paragraph_element(paragraph, theme, lookup),
+        Block::Table(table) => table_element(table, theme, lookup).into_any_element(),
+        Block::Container(container) => {
+            container_element(container, theme, lookup).into_any_element()
+        }
     }
 }
 
-fn paragraph_element(paragraph: &Paragraph, theme: &Theme) -> AnyElement {
+fn paragraph_element(paragraph: &Paragraph, theme: &Theme, lookup: &LookupSender) -> AnyElement {
     let style = &paragraph.style;
     if paragraph.kind == BlockKind::Rule {
         return div()
@@ -532,6 +541,7 @@ fn paragraph_element(paragraph: &Paragraph, theme: &Theme) -> AnyElement {
     } else {
         let mut text = String::new();
         let mut runs = Vec::new();
+        let mut links: Vec<(std::ops::Range<usize>, &LinkTarget)> = Vec::new();
         for span in &paragraph.spans {
             let Span::Text(span) = span else {
                 continue;
@@ -539,6 +549,7 @@ fn paragraph_element(paragraph: &Paragraph, theme: &Theme) -> AnyElement {
             if span.text.is_empty() {
                 continue;
             }
+            let start = text.len();
             text.push_str(&span.text);
             runs.push(text_run(
                 span.text.len(),
@@ -547,21 +558,68 @@ fn paragraph_element(paragraph: &Paragraph, theme: &Theme) -> AnyElement {
                 color,
                 theme,
             ));
+            if let Some(link) = &span.style.link {
+                links.push((start..text.len(), link));
+            }
         }
         if !text.is_empty() {
-            element = element.child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .child(StyledText::new(text).with_runs(runs)),
-            );
+            let styled = StyledText::new(text.clone()).with_runs(runs);
+            let content: AnyElement = if links.is_empty() {
+                styled.into_any_element()
+            } else {
+                link_text(&text, styled, links, lookup)
+            };
+            element = element.child(div().flex_1().min_w(px(0.)).child(content));
         }
     }
 
     element.into_any_element()
 }
 
-fn table_element(table: &Table, theme: &Theme) -> Div {
+/// 把带链接的文本包成 `InteractiveText`：悬停变手型，点击查词或开浏览器。
+fn link_text(
+    text: &str,
+    styled: StyledText,
+    links: Vec<(std::ops::Range<usize>, &LinkTarget)>,
+    lookup: &LookupSender,
+) -> AnyElement {
+    let mut ranges = Vec::with_capacity(links.len());
+    let mut targets = Vec::with_capacity(links.len());
+    for (range, target) in links {
+        ranges.push(range);
+        targets.push(target.clone());
+    }
+    let lookup = lookup.clone();
+    InteractiveText::new(
+        ElementId::NamedInteger("dict-link".into(), hash_text(text)),
+        styled,
+    )
+    .on_click(ranges, move |index, _window, cx| {
+        let Some(target) = targets.get(index) else {
+            return;
+        };
+        match target {
+            LinkTarget::Entry(term) => {
+                if lookup.unbounded_send(term.clone()).is_err() {
+                    log::warn!("dictionary lookup channel closed");
+                }
+            }
+            LinkTarget::Uri(uri) => cx.open_url(uri),
+        }
+    })
+    .into_any_element()
+}
+
+/// 元素 id 只需要在同一个窗口内唯一；用正文内容做哈希足够区分不同段落。
+fn hash_text(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn table_element(table: &Table, theme: &Theme, lookup: &LookupSender) -> Div {
     let mut root = div().flex().flex_col().w_full().min_w(px(0.));
     root = root
         .mt(px(table.style.margin_top.unwrap_or(6.0)))
@@ -579,7 +637,7 @@ fn table_element(table: &Table, theme: &Theme) -> Div {
             .mb(px(row.style.margin_bottom.unwrap_or(0.0)));
         row_element = styled_box(row_element, &row.style, theme);
         for cell in &row.cells {
-            row_element = row_element.child(cell_element(cell, theme));
+            row_element = row_element.child(cell_element(cell, theme, lookup));
         }
         root = root.child(row_element);
     }
@@ -587,7 +645,7 @@ fn table_element(table: &Table, theme: &Theme) -> Div {
     root
 }
 
-fn cell_element(cell: &TableCell, theme: &Theme) -> Div {
+fn cell_element(cell: &TableCell, theme: &Theme, lookup: &LookupSender) -> Div {
     let mut style = cell.style.clone();
     style.padding.top += 3.0;
     style.padding.bottom += 3.0;
@@ -618,9 +676,98 @@ fn cell_element(cell: &TableCell, theme: &Theme) -> Div {
     }
 
     for block in &cell.blocks {
-        element = element.child(block_element(block, theme));
+        element = element.child(block_element(block, theme, lookup));
     }
     element
+}
+
+/// `display: flex` 容器：直接映射到 GPUI 的 flex 布局。
+fn container_element(container: &Container, theme: &Theme, lookup: &LookupSender) -> Div {
+    let flex = container.flex;
+    let is_row = flex.direction.is_row();
+
+    let mut root = div().flex().w_full().min_w(px(0.));
+    root = match flex.direction {
+        FlexDirection::Row => root.flex_row(),
+        FlexDirection::RowReverse => root.flex_row_reverse(),
+        FlexDirection::Column => root.flex_col(),
+        FlexDirection::ColumnReverse => root.flex_col_reverse(),
+    };
+    root = match flex.wrap {
+        FlexWrap::NoWrap => root,
+        FlexWrap::Wrap => root.flex_wrap(),
+        FlexWrap::WrapReverse => root.flex_wrap_reverse(),
+    };
+    root = match flex.justify {
+        Justify::Start => root.justify_start(),
+        Justify::End => root.justify_end(),
+        Justify::Center => root.justify_center(),
+        Justify::SpaceBetween => root.justify_between(),
+        Justify::SpaceAround => root.justify_around(),
+        Justify::SpaceEvenly => root.justify_evenly(),
+    };
+    root = match flex.align_items {
+        AlignItems::Start => root.items_start(),
+        AlignItems::End => root.items_end(),
+        AlignItems::Center => root.items_center(),
+        AlignItems::Baseline => root.items_baseline(),
+        AlignItems::Stretch => root.items_stretch(),
+    };
+    if flex.gap > 0.0 {
+        root = root.gap(px(flex.gap));
+    }
+    root = root
+        .mt(px(container.style.margin_top.unwrap_or(6.0)))
+        .mb(px(container.style.margin_bottom.unwrap_or(0.0)));
+    root = styled_box(root, &container.style, theme);
+
+    // 双栏对照几乎都不写宽度：横向且没人声明尺寸时，让子项均分宽度，
+    // 否则文本会按内容宽度排，右栏可能被挤到看不见。
+    let sized = container.items.iter().any(|item| {
+        item.style.grow.is_some() || item.style.width.is_some() || item.style.basis.is_some()
+    });
+
+    for item in &container.items {
+        let mut element = div().flex().flex_col().min_w(px(0.));
+        if let Some(grow) = item.style.grow {
+            element = element.flex_grow(grow);
+        } else if is_row && !sized {
+            element = element.flex_1();
+        }
+        if let Some(shrink) = item.style.shrink {
+            element = element.flex_shrink(shrink);
+        }
+        if let Some(basis) = item.style.basis {
+            element = element.flex_basis(px(basis));
+        }
+        if let Some(width) = item.style.width {
+            element = element.flex_none().w(px(width));
+        }
+        element = match item.style.align_self {
+            None | Some(AlignSelf::Auto) => element,
+            Some(AlignSelf::Start) => element.self_start(),
+            Some(AlignSelf::End) => element.self_end(),
+            Some(AlignSelf::Center) => element.self_center(),
+            Some(AlignSelf::Baseline) => element.self_baseline(),
+            Some(AlignSelf::Stretch) => element.self_stretch(),
+        };
+        element = element
+            .mt(px(item.style.margin_top.unwrap_or(0.0)))
+            .mb(px(item.style.margin_bottom.unwrap_or(0.0)));
+        element = styled_box(element, &item.style, theme);
+        element = element
+            .text_size(px(item.style.size.unwrap_or(13.0)))
+            .text_color(item.style.color.map(hsla).unwrap_or(theme.text.into()))
+            .font(make_font(item.style.family.as_deref(), theme))
+            .line_height(relative(item.style.line_height.unwrap_or(1.55)));
+
+        for block in &item.blocks {
+            element = element.child(block_element(block, theme, lookup));
+        }
+        root = root.child(element);
+    }
+
+    root
 }
 
 fn chunk_element(
@@ -632,7 +779,7 @@ fn chunk_element(
     theme: &Theme,
 ) -> Div {
     let size = style.size.unwrap_or(block_size);
-    let color = style.color.map(hsla).unwrap_or(block_color);
+    let color = span_color(style, block_color, theme);
     let font = span_font(style, block_font, theme);
 
     let mut element = div()
@@ -640,7 +787,7 @@ fn chunk_element(
         .text_size(px(size))
         .text_color(color)
         .font(font);
-    if style.underline {
+    if span_underlined(style) {
         element = element.underline();
         if let Some(underline) = style.underline_color {
             element = element.text_decoration_color(hsla(underline));
@@ -662,8 +809,8 @@ fn text_run(
     block_color: Hsla,
     theme: &Theme,
 ) -> TextRun {
-    let color = style.color.map(hsla).unwrap_or(block_color);
-    let underline = style.underline.then(|| UnderlineStyle {
+    let color = span_color(style, block_color, theme);
+    let underline = span_underlined(style).then(|| UnderlineStyle {
         thickness: px(1.0),
         color: Some(style.underline_color.map(hsla).unwrap_or(color)),
         wavy: false,
@@ -847,6 +994,23 @@ fn span_font(style: &SpanStyle, block_font: &Font, theme: &Theme) -> Font {
         FontStyle::Normal
     };
     font
+}
+
+/// 行内颜色：CSS 指定优先；链接在 CSS 完全没提装饰时用主题强调色。
+fn span_color(style: &SpanStyle, block_color: Hsla, theme: &Theme) -> Hsla {
+    if let Some(color) = style.color {
+        return hsla(color);
+    }
+    if style.link.is_some() && !style.decorated {
+        return theme.accent.into();
+    }
+    block_color
+}
+
+/// 链接默认带下划线，但 CSS 声明过 `text-decoration` 时以 CSS 为准
+/// （许多词典用 `text-decoration: none` 让页码链接融入正文）。
+fn span_underlined(style: &SpanStyle) -> bool {
+    style.underline || (style.link.is_some() && !style.decorated)
 }
 
 fn text_align(align: Align) -> TextAlign {

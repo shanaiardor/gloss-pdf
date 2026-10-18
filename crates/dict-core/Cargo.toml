@@ -10,7 +10,8 @@ anyhow.workspace = true
 log.workspace = true
 futures.workspace = true
 image.workspace = true
-flate2 = "1"
 kuchiki = "0.8.1"
 lightningcss = { version = "1.0.0-alpha.72", default-features = false }
 mdictlib = { version = "0.2.8", features = ["lzo"] }
+# WOFF1 / WOFF2 解包；默认特性带 brotli 与 zlib，正好覆盖两种封装。
+wuff = "0.2"

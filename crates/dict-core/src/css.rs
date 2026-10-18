@@ -11,7 +11,9 @@ use lightningcss::rules::CssRule;
 use lightningcss::stylesheet::{ParserOptions, PrinterOptions, StyleSheet};
 use lightningcss::traits::ToCss;
 
-use crate::model::{Align, Border, Color, Edges};
+use crate::model::{
+    Align, AlignItems, AlignSelf, Border, Color, Edges, FlexDirection, FlexWrap, Justify,
+};
 
 /// CSS 的初始字号；用于 `rem` 以及没有 css 字号时的 `em`。
 pub(crate) const ROOT_SIZE: f32 = 16.0;
@@ -257,12 +259,23 @@ pub(crate) enum Property {
     PreserveSpace(bool),
     Content(Content),
     BackgroundImage,
+    FlexDirection(FlexDirection),
+    FlexWrap(FlexWrap),
+    Justify(Justify),
+    AlignItems(AlignItems),
+    AlignSelf(AlignSelf),
+    /// `gap` / `row-gap` / `column-gap`：只保留一个值，见 [`Computed::gap`]。
+    Gap(Length),
+    FlexGrow(f32),
+    FlexShrink(f32),
+    FlexBasis(Length),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Display {
     Inline,
     Block,
+    Flex,
     None,
 }
 
@@ -371,6 +384,21 @@ pub(crate) struct Computed {
     pub content: Option<Content>,
     /// 元素声明了背景图；行内文本用下划线近似（典型是词典的书名波浪线）。
     pub background_image: bool,
+    // ---- flex 排版 ----
+    pub flex_direction: Option<FlexDirection>,
+    pub flex_wrap: Option<FlexWrap>,
+    pub justify: Option<Justify>,
+    pub align_items: Option<AlignItems>,
+    pub align_self: Option<AlignSelf>,
+    /// 主轴/交叉轴间距。词典里的双栏对照几乎都写 `gap: Npx`，
+    /// 分轴写法（`row-gap` / `column-gap`）只保留最后一次声明，够用且省一个字段。
+    pub gap: Option<f32>,
+    pub flex_grow: Option<f32>,
+    pub flex_shrink: Option<f32>,
+    pub flex_basis: Option<f32>,
+    /// CSS 是否显式声明过 `text-decoration`（包括 `none`）。
+    /// 界面据此决定要不要给链接补默认下划线。
+    pub decoration_explicit: bool,
 }
 
 impl Computed {
@@ -475,7 +503,10 @@ impl Computed {
                 self.height = (!matches!(length, Length::Percent(_)))
                     .then(|| length.resolve(font_size, root_size).max(0.0));
             }
-            Property::Underline(value) => self.underline = *value,
+            Property::Underline(value) => {
+                self.underline = *value;
+                self.decoration_explicit = true;
+            }
             Property::Strike(value) => self.strike = *value,
             Property::Indent(length) => {
                 self.indent = Some(length.resolve(font_size, root_size));
@@ -483,6 +514,21 @@ impl Computed {
             Property::PreserveSpace(value) => self.preserve_space = *value,
             Property::Content(content) => self.content = Some(content.clone()),
             Property::BackgroundImage => self.background_image = true,
+            Property::FlexDirection(direction) => self.flex_direction = Some(*direction),
+            Property::FlexWrap(wrap) => self.flex_wrap = Some(*wrap),
+            Property::Justify(justify) => self.justify = Some(*justify),
+            Property::AlignItems(align) => self.align_items = Some(*align),
+            Property::AlignSelf(align) => self.align_self = Some(*align),
+            Property::Gap(length) => {
+                self.gap = Some(length.resolve(font_size, root_size).max(0.0));
+            }
+            Property::FlexGrow(grow) => self.flex_grow = Some(grow.max(0.0)),
+            Property::FlexShrink(shrink) => self.flex_shrink = Some(shrink.max(0.0)),
+            Property::FlexBasis(length) => {
+                // 百分比基准要等布局宽度，这里退化成 `auto`。
+                self.flex_basis = (!matches!(length, Length::Percent(_)))
+                    .then(|| length.resolve(font_size, root_size).max(0.0));
+            }
         }
     }
 }
@@ -652,8 +698,164 @@ fn parse_property(name: &str, value: &str) -> Vec<Property> {
             .map(Property::Content)
             .into_iter()
             .collect(),
+        "flex-direction" => parse_flex_direction(value)
+            .map(Property::FlexDirection)
+            .into_iter()
+            .collect(),
+        "flex-wrap" => parse_flex_wrap(value)
+            .map(Property::FlexWrap)
+            .into_iter()
+            .collect(),
+        "justify-content" => parse_justify(value)
+            .map(Property::Justify)
+            .into_iter()
+            .collect(),
+        "align-items" => parse_align_items(value)
+            .map(Property::AlignItems)
+            .into_iter()
+            .collect(),
+        "align-self" => parse_align_self(value)
+            .map(Property::AlignSelf)
+            .into_iter()
+            .collect(),
+        // 分轴写法只取第一个长度；两值 `gap: 4px 8px` 也取第一个。
+        "gap" | "row-gap" | "column-gap" | "grid-gap" => value
+            .split_whitespace()
+            .next()
+            .and_then(parse_length)
+            .map(Property::Gap)
+            .into_iter()
+            .collect(),
+        "flex-grow" => value
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(Property::FlexGrow)
+            .into_iter()
+            .collect(),
+        "flex-shrink" => value
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(Property::FlexShrink)
+            .into_iter()
+            .collect(),
+        "flex-basis" => parse_length(value)
+            .map(Property::FlexBasis)
+            .into_iter()
+            .collect(),
+        "flex" => parse_flex_shorthand(value),
         _ => Vec::new(),
     }
+}
+
+fn parse_flex_direction(value: &str) -> Option<FlexDirection> {
+    Some(match value.trim().to_ascii_lowercase().as_str() {
+        "row" => FlexDirection::Row,
+        "row-reverse" => FlexDirection::RowReverse,
+        "column" => FlexDirection::Column,
+        "column-reverse" => FlexDirection::ColumnReverse,
+        _ => return None,
+    })
+}
+
+fn parse_flex_wrap(value: &str) -> Option<FlexWrap> {
+    Some(match value.trim().to_ascii_lowercase().as_str() {
+        "nowrap" => FlexWrap::NoWrap,
+        "wrap" => FlexWrap::Wrap,
+        "wrap-reverse" => FlexWrap::WrapReverse,
+        _ => return None,
+    })
+}
+
+fn parse_justify(value: &str) -> Option<Justify> {
+    Some(match value.trim().to_ascii_lowercase().as_str() {
+        "flex-start" | "start" | "left" => Justify::Start,
+        "flex-end" | "end" | "right" => Justify::End,
+        "center" => Justify::Center,
+        "space-between" => Justify::SpaceBetween,
+        "space-around" => Justify::SpaceAround,
+        "space-evenly" => Justify::SpaceEvenly,
+        _ => return None,
+    })
+}
+
+fn parse_align_items(value: &str) -> Option<AlignItems> {
+    Some(match value.trim().to_ascii_lowercase().as_str() {
+        "flex-start" | "start" | "self-start" => AlignItems::Start,
+        "flex-end" | "end" | "self-end" => AlignItems::End,
+        "center" => AlignItems::Center,
+        "baseline" => AlignItems::Baseline,
+        "stretch" | "normal" => AlignItems::Stretch,
+        _ => return None,
+    })
+}
+
+fn parse_align_self(value: &str) -> Option<AlignSelf> {
+    Some(match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => AlignSelf::Auto,
+        "flex-start" | "start" | "self-start" => AlignSelf::Start,
+        "flex-end" | "end" | "self-end" => AlignSelf::End,
+        "center" => AlignSelf::Center,
+        "baseline" => AlignSelf::Baseline,
+        "stretch" | "normal" => AlignSelf::Stretch,
+        _ => return None,
+    })
+}
+
+/// `flex` 简写：`1` / `1 0 auto` / `0 0 120px` / `none`。
+fn parse_flex_shorthand(value: &str) -> Vec<Property> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "none" => {
+            return vec![
+                Property::FlexGrow(0.0),
+                Property::FlexShrink(0.0),
+                Property::FlexBasis(Length::Px(0.0)),
+            ];
+        }
+        "auto" => {
+            return vec![
+                Property::FlexGrow(1.0),
+                Property::FlexShrink(1.0),
+                Property::FlexBasis(Length::Px(0.0)),
+            ];
+        }
+        "initial" => {
+            return vec![
+                Property::FlexGrow(0.0),
+                Property::FlexShrink(1.0),
+                Property::FlexBasis(Length::Px(0.0)),
+            ];
+        }
+        _ => {}
+    }
+
+    let tokens: Vec<&str> = value.split_whitespace().collect();
+    let mut output = Vec::new();
+    let mut numbers = 0;
+    for token in &tokens {
+        if numbers < 2
+            && let Ok(number) = token.parse::<f32>()
+        {
+            output.push(if numbers == 0 {
+                Property::FlexGrow(number)
+            } else {
+                Property::FlexShrink(number)
+            });
+            numbers += 1;
+            continue;
+        }
+        if let Some(length) = parse_length(token) {
+            output.push(Property::FlexBasis(length));
+        }
+    }
+    // 只写了一个数值时按规范补 `flex-shrink: 1`、`flex-basis: 0`。
+    if numbers == 1 {
+        output.push(Property::FlexShrink(1.0));
+        output.push(Property::FlexBasis(Length::Px(0.0)));
+    }
+    output
 }
 
 fn parse_background(value: &str) -> Vec<Property> {
@@ -758,8 +960,10 @@ fn parse_display(value: &str) -> Option<Display> {
         "inline" | "inline-block" | "inline-flex" | "inline-grid" | "contents" => {
             Some(Display::Inline)
         }
-        "block" | "flex" | "grid" | "list-item" | "table" | "table-row" | "table-cell"
-        | "table-caption" => Some(Display::Block),
+        "flex" => Some(Display::Flex),
+        "block" | "grid" | "list-item" | "table" | "table-row" | "table-cell" | "table-caption" => {
+            Some(Display::Block)
+        }
         _ => None,
     }
 }
@@ -1415,6 +1619,52 @@ mod tests {
         let content = parse_content(r#""引""#).unwrap();
         assert_eq!(content.resolve(&[]), "引");
         assert!(parse_content("none").is_none());
+    }
+
+    #[test]
+    fn flex_properties_are_parsed() {
+        let sheet = Stylesheet::parse(
+            ".target { display: flex; flex-direction: column-reverse; flex-wrap: wrap;
+                       justify-content: space-evenly; align-items: baseline;
+                       gap: 8px 12px; flex: 0 0 140px; align-self: center; }",
+        );
+        let (_doc, element) = document(r#"<div class="target">x</div>"#);
+        let style = computed_for(&sheet, &element, None);
+        assert_eq!(style.display, Some(Display::Flex));
+        assert_eq!(style.flex_direction, Some(FlexDirection::ColumnReverse));
+        assert_eq!(style.flex_wrap, Some(FlexWrap::Wrap));
+        assert_eq!(style.justify, Some(Justify::SpaceEvenly));
+        assert_eq!(style.align_items, Some(AlignItems::Baseline));
+        assert_eq!(style.gap, Some(8.0));
+        assert_eq!(style.flex_grow, Some(0.0));
+        assert_eq!(style.flex_shrink, Some(0.0));
+        assert_eq!(style.flex_basis, Some(140.0));
+        assert_eq!(style.align_self, Some(AlignSelf::Center));
+    }
+
+    #[test]
+    fn flex_shorthand_expands_single_number() {
+        let properties = parse_flex_shorthand("1");
+        assert!(matches!(properties[0], Property::FlexGrow(1.0)));
+        assert!(matches!(properties[1], Property::FlexShrink(1.0)));
+        assert!(matches!(
+            properties[2],
+            Property::FlexBasis(Length::Px(0.0))
+        ));
+        assert!(matches!(
+            parse_flex_shorthand("none")[0],
+            Property::FlexGrow(0.0)
+        ));
+    }
+
+    #[test]
+    fn display_flex_is_not_flattened() {
+        let sheet = Stylesheet::parse(".target { display: flex; }");
+        let (_doc, element) = document(r#"<div class="target">x</div>"#);
+        assert_eq!(
+            computed_for(&sheet, &element, None).display,
+            Some(Display::Flex)
+        );
     }
 
     #[test]

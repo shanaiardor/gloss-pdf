@@ -4,7 +4,6 @@
 //! 字体覆盖的码位，渲染前把文本切成"每个字符用列表里第一个覆盖它的字体"。
 
 use std::collections::HashMap;
-use std::io::Read;
 
 /// 已加载的字体集合。
 #[derive(Default)]
@@ -79,13 +78,16 @@ fn normalize(family: &str) -> String {
     family.trim().trim_matches(['"', '\'']).to_ascii_lowercase()
 }
 
-/// TTF/OTF 原样返回；WOFF 解包成 sfnt；WOFF2 暂不支持。
+/// TTF/OTF 原样返回；WOFF / WOFF2 解包成 sfnt。
+///
+/// 解包交给 `wuff`（纯 Rust，自带 Brotli 与 zlib 解码），比手写
+/// WOFF 头解析更省事，也顺带覆盖了 WOFF2 的 glyf/loca 变换。
 fn to_sfnt(bytes: &[u8]) -> Option<Vec<u8>> {
     if bytes.starts_with(b"wOFF") {
-        return woff_to_sfnt(bytes);
+        return wuff::decompress_woff1(bytes).ok();
     }
     if bytes.starts_with(b"wOF2") {
-        return None;
+        return wuff::decompress_woff2(bytes).ok();
     }
     if bytes.starts_with(&[0x00, 0x01, 0x00, 0x00])
         || bytes.starts_with(b"OTTO")
@@ -107,124 +109,6 @@ fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_be_bytes(
         bytes.get(offset..offset + 4)?.try_into().ok()?,
     ))
-}
-
-fn woff_to_sfnt(bytes: &[u8]) -> Option<Vec<u8>> {
-    let flavor = u32_at(bytes, 4)?;
-    let num_tables = u16_at(bytes, 12)? as usize;
-    if num_tables == 0 || num_tables > 4096 {
-        return None;
-    }
-
-    struct WoffTable {
-        tag: [u8; 4],
-        checksum: u32,
-        data: Vec<u8>,
-    }
-
-    let mut tables = Vec::with_capacity(num_tables);
-    for index in 0..num_tables {
-        let base = 44 + index * 20;
-        let tag: [u8; 4] = bytes.get(base..base + 4)?.try_into().ok()?;
-        let offset = u32_at(bytes, base + 4)? as usize;
-        let comp_length = u32_at(bytes, base + 8)? as usize;
-        let orig_length = u32_at(bytes, base + 12)? as usize;
-        let checksum = u32_at(bytes, base + 16)?;
-        if orig_length > 64 * 1024 * 1024 {
-            return None;
-        }
-        let raw = bytes.get(offset..offset.checked_add(comp_length)?)?;
-        let data = if comp_length < orig_length {
-            zlib_decode(raw, orig_length)?
-        } else {
-            raw.to_vec()
-        };
-        if data.len() != orig_length {
-            return None;
-        }
-        tables.push(WoffTable {
-            tag,
-            checksum,
-            data,
-        });
-    }
-    tables.sort_by_key(|table| table.tag);
-
-    let table_count = tables.len() as u16;
-    let entry_selector = (table_count as f32).log2().floor() as u16;
-    let search_range = (1u16 << entry_selector).saturating_mul(16);
-    let range_shift = table_count.saturating_mul(16).saturating_sub(search_range);
-
-    let mut output = Vec::new();
-    output.extend_from_slice(&flavor.to_be_bytes());
-    output.extend_from_slice(&table_count.to_be_bytes());
-    output.extend_from_slice(&search_range.to_be_bytes());
-    output.extend_from_slice(&entry_selector.to_be_bytes());
-    output.extend_from_slice(&range_shift.to_be_bytes());
-
-    let directory_start = output.len();
-    output.resize(directory_start + tables.len() * 16, 0);
-
-    let mut data_offset = output.len();
-    let mut head_offset = None;
-    for (index, table) in tables.iter().enumerate() {
-        let record = directory_start + index * 16;
-        output[record..record + 4].copy_from_slice(&table.tag);
-        output[record + 4..record + 8].copy_from_slice(&table.checksum.to_be_bytes());
-        output[record + 8..record + 12].copy_from_slice(&(data_offset as u32).to_be_bytes());
-        output[record + 12..record + 16].copy_from_slice(&(table.data.len() as u32).to_be_bytes());
-        if &table.tag == b"head" {
-            head_offset = Some(data_offset);
-        }
-        output.extend_from_slice(&table.data);
-        while output.len() % 4 != 0 {
-            output.push(0);
-        }
-        data_offset = output.len();
-    }
-
-    if let Some(head) = head_offset {
-        if head + 12 > output.len() {
-            return None;
-        }
-        // 先清零 checkSumAdjustment，再重算整个字体。
-        output[head + 8..head + 12].fill(0);
-        let adjustment = 0xB1B0_AFBAu32.wrapping_sub(checksum(&output));
-        output[head + 8..head + 12].copy_from_slice(&adjustment.to_be_bytes());
-        let head_length = tables
-            .iter()
-            .find(|table| &table.tag == b"head")
-            .map(|table| table.data.len())?;
-        let head_sum = checksum(&output[head..head + head_length]);
-        for index in 0..tables.len() {
-            let record = directory_start + index * 16;
-            if &output[record..record + 4] == b"head" {
-                output[record + 4..record + 8].copy_from_slice(&head_sum.to_be_bytes());
-                break;
-            }
-        }
-    }
-
-    Some(output)
-}
-
-fn zlib_decode(input: &[u8], expected: usize) -> Option<Vec<u8>> {
-    let mut output = Vec::with_capacity(expected.min(16 * 1024 * 1024));
-    flate2::read::ZlibDecoder::new(input)
-        .take(expected as u64 + 1)
-        .read_to_end(&mut output)
-        .ok()?;
-    Some(output)
-}
-
-fn checksum(bytes: &[u8]) -> u32 {
-    let mut sum = 0u32;
-    for chunk in bytes.chunks(4) {
-        let mut padded = [0u8; 4];
-        padded[..chunk.len()].copy_from_slice(chunk);
-        sum = sum.wrapping_add(u32::from_be_bytes(padded));
-    }
-    sum
 }
 
 fn cmap_ranges(sfnt: &[u8]) -> Option<Vec<(u32, u32)>> {
@@ -342,5 +226,21 @@ mod tests {
         assert_eq!(library.covers("WL-SPECIAL", '～'), Some(true));
         assert_eq!(library.covers("wl-special", 'a'), Some(false));
         assert_eq!(library.covers("unknown", 'a'), None);
+    }
+
+    #[test]
+    fn native_sfnt_passes_through() {
+        let ttf = [0x00, 0x01, 0x00, 0x00, 0x00, 0x01];
+        assert_eq!(to_sfnt(&ttf).as_deref(), Some(&ttf[..]));
+        assert_eq!(to_sfnt(b"OTTO...").as_deref(), Some(&b"OTTO..."[..]));
+    }
+
+    #[test]
+    fn broken_woff_and_woff2_are_rejected_without_panicking() {
+        // 只有魔术字、没有表数据：解包必须失败而不是 panic。
+        assert!(to_sfnt(b"wOFF").is_none());
+        assert!(to_sfnt(b"wOF2").is_none());
+        assert!(to_sfnt(b"wOF2\x00\x00\x00\x00garbage").is_none());
+        assert!(to_sfnt(b"not a font").is_none());
     }
 }

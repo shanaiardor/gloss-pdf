@@ -25,15 +25,16 @@ impl DictEntry {
     }
 }
 
-/// 块级内容：段落或表格。
+/// 块级内容：段落、表格或 flex 容器。
 #[derive(Clone, Debug, PartialEq)]
 pub enum Block {
     Paragraph(Paragraph),
     Table(Table),
+    Container(Container),
 }
 
 impl Block {
-    /// 纯文本形式（表格按行拼接）。
+    /// 纯文本形式（表格按行拼接，容器按子项顺序拼接）。
     pub fn text(&self) -> String {
         match self {
             Block::Paragraph(paragraph) => paragraph.text(),
@@ -55,6 +56,20 @@ impl Block {
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
+            Block::Container(container) => container
+                .items
+                .iter()
+                .map(|item| {
+                    item.blocks
+                        .iter()
+                        .map(Block::text)
+                        .filter(|text| !text.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
         }
     }
 
@@ -63,6 +78,10 @@ impl Block {
         match self {
             Block::Paragraph(paragraph) => paragraph.spans.is_empty(),
             Block::Table(table) => table.rows.iter().all(|row| row.cells.is_empty()),
+            Block::Container(container) => container
+                .items
+                .iter()
+                .all(|item| item.blocks.iter().all(|block| block.is_empty())),
         }
     }
 }
@@ -105,6 +124,90 @@ pub struct TableCell {
     pub blocks: Vec<Block>,
 }
 
+/// `display: flex` 的容器：子元素按主轴排布。
+///
+/// 只在词典释义里用得上，因此只保留 flex 排版必需的子集；
+/// `grid`、`inline-flex` 仍按原有近似处理。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Container {
+    pub style: BlockStyle,
+    pub flex: FlexStyle,
+    pub items: Vec<FlexItem>,
+}
+
+/// 一个 flex 子项：外壳样式（内外边距、边框、伸缩比例）加内部块。
+#[derive(Clone, Debug, PartialEq)]
+pub struct FlexItem {
+    pub style: BlockStyle,
+    pub blocks: Vec<Block>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FlexStyle {
+    pub direction: FlexDirection,
+    pub wrap: FlexWrap,
+    pub justify: Justify,
+    pub align_items: AlignItems,
+    /// 主轴与交叉轴共用一个间距（`gap: 8px`）；分轴写法取最后一次声明。
+    pub gap: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FlexDirection {
+    #[default]
+    Row,
+    RowReverse,
+    Column,
+    ColumnReverse,
+}
+
+impl FlexDirection {
+    pub fn is_row(self) -> bool {
+        matches!(self, FlexDirection::Row | FlexDirection::RowReverse)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FlexWrap {
+    #[default]
+    NoWrap,
+    Wrap,
+    WrapReverse,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Justify {
+    #[default]
+    Start,
+    End,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AlignItems {
+    Start,
+    End,
+    Center,
+    Baseline,
+    #[default]
+    Stretch,
+}
+
+/// `align-self`：`Auto` 表示跟随容器的 `align-items`。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AlignSelf {
+    #[default]
+    Auto,
+    Start,
+    End,
+    Center,
+    Baseline,
+    Stretch,
+}
+
 /// 段落的语义分类，界面据此给默认字号/颜色。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BlockKind {
@@ -138,6 +241,12 @@ pub struct BlockStyle {
     pub width: Option<f32>,
     /// 列表项前缀，例如 `•` 或 `1.`。
     pub marker: Option<String>,
+    /// flex 子项的伸缩比例；`None` 表示沿用默认。
+    pub grow: Option<f32>,
+    pub shrink: Option<f32>,
+    /// flex 基准宽度（px）；`None` 表示 `auto`。
+    pub basis: Option<f32>,
+    pub align_self: Option<AlignSelf>,
 }
 
 /// 行内内容：文字或图片。
@@ -178,6 +287,20 @@ pub struct SpanStyle {
     pub background: Option<Color>,
     /// 已经按字符覆盖范围挑好的字体名。
     pub family: Option<String>,
+    /// 行内链接（`<a href>`），界面据此把区间做成可点击。
+    pub link: Option<LinkTarget>,
+    /// CSS 是否显式声明过 `text-decoration`（含 `none`）。
+    /// 为 `false` 时界面可以给链接补默认下划线，`true` 则完全按 CSS 走。
+    pub decorated: bool,
+}
+
+/// 行内链接目标。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkTarget {
+    /// 词典内部词条：`entry://xxx`、`bword://xxx`。
+    Entry(String),
+    /// 外部地址：`http(s)://`、`mailto:`。
+    Uri(String),
 }
 
 /// 行内图片：字节来自 `.mdd` 或 `data:` URI。

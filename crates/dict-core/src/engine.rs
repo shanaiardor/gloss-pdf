@@ -805,7 +805,7 @@ mod tests {
                     .iter()
                     .filter_map(|block| match block {
                         Block::Paragraph(paragraph) => Some(paragraph),
-                        Block::Table(_) => None,
+                        Block::Table(_) | Block::Container(_) => None,
                     })
                     .flat_map(|paragraph| paragraph.spans.iter())
                     .any(|span| matches!(span, Span::Text(text) if text.style.bold && text.text.contains("世界"))));
@@ -815,7 +815,7 @@ mod tests {
                         .iter()
                         .filter_map(|block| match block {
                             Block::Paragraph(paragraph) => Some(paragraph),
-                            Block::Table(_) => None,
+                            Block::Table(_) | Block::Container(_) => None,
                         })
                         .flat_map(|paragraph| paragraph.spans.iter())
                         .any(|span| matches!(span, Span::Image(image) if image.width == 2))

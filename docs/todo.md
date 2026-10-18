@@ -3,8 +3,8 @@
 阅读体验、互操作与工程化的剩余事项。
 
 > 基线：`main` / `9ed2bde`（P0 与 P1 连续滚动已合并）
-> 更新：2026-10-18 进度更新（`app.rs` 拆分 + 三项 P0 边界）
-> 代码量 14,699 行；`cargo test` 全绿（gpui-pdf 98 项、dict-core 37 项、pdf-core 9 项，另 1 项手动测试忽略）
+> 更新：2026-10-18 进度更新（`app.rs` 拆分 + 三项 P0 边界 + 词典渲染三处缺口）
+> 代码量 15,436 行；`cargo test` 全绿（gpui-pdf 98 项、dict-core 48 项、pdf-core 9 项，另 1 项手动测试忽略）
 
 ## 目录
 
@@ -32,7 +32,7 @@
 | ☐ 待办  | P1  | 目录面板增强                 | `ui/outline.rs`                                            | 局部重写    |
 | ☐ 待办  | P1  | 收藏落地                   | `home.rs`、`ui/home.rs`                                     | 新增存储    |
 | ☐ 待办  | P2  | 高亮写入标准注释               | `pdf-core`、`highlights.rs`                                 | 需手写外观流  |
-| ☐ 待办  | P2  | 词典渲染三处缺口               | `dict-core/css.rs`、`dict-core/fonts.rs`、`ui/dictionary.rs` | 改动分散    |
+| ✅ 已完成 | P2  | 词典渲染三处缺口               | `dict-core/css.rs`、`dict-core/fonts.rs`、`ui/dictionary.rs` | 改动分散    |
 | ☐ 待办  | P2  | 表单字段、打印导出              | `pdf-core`、`ui/chrome.rs`                                  | 新增能力    |
 | ✅ 已完成 | 低   | 汉字搜索空格容错               | `pdf-core/text_match.rs`、`search.rs`                       | 小，需两侧一致 |
 | ✅ 已完成 | 低   | 光标闪烁、全文扫描进度            | `ui/text_input.rs`、`pdf-core/engine.rs`、`ui/search_bar.rs` | 体验打磨    |
@@ -110,19 +110,25 @@ P0 与连续滚动完成后，阅读主链路已闭环。连续滚动的实现�
 
 验收标准：在第三方阅读器（Acrobat 或浏览器内置阅读器）中打开同一文件，高亮可见且位置正确。
 
-### （二）词典渲染的三处缺口 ☐
+### （二）词典渲染的三处缺口 ✅
 
 **表 2　词典渲染能力缺口**
 
-| 缺口          | 现状                                                                                     | 影响                                                                            |
+| 缺口          | 原现状                                                                                     | 处理方式                                                                            |
 | ----------- | -------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| WOFF2 字体不支持 | `dict-core/fonts.rs` 第 82 行注释写明「TTF/OTF 原样返回；WOFF 解包成 sfnt；WOFF2 暂不支持」                 | 相当一部分现代词典用 WOFF2 装字体，会回退到系统字体，字形与音标可能错位                                       |
-| 弹性布局无真实实现   | `css.rs` 的 `parse_display` 把 flex、grid、table 一律映射为块级，`inline-flex`、`inline-grid` 映射为行内 | 用弹性布局排版的释义（常见于双栏对照、例句区块）会退化成一列堆叠                                              |
-| 释义内链接点不动    | `ui/dictionary.rs` 全文只有两处 `on_click`（标题栏按钮与「查」按钮），没有对释义内词条链接的点击处理                      | 词典内部的交叉引用（「见 XX 条」）无法跳转；`@@@LINK` 重定向已在 `dict-core/engine.rs` 跟随，但只发生在同词条解析阶段 |
+| WOFF2 字体不支持 | `dict-core/fonts.rs` 第 82 行注释写明「TTF/OTF 原样返回；WOFF 解包成 sfnt；WOFF2 暂不支持」                 | ✅ 改用 `wuff`（纯 Rust，自带 Brotli 与 zlib）统一解包 WOFF/WOFF2，删掉自写的 120 行 WOFF 解析与 `flate2` 依赖 |
+| 弹性布局无真实实现   | `css.rs` 的 `parse_display` 把 flex、grid、table 一律映射为块级，`inline-flex`、`inline-grid` 映射为行内 | ✅ `display:flex` 走 `Block::Container`，映射到 GPUI 原生 flex（内置 taffy）；`grid` 仍按块级近似 |
+| 释义内链接点不动    | `ui/dictionary.rs` 全文只有两处 `on_click`（标题栏按钮与「查」按钮），没有对释义内词条链接的点击处理                      | ✅ `<a href>` 解析成 `LinkTarget`，随行内样式继承到子片段；界面用 `InteractiveText` 绑定点击区间 |
 
-落点：WOFF2 需要引入解压（Brotli 加 WOFF2 变换表）或换一个自带 WOFF2 支持的字体库；布局至少要支持单行、`justify-content`、`gap` 三种最常见形态；释义内链接需要在 HTML 转 Block 时把链接保留为可点击的 run，并接回查询通道。
+**实现要点**
 
-验收标准：加载一本用 WOFF2 字体、带交叉引用的词典，音标字形正常，点击「见某条」能跳到对应词条。
+- **WOFF2**：`to_sfnt` 变成三条分支——`wOFF` → `wuff::decompress_woff1`、`wOF2` → `wuff::decompress_woff2`、原生 sfnt 原样返回。`cmap_ranges` 与 `FontLibrary` 不变，解出来的就是普通 sfnt。真实 Roboto WOFF2 实测解包成功（31 段 cmap，`a` 命中、`漢` 不命中）。
+- **flex**：模型新增 `Block::Container` / `FlexItem` / `FlexStyle`，覆盖 `flex-direction`、`flex-wrap`、`justify-content`、`align-items`、`align-self`、`gap`、`flex` 简写、`flex-grow/shrink/basis`。`html.rs` 把直接子元素各收成一个子项，行内子元素并入匿名项；界面映射到 `.flex_row()/.justify_between()/.items_center()/.gap()` 等方法。横向容器在子项都没声明尺寸时自动均分宽度——双栏对照几乎都不写宽度，均分才不会把右栏挤没。
+- **链接**：`entry://`、`bword://` 转成 `LinkTarget::Entry`（百分号解码、去掉 `#fragment`），`http(s)://`、`mailto:` 转成 `Uri`，其余（`#anchor`、`javascript:`）忽略。点击词条走已有的查询通道，外链走 `cx.open_url`。颜色与下划线**以 CSS 为准**：CSS 声明过 `text-decoration` 就照办（王力字典用 `none` 让页码链接融入正文），完全没声明时才补主题强调色 + 下划线。
+
+**验收标准**：加载一本用 WOFF2 字体、带交叉引用的词典，音标字形正常，点击「见某条」能跳到对应词条。
+
+**验证结果**：`cargo test` 全绿（dict-core 48 项，新增链接/装饰/flex/字体格式用例）；用王力字典实测 8 个 WOFF 字体全部解包（`loaded font ... 4561 ranges`）；用合成词典实测三栏 flex（固定 90px + 两个弹性栏）并排、`gap`/`padding` 生效，默认链接为强调色带下划线、CSS `text-decoration:none` 的链接颜色与装饰均按 CSS 渲染，点击「World」成功跳转到目标词条。
 
 ### （三）表单字段与打印导出 ☐
 
@@ -207,7 +213,7 @@ worker 逐页提取文本并计数，大文档第一次搜索需要数秒，原�
 2. ✅ 已完成：拆分 `app.rs`（事件分派、文档生命周期、渲染调度、窗口管理四个模块）。
 3. 继续 P1 剩余三项：真实缩略图、目录面板、收藏落地。缩略图与目录面板互不依赖可并行；收藏的数据结构与最近阅读同构，成本最低，可顺手做。
 4. ✅ 已完成：汉字空格容错、扫描进度、光标闪烁。P0 遗留只剩批注侧栏增强（编辑备注、改颜色、筛选、排序），可随批注功能一并做。
-5. 最后做互操作：标准注释、词典 WOFF2 与布局、表单打印。每一项都有外部依赖或需要新协议实现，适合单独排期。
+5. 最后做互操作：标准注释、表单打印。词典的 WOFF2/布局/链接已在第四节（二）完成；剩下两项都有外部协议依赖，适合单独排期。
 
 ## 附录：涉及文件速查
 
@@ -233,8 +239,11 @@ worker 逐页提取文本并计数，大文档第一次搜索需要数秒，原�
 | `crates/pdf-core/src/engine.rs`         | 渲染、文本提取、全文计数、搜索命令与扫描进度              |
 | `crates/gpui-pdf/src/ui/text_input.rs`  | 输入框与光标闪烁                              |
 | `crates/gpui-pdf/src/ui/search_bar.rs`  | 搜索框状态文案（扫描进度/命中数）                     |
-| `crates/dict-core/src/css.rs`           | `parse_display` 的布局退化                 |
-| `crates/dict-core/src/fonts.rs`         | WOFF2 不支持（第 82 行）                     |
+| `crates/dict-core/src/css.rs`           | flex 属性的解析与计算样式                       |
+| `crates/dict-core/src/fonts.rs`         | WOFF/WOFF2 解包（`wuff`）与 cmap 覆盖范围      |
+| `crates/dict-core/src/html.rs`          | `<a href>` → `LinkTarget`、flex 容器 → `Block::Container` |
+| `crates/dict-core/src/model.rs`         | `Container`/`FlexStyle`、`SpanStyle.link`  |
+| `crates/gpui-pdf/src/ui/dictionary.rs`  | flex 映射到 GPUI、`InteractiveText` 链接点击 |
 
 ---
 

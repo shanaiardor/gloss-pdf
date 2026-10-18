@@ -13,6 +13,7 @@ pub use engine::{Command, DictEngine, Event};
 pub use fonts::FontLibrary;
 pub use html::{NoResources, RenderContext, ResourceResolver, extract_phonetic, render, to_blocks};
 pub use model::{
-    Align, Block, BlockKind, BlockStyle, Border, Color, DictEntry, Edges, ImageFormat, ImageSpan,
-    Paragraph, Span, SpanStyle, Table, TableCell, TableRow, TextSpan,
+    Align, AlignItems, AlignSelf, Block, BlockKind, BlockStyle, Border, Color, Container,
+    DictEntry, Edges, FlexDirection, FlexItem, FlexStyle, FlexWrap, ImageFormat, ImageSpan,
+    Justify, LinkTarget, Paragraph, Span, SpanStyle, Table, TableCell, TableRow, TextSpan,
 };
