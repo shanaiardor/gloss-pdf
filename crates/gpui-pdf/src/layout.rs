@@ -64,7 +64,10 @@ impl FitArea {
 
 /// 按模式算出缩放。页面尺寸无效或模式是手动缩放时返回 `None`。
 pub fn zoom_for(page: PageSize, area: FitArea, mode: FitMode) -> Option<f32> {
-    if !page.width.is_finite() || !page.height.is_finite() || page.width <= 0.0 || page.height <= 0.0
+    if !page.width.is_finite()
+        || !page.height.is_finite()
+        || page.width <= 0.0
+        || page.height <= 0.0
     {
         return None;
     }

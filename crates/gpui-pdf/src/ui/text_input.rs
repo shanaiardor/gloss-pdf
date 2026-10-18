@@ -154,12 +154,7 @@ impl TextField {
         let start = range.start.min(self.content.len());
         let end = range.end.min(self.content.len()).max(start);
         let before = self.content.clone();
-        self.content = format!(
-            "{}{}{}",
-            &before[..start],
-            text,
-            &before[end..]
-        );
+        self.content = format!("{}{}{}", &before[..start], text, &before[end..]);
         let caret = start + text.len();
         self.selection = caret..caret;
         self.reversed = false;
@@ -877,7 +872,10 @@ impl Element for TextElement {
             window.paint_quad(selection);
         }
 
-        let line = prepaint.line.take().expect("text input laid out in prepaint");
+        let line = prepaint
+            .line
+            .take()
+            .expect("text input laid out in prepaint");
         let origin = point(bounds.left() - prepaint.scroll_x, bounds.top());
         if let Err(error) = line.paint(
             origin,

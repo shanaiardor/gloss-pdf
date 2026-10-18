@@ -71,7 +71,9 @@ impl HighlightStore {
     }
 
     pub fn for_page(&self, page: usize) -> impl Iterator<Item = &Highlight> {
-        self.items.iter().filter(move |highlight| highlight.page == page)
+        self.items
+            .iter()
+            .filter(move |highlight| highlight.page == page)
     }
 
     /// 按页码排序后的副本，批注侧栏用。
@@ -101,7 +103,11 @@ impl HighlightStore {
                 }
                 self.items = items;
                 self.next_id = next;
-                log::info!("loaded {} highlights from {}", self.items.len(), path.display());
+                log::info!(
+                    "loaded {} highlights from {}",
+                    self.items.len(),
+                    path.display()
+                );
             }
             Err(error) => log::warn!("failed to parse {}: {error}", path.display()),
         }
@@ -109,9 +115,12 @@ impl HighlightStore {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(&self.items)?;
-        std::fs::write(path, json)
-            .with_context(|| format!("无法写入 {}", path.display()))?;
-        log::info!("saved {} highlights to {}", self.items.len(), path.display());
+        std::fs::write(path, json).with_context(|| format!("无法写入 {}", path.display()))?;
+        log::info!(
+            "saved {} highlights to {}",
+            self.items.len(),
+            path.display()
+        );
         Ok(())
     }
 }

@@ -1,4 +1,4 @@
-﻿//! 阅读器状态：当前文档、多页位图缓存、当前页、缩放与滚动，以及选择/搜索/高亮。
+//! 阅读器状态：当前文档、多页位图缓存、当前页、缩放与滚动，以及选择/搜索/高亮。
 //!
 //! 连续滚动下滚动偏移是「文档级」的，页内位置只在保存/恢复阅读进度时用得到；
 //! 这里只维护状态与缓存，偏移和当前页的换算由 `app.rs` 结合 `DocumentLayout` 完成。
@@ -180,7 +180,9 @@ impl Viewer {
 
     /// 双击选词：选区归到 `page`，只在这一页里扩展。
     pub fn select_word_at(&mut self, page: usize, index: usize) {
-        let Viewer { pages, selection, .. } = self;
+        let Viewer {
+            pages, selection, ..
+        } = self;
         let Some(chars) = pages.get(&page).map(|data| data.chars.as_slice()) else {
             return;
         };

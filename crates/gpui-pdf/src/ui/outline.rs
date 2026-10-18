@@ -6,11 +6,7 @@ use crate::app::AppState;
 use crate::theme::Theme;
 
 impl AppState {
-    pub(crate) fn outline_panel(
-        &self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::Div> {
+    pub(crate) fn outline_panel(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::Div> {
         if !self.outline_open {
             return None;
         }
@@ -22,7 +18,11 @@ impl AppState {
             .map(|doc| doc.outline.clone())
             .unwrap_or_default();
 
-        let mut list = div().id("outline-scroll").flex_1().overflow_y_scroll().p_2();
+        let mut list = div()
+            .id("outline-scroll")
+            .flex_1()
+            .overflow_y_scroll()
+            .p_2();
         if outline.is_empty() {
             list = list.child(
                 div()
@@ -46,9 +46,11 @@ impl AppState {
                     .cursor_pointer()
                     .hover(move |style| style.bg(hover_bg))
                     .child(format!("{}{}", "  ".repeat(item.depth), item.title))
-                    .on_click(cx_list.listener(move |this, _event: &ClickEvent, _window, cx| {
-                        this.set_page(item.page, cx);
-                    }))
+                    .on_click(
+                        cx_list.listener(move |this, _event: &ClickEvent, _window, cx| {
+                            this.set_page(item.page, cx);
+                        }),
+                    )
             }));
         }
 
@@ -89,12 +91,10 @@ impl AppState {
                                     let hover_bg = theme.surface_hover;
                                     move |style| style.bg(hover_bg)
                                 })
-                                .on_click(cx.listener(
-                                    |this, _event: &ClickEvent, _window, cx| {
-                                        this.outline_open = false;
-                                        cx.notify();
-                                    },
-                                ))
+                                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                    this.outline_open = false;
+                                    cx.notify();
+                                }))
                                 .child("✕"),
                         ),
                 )

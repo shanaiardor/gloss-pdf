@@ -59,9 +59,11 @@ impl AppState {
                     .rounded_md()
                     .cursor_pointer()
                     .hover(move |style| style.bg(hover))
-                    .on_click(cx_list.listener(move |this, _event: &ClickEvent, _window, cx| {
-                        this.set_page(page, cx);
-                    }))
+                    .on_click(
+                        cx_list.listener(move |this, _event: &ClickEvent, _window, cx| {
+                            this.set_page(page, cx);
+                        }),
+                    )
                     .child(
                         div()
                             .flex_shrink_0()
@@ -88,10 +90,12 @@ impl AppState {
                             .text_size(px(11.))
                             .text_color(muted)
                             .hover(move |style| style.bg(hover))
-                            .on_click(cx_list.listener(move |this, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                this.delete_highlight(id, cx);
-                            }))
+                            .on_click(cx_list.listener(
+                                move |this, _event: &ClickEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    this.delete_highlight(id, cx);
+                                },
+                            ))
                             .child("✕"),
                     )
             }));
@@ -140,11 +144,9 @@ impl AppState {
                                     let hover = theme.surface_hover;
                                     move |style| style.bg(hover)
                                 })
-                                .on_click(cx.listener(
-                                    |this, _event: &ClickEvent, _window, cx| {
-                                        this.toggle_highlight_panel(cx);
-                                    },
-                                ))
+                                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                    this.toggle_highlight_panel(cx);
+                                }))
                                 .child("✕"),
                         ),
                 )
