@@ -28,6 +28,9 @@ pub struct SearchState {
     pub doc_index: Option<usize>,
     /// 全文搜索是否在跑。
     pub scanning: bool,
+    /// 全文扫描进度：已扫描页数与总页数；`scanned_total` 为 0 表示还没开始报进度。
+    pub scanned: usize,
+    pub scanned_total: usize,
     /// 每页的匹配区间，连续滚动时逐页画高亮用。
     page_matches: HashMap<usize, Vec<RangeInclusive<usize>>>,
     /// `matches` / `current` 属于哪一页。
@@ -58,6 +61,8 @@ impl SearchState {
         self.total = 0;
         self.doc_index = None;
         self.scanning = false;
+        self.scanned = 0;
+        self.scanned_total = 0;
         self.page_matches.clear();
         self.pending = None;
     }
@@ -123,6 +128,25 @@ impl SearchState {
         if self.doc_index.is_some_and(|index| index >= total) {
             self.doc_index = if total == 0 { None } else { Some(total - 1) };
         }
+    }
+
+    /// 开始一次全文扫描：清掉上一轮结果与进度。
+    pub fn begin_scan(&mut self) {
+        self.doc_index = None;
+        self.total = 0;
+        self.pages.clear();
+        self.scanning = true;
+        self.scanned = 0;
+        self.scanned_total = 0;
+    }
+
+    /// 更新扫描进度；`total` 由 worker 在开始时给出。
+    pub fn update_scan(&mut self, scanned: usize, total: usize) {
+        if !self.scanning {
+            return;
+        }
+        self.scanned = scanned;
+        self.scanned_total = total;
     }
 
     /// 全文第 `index` 个命中所在页与页内序号。
@@ -196,33 +220,13 @@ impl SearchState {
     }
 }
 
-/// 在单页字符里找所有不重叠的命中，返回字符下标区间（不是字节下标）。
+/// 页内匹配：把 `CharBox` 序列交给 [`pdf_core::text_match`] 的共享规则。
+///
+/// 规则（大小写折叠、汉字空格容错、不重叠）只在那里定义一次，worker 的全文
+/// 计数走同一份实现，避免两侧命中数对不上。
 fn find_matches(query: &str, chars: &[CharBox]) -> Vec<RangeInclusive<usize>> {
-    let needle: Vec<char> = query.to_lowercase().chars().collect();
-    if needle.is_empty() {
-        return Vec::new();
-    }
-
-    let haystack: Vec<char> = chars
-        .iter()
-        .map(|character| character.ch.to_lowercase().next().unwrap_or(character.ch))
-        .collect();
-
-    let mut matches = Vec::new();
-    if needle.len() > haystack.len() {
-        return matches;
-    }
-
-    let mut start = 0;
-    while start + needle.len() <= haystack.len() {
-        if haystack[start..start + needle.len()] == needle[..] {
-            matches.push(start..=start + needle.len() - 1);
-            start += needle.len();
-        } else {
-            start += 1;
-        }
-    }
-    matches
+    let plain: Vec<char> = chars.iter().map(|character| character.ch).collect();
+    pdf_core::text_match::find_matches(query, &plain)
 }
 
 #[cfg(test)]
@@ -272,6 +276,21 @@ mod tests {
         assert_eq!(search.current, 0);
         assert!(search.next(false));
         assert_eq!(search.current, 1);
+    }
+
+    #[test]
+    fn chinese_query_matches_spaced_characters() {
+        // 排版软件常在汉字之间插空格：查询「汉字」要命中「汉 字」，
+        // 区间仍用原字符下标，高亮才能盖住中间的空格。
+        let mut search = SearchState {
+            open: true,
+            query: "汉字".into(),
+            ..Default::default()
+        };
+        search.recompute(&chars("汉 字 之 间"), 0);
+        assert_eq!(search.matches.len(), 1);
+        assert_eq!(*search.matches[0].start(), 0);
+        assert_eq!(*search.matches[0].end(), 2);
     }
 
     #[test]

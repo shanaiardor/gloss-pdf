@@ -9,6 +9,7 @@
 //!   `ElementInputHandler` 交给窗口。
 
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use gpui::{
     Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
@@ -20,6 +21,9 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::theme::Theme;
+
+/// 光标闪烁的一个完整周期：前半周期显示、后半周期隐藏，各 500ms。
+const CARET_BLINK_PERIOD: Duration = Duration::from_millis(1000);
 
 gpui::actions!(
     text_input,
@@ -304,6 +308,8 @@ pub(crate) struct TextInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    /// 闪烁相位起点：每次输入/移动光标都重置，保证「刚打完字光标一定是亮的」。
+    caret_reset_at: Instant,
 }
 
 impl TextInput {
@@ -322,6 +328,7 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            caret_reset_at: Instant::now(),
         }
     }
 
@@ -332,6 +339,7 @@ impl TextInput {
     /// 外层同步内容（例如词典窗口回填当前词），不会发出 `Changed`。
     pub fn set_value(&mut self, value: impl AsRef<str>, cx: &mut Context<Self>) {
         if self.field.set_content(value.as_ref()) {
+            self.reset_caret();
             cx.notify();
         }
     }
@@ -347,6 +355,7 @@ impl TextInput {
     /// 直接插入文本（外层在没有焦点时也能往里写）。
     pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if self.field.insert(text) {
+            self.reset_caret();
             cx.notify();
             cx.emit(TextInputEvent::Changed);
         }
@@ -354,6 +363,7 @@ impl TextInput {
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         if self.field.clear() {
+            self.reset_caret();
             cx.notify();
             cx.emit(TextInputEvent::Changed);
         }
@@ -361,10 +371,22 @@ impl TextInput {
 
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
         self.field.select_all();
+        self.reset_caret();
         cx.notify();
     }
 
+    /// 让闪烁相位从「可见」重新开始；输入、移动光标、点击定位都要调。
+    fn reset_caret(&mut self) {
+        self.caret_reset_at = Instant::now();
+    }
+
+    /// 当前闪烁相位（0..1）。
+    fn caret_phase(&self) -> f32 {
+        caret_phase(self.caret_reset_at.elapsed())
+    }
+
     fn notify_changed(&mut self, cx: &mut Context<Self>) {
+        self.reset_caret();
         cx.notify();
         cx.emit(TextInputEvent::Changed);
     }
@@ -401,37 +423,44 @@ impl TextInput {
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
         self.field.move_left();
+        self.reset_caret();
         cx.notify();
     }
 
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
         self.field.move_right();
+        self.reset_caret();
         cx.notify();
     }
 
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.field.select_left();
+        self.reset_caret();
         cx.notify();
     }
 
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
         self.field.select_right();
+        self.reset_caret();
         cx.notify();
     }
 
     fn select_all_action(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.field.select_all();
+        self.reset_caret();
         cx.notify();
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
         self.field.move_to(0);
+        self.reset_caret();
         cx.notify();
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
         let end = self.field.content().len();
         self.field.move_to(end);
+        self.reset_caret();
         cx.notify();
     }
 
@@ -510,6 +539,7 @@ impl TextInput {
         } else {
             self.field.move_to(index);
         }
+        self.reset_caret();
         cx.notify();
     }
 
@@ -524,6 +554,7 @@ impl TextInput {
         }
         let index = self.index_for_position(event.position);
         self.field.select_to(index);
+        self.reset_caret();
         cx.notify();
     }
 
@@ -650,6 +681,16 @@ struct TextElement {
     input: gpui::Entity<TextInput>,
 }
 
+/// 从相位起点算起过了 `elapsed` 时的闪烁相位。
+fn caret_phase(elapsed: Duration) -> f32 {
+    (elapsed.as_secs_f32() / CARET_BLINK_PERIOD.as_secs_f32()) % 1.0
+}
+
+/// 闪烁相位 → 光标是否可见：前半周期显示，后半周期隐藏。
+fn caret_visible(phase: f32) -> bool {
+    phase < 0.5
+}
+
 struct PrepaintState {
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
@@ -701,6 +742,14 @@ impl Element for TextElement {
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
         let focused = input.focus_handle.is_focused(window);
+        let reduce_motion = cx.reduce_motion();
+        if focused && !reduce_motion {
+            // 只把输入框自己标脏，避免为了闪烁重绘整个窗口。
+            let entity = self.input.clone();
+            window.on_next_frame(move |_window, cx| cx.notify(entity.entity_id()));
+        }
+        // 系统开了「减少动态效果」时不做闪烁，光标常亮。
+        let caret_on = reduce_motion || caret_visible(input.caret_phase());
         let content = input.field.content().to_string();
         let empty = content.is_empty();
         let selection = input.field.selection();
@@ -767,9 +816,8 @@ impl Element for TextElement {
         let (selection_quad, cursor_quad) = if !focused {
             (None, None)
         } else if selection.is_empty() {
-            (
-                None,
-                Some(fill(
+            let quad = caret_on.then(|| {
+                fill(
                     Bounds::new(
                         point(
                             bounds.left() + cursor_x - scroll_x,
@@ -778,8 +826,9 @@ impl Element for TextElement {
                         size(px(1.5), font_size),
                     ),
                     input.theme.accent,
-                )),
-            )
+                )
+            });
+            (None, quad)
         } else {
             (
                 Some(fill(
@@ -894,6 +943,23 @@ mod tests {
         let mut field = TextField::default();
         field.set_content(text);
         field
+    }
+
+    #[test]
+    fn caret_blinks_once_per_half_cycle() {
+        // 前半周期可见、后半周期隐藏，切换点正好在 0.5。
+        assert!(caret_visible(0.0));
+        assert!(caret_visible(0.49));
+        assert!(!caret_visible(0.5));
+        assert!(!caret_visible(0.99));
+    }
+
+    #[test]
+    fn caret_phase_wraps_every_second() {
+        assert_eq!(caret_phase(Duration::ZERO), 0.0);
+        assert!((caret_phase(Duration::from_millis(500)) - 0.5).abs() < f32::EPSILON);
+        assert_eq!(caret_phase(CARET_BLINK_PERIOD), 0.0);
+        assert!((caret_phase(Duration::from_millis(1250)) - 0.25).abs() < f32::EPSILON);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! 词典窗口的界面状态：当前词、加载状态、查询结果。
+//! 词典域：窗口的界面状态（当前词、加载状态、查询结果）与词条清洗。
 
 use dict_core::DictEntry;
 
@@ -64,5 +64,72 @@ impl DictionaryState {
         self.not_found = false;
         self.error = None;
         self.pending_term = None;
+    }
+}
+
+/// 查词前清洗：取第一行、去掉首尾标点与空白、限制长度。
+pub(crate) fn normalize_term(raw: &str) -> String {
+    let term = raw.lines().next().unwrap_or_default().trim();
+    let term = term.trim_matches(is_edge_punctuation);
+    term.chars().take(64).collect()
+}
+
+fn is_edge_punctuation(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '.' | ','
+                | ';'
+                | ':'
+                | '!'
+                | '?'
+                | '"'
+                | '\''
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '('
+                | ')'
+                | '（'
+                | '）'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '《'
+                | '》'
+                | '「'
+                | '」'
+                | '【'
+                | '】'
+                | '。'
+                | '，'
+                | '、'
+                | '；'
+                | '：'
+                | '！'
+                | '？'
+                | '…'
+                | '—'
+                | '–'
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_term_trims_punctuation_and_takes_first_line() {
+        assert_eq!(normalize_term("  \"apple\",\nsecond"), "apple");
+        assert_eq!(normalize_term("（你好）"), "你好");
+        assert_eq!(normalize_term("..."), "");
+    }
+
+    #[test]
+    fn normalize_term_caps_length() {
+        let term = normalize_term(&"a".repeat(100));
+        assert_eq!(term.chars().count(), 64);
     }
 }

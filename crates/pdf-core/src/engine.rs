@@ -11,6 +11,7 @@ use futures::channel::mpsc::UnboundedSender;
 use pdfium_render::prelude::*;
 
 use crate::model::{CharBox, LinkBox, LinkTarget, OutlineItem, PageHits, PageSize, RectPt};
+use crate::text_match::count_matches;
 
 /// 发给 PDF 工作线程的命令。
 pub enum Command {
@@ -49,6 +50,12 @@ pub enum Event {
         request: u64,
         query: String,
         pages: Vec<PageHits>,
+        total: usize,
+    },
+    /// 全文搜索的扫描进度；大文档第一次搜索要提取文本，界面据此显示进度。
+    SearchProgress {
+        request: u64,
+        scanned: usize,
         total: usize,
     },
     Error(String),
@@ -124,12 +131,16 @@ fn worker_loop(commands: Receiver<Command>, events: UnboundedSender<Event>) {
                 let Some(document) = document.as_ref() else {
                     continue;
                 };
-                let result = search_document(document, &mut page_text, &query, request);
+                let result = search_document(document, &mut page_text, &query, request, &events);
                 let _ = events.unbounded_send(result);
             }
         }
     }
 }
+
+/// 每扫描多少页回一次进度。取 8 是为了让进度条在大文档上够跟手，
+/// 又不至于每页都往 UI 线程塞一条消息。
+const SEARCH_PROGRESS_PAGES: usize = 8;
 
 /// 逐页统计命中数。文本按页缓存，第二遍搜索只做字符串比较。
 fn search_document(
@@ -137,6 +148,7 @@ fn search_document(
     cache: &mut Vec<Option<String>>,
     query: &str,
     request: u64,
+    events: &UnboundedSender<Event>,
 ) -> Event {
     let needle = query.to_lowercase();
     let mut pages = Vec::new();
@@ -144,6 +156,13 @@ fn search_document(
 
     if !needle.is_empty() {
         let page_count = document.pages().len() as usize;
+        // 先报 0/N：界面立刻从「搜索中…」切成具体进度。
+        let _ = events.unbounded_send(Event::SearchProgress {
+            request,
+            scanned: 0,
+            total: page_count,
+        });
+
         for index in 0..page_count {
             if cache.len() <= index {
                 cache.resize(index + 1, None);
@@ -171,6 +190,15 @@ fn search_document(
                     count,
                 });
             }
+
+            let scanned = index + 1;
+            if scanned % SEARCH_PROGRESS_PAGES == 0 || scanned == page_count {
+                let _ = events.unbounded_send(Event::SearchProgress {
+                    request,
+                    scanned,
+                    total: page_count,
+                });
+            }
         }
     }
 
@@ -180,23 +208,6 @@ fn search_document(
         pages,
         total,
     }
-}
-
-/// 不重叠地数 `needle` 在 `haystack` 里出现的次数；与 UI 页内匹配的规则一致。
-fn count_matches(haystack: &str, needle: &str) -> usize {
-    if needle.is_empty() {
-        return 0;
-    }
-    let mut count = 0;
-    let mut start = 0;
-    while let Some(found) = haystack[start..].find(needle) {
-        count += 1;
-        start += found + needle.len();
-        if start >= haystack.len() {
-            break;
-        }
-    }
-    count
 }
 
 fn bind_pdfium() -> Result<&'static Pdfium> {
@@ -379,5 +390,10 @@ mod tests {
         assert_eq!(count_matches("汉字里找汉字", "汉字"), 2);
         assert_eq!(count_matches("abc", "x"), 0);
         assert_eq!(count_matches("abc", ""), 0);
+    }
+
+    #[test]
+    fn counts_chinese_hits_across_spaces() {
+        assert_eq!(count_matches("汉 字 与 汉 字", "汉字"), 2);
     }
 }

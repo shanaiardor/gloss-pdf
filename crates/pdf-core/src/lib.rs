@@ -13,6 +13,7 @@
 
 mod engine;
 mod model;
+pub mod text_match;
 
 pub use engine::{Command, Event, PdfEngine};
 pub use model::{CharBox, LinkBox, LinkTarget, OutlineItem, PageHits, PageSize, RectPt};

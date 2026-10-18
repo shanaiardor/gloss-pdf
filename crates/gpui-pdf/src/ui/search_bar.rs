@@ -12,7 +12,11 @@ impl AppState {
         let status = if search.query.is_empty() {
             String::new()
         } else if search.scanning {
-            "搜索中…".to_string()
+            if search.scanned_total > 0 {
+                format!("已扫描 {}/{} 页", search.scanned, search.scanned_total)
+            } else {
+                "搜索中…".to_string()
+            }
         } else if search.total == 0 {
             "无匹配".to_string()
         } else {
