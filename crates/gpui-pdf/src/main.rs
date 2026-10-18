@@ -1,7 +1,9 @@
 ﻿//! 入口：初始化日志，打开主窗口，把错误收敛到日志里。
 
 mod app;
+mod assets;
 mod dictionary;
+mod fonts;
 mod geometry;
 mod highlights;
 mod home;
@@ -28,19 +30,21 @@ fn main() {
     init_logging();
     log::info!("starting gpui-pdf");
 
-    application().run(|cx: &mut App| {
-        cx.on_window_closed(|cx, _window_id| {
-            if cx.windows().is_empty() {
+    application()
+        .with_assets(assets::Assets)
+        .run(|cx: &mut App| {
+            cx.on_window_closed(|cx, _window_id| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+
+            if let Err(error) = open_main_window(cx) {
+                log::error!("failed to open main window: {error:#}");
                 cx.quit();
             }
-        })
-        .detach();
-
-        if let Err(error) = open_main_window(cx) {
-            log::error!("failed to open main window: {error:#}");
-            cx.quit();
-        }
-    });
+        });
 }
 
 fn init_logging() {
@@ -50,6 +54,8 @@ fn init_logging() {
 }
 
 fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
+    fonts::install(cx);
+
     let bounds = Bounds::centered(None, size(px(1040.), px(720.)), cx);
 
     cx.open_window(

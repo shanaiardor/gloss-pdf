@@ -1,6 +1,8 @@
 ﻿//! 浮动界面组件：顶部胶囊、底部胶囊、窗口按钮、拖拽条。
 
-use gpui::{App, ClickEvent, Context, Window, WindowControlArea, div, prelude::*, px, rgb};
+use gpui::{
+    App, ClickEvent, Context, Render, Window, WindowControlArea, div, prelude::*, px, rgb, svg,
+};
 
 use crate::app::AppState;
 use crate::layout::FitMode;
@@ -8,24 +10,7 @@ use crate::theme::Theme;
 
 impl AppState {
     pub(crate) fn floating_top(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
-        let outline_label = if self.outline_open {
-            "目录 ·"
-        } else {
-            "目录"
-        };
         let can_save = !self.viewer.highlights.is_empty();
-
-        let mut save = pill_button(
-            "save",
-            "保存",
-            theme,
-            cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                this.save_highlights(cx);
-            }),
-        );
-        if !can_save {
-            save = save.opacity(0.35);
-        }
 
         let capsule = div()
             .id("floating-top-capsule")
@@ -41,34 +26,46 @@ impl AppState {
             .shadow_lg()
             // 扩大后的顶部拖拽带在胶囊下面，胶囊要挡住命中区。
             .occlude()
-            .child(pill_button(
+            .child(icon_button(
                 "home",
+                "icons/home.svg",
                 "首页",
+                false,
+                true,
                 theme,
                 cx.listener(|this, _event: &ClickEvent, _window, cx| {
                     this.close_document(cx);
                 }),
             ))
-            .child(pill_button(
+            .child(icon_button(
                 "open",
-                "打开",
+                "icons/open.svg",
+                "打开 (Ctrl+O)",
+                false,
+                true,
                 theme,
                 cx.listener(|this, _event: &ClickEvent, window, cx| {
                     this.open_pdf(window, cx);
                 }),
             ))
-            .child(pill_button(
+            .child(icon_button(
                 "outline",
-                outline_label,
+                "icons/outline.svg",
+                "目录 (Ctrl+B)",
+                self.outline_open,
+                true,
                 theme,
                 cx.listener(|this, _event: &ClickEvent, _window, cx| {
                     this.outline_open = !this.outline_open;
                     cx.notify();
                 }),
             ))
-            .child(pill_button(
+            .child(icon_button(
                 "search",
-                "搜索",
+                "icons/search.svg",
+                "搜索 (Ctrl+F)",
+                self.viewer.search.open,
+                true,
                 theme,
                 cx.listener(|this, _event: &ClickEvent, _window, cx| {
                     if this.viewer.search.open {
@@ -79,30 +76,45 @@ impl AppState {
                     cx.notify();
                 }),
             ))
-            .child(pill_button(
+            .child(icon_button(
                 "highlight",
-                "高亮",
+                "icons/highlight.svg",
+                "高亮 (H)",
+                false,
+                true,
                 theme,
                 cx.listener(|this, _event: &ClickEvent, _window, cx| {
                     this.add_highlight(cx);
                 }),
             ))
-            .child(pill_button(
+            .child(icon_button(
                 "dictionary",
-                if self.dictionary_window.is_some() {
-                    "词典 ·"
-                } else {
-                    "词典"
-                },
+                "icons/dictionary.svg",
+                "词典",
+                self.dictionary_window.is_some(),
+                true,
                 theme,
                 cx.listener(|this, _event: &ClickEvent, _window, cx| {
                     this.toggle_dictionary_window(cx);
                 }),
             ))
-            .child(save)
-            .child(pill_button(
+            .child(icon_button(
+                "save",
+                "icons/save.svg",
+                "保存 (Ctrl+S)",
+                false,
+                can_save,
+                theme,
+                cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.save_highlights(cx);
+                }),
+            ))
+            .child(icon_button(
                 "settings",
+                "icons/settings.svg",
                 "设置",
+                self.settings_open,
+                true,
                 theme,
                 cx.listener(|this, _event: &ClickEvent, _window, cx| {
                     this.toggle_settings(cx);
@@ -298,6 +310,80 @@ fn pill_button(
         .hover(move |style| style.bg(hover_bg))
         .on_click(on_click)
         .child(label.into())
+}
+
+/// 顶部胶囊的纯图标按钮：悬停提示 + `aria_label` 补上文字含义。
+fn icon_button(
+    id: &'static str,
+    icon: &'static str,
+    label: &'static str,
+    active: bool,
+    enabled: bool,
+    theme: &Theme,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let hover_bg = theme.surface_hover;
+    let icon_color = if !enabled {
+        theme.text_muted
+    } else if active {
+        theme.accent
+    } else {
+        theme.text
+    };
+    let tooltip_theme = theme.clone();
+
+    let button = div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(28.))
+        .rounded_full()
+        .aria_label(label)
+        .tooltip(move |_window, cx| {
+            cx.new(|_| IconTooltip {
+                label,
+                theme: tooltip_theme.clone(),
+            })
+            .into()
+        })
+        .child(svg().path(icon).size(px(16.)).text_color(icon_color));
+
+    let button = if enabled {
+        button
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover_bg))
+            .on_click(on_click)
+    } else {
+        button.opacity(0.35)
+    };
+
+    if active {
+        button.bg(theme.accent.opacity(0.16))
+    } else {
+        button
+    }
+}
+
+/// 图标按钮的悬停提示，保持原来的文字说明。
+struct IconTooltip {
+    label: &'static str,
+    theme: Theme,
+}
+
+impl Render for IconTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(self.theme.surface)
+            .border_1()
+            .border_color(self.theme.border)
+            .text_size(px(11.))
+            .text_color(self.theme.text_muted)
+            .child(self.label)
+    }
 }
 
 /// 适宽/适页按钮：当前生效的模式用强调色标出来。

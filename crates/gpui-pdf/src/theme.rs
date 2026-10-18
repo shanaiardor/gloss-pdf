@@ -2,19 +2,10 @@
 
 use gpui::{Rgba, SharedString, rgb, rgba};
 
-#[cfg(target_os = "windows")]
-const UI_FONT: &str = "Segoe UI";
-#[cfg(target_os = "macos")]
-const UI_FONT: &str = "SF Pro Text";
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-const UI_FONT: &str = "Noto Sans";
-
-#[cfg(target_os = "windows")]
-const MONO_FONT: &str = "Cascadia Mono";
-#[cfg(target_os = "macos")]
-const MONO_FONT: &str = "SF Mono";
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-const MONO_FONT: &str = "Noto Sans Mono";
+/// 界面默认字体，运行时由 [`crate::fonts`] 注册字体文件。
+const UI_FONT: &str = "LXGW WenKai TC";
+/// 页码、缩放百分比等数字显示用等宽体。
+const MONO_FONT: &str = "LXGW WenKai Mono TC";
 
 /// 一套完整的配色 + 字体。
 #[derive(Clone)]

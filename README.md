@@ -45,6 +45,11 @@ cargo run -p gpui-pdf -- samples/dummy.pdf
 首次编译 GPUI 较慢。`pdfium.dll`（约 7.5 MB）已放在项目根目录，运行时按
 「exe 目录 → 当前目录 → 系统库」顺序查找。
 
+界面默认使用 **LXGW 文楷 TC**。字体不打包在仓库里，启动时从
+`C:\Users\shanay\Downloads\lxgw-wenkai-tc-v1.522` 读取；也可以用
+`GPUI_PDF_FONT_DIR` 指向其他字体目录（需包含 `LXGWWenKaiTC-Regular.ttf`
+和 `LXGWWenKaiMonoTC-Regular.ttf`）。找不到字体时自动回退到系统字体。
+
 ## 快捷键
 
 | 快捷键 | 行为 |
@@ -74,6 +79,8 @@ crates/
 └── gpui-pdf/              # GPUI 应用
     └── src/
         ├── main.rs        # 入口：日志、无边框窗口、命令行参数
+        ├── assets.rs      # 内嵌 SVG 图标
+        ├── fonts.rs       # 启动时加载 LXGW 文楷
         ├── app.rs         # 控制器：引擎事件、键盘/鼠标、生命周期
         ├── layout.rs      # 适宽/适页缩放、页边距、按纸张选择窗口尺寸
         ├── home.rs        # 首页状态：最近阅读持久化、搜索过滤、侧栏选中项
