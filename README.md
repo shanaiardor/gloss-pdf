@@ -111,7 +111,8 @@ pdfium.dll                 # PDFium 动态库（运行时绑定）
 samples/                   # 测试用 PDF（dummy.pdf / colors.pdf）
 ```
 
-分层与“新功能该改哪里”见 [docs/architecture.md](docs/architecture.md)。
+分层与“新功能该改哪里”见 [docs/architecture.md](docs/architecture.md)，待办与优先级见
+[docs/todo.md](docs/todo.md)。
 
 测试：
 
