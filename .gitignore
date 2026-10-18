@@ -4,3 +4,7 @@
 screenshot*.png
 !/docs/screenshot.png
 .workbuddy/
+# 本地工具产物：文档生成目录、会话日志、命令工具配置
+/output/
+/logs/
+.commandcode/
