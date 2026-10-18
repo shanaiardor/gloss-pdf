@@ -292,6 +292,50 @@ mod tests {
     }
 
     #[test]
+    fn finds_chinese_queries_by_character_index() {
+        let text = "这是一段中文，里面有两个汉字，汉字要能找到";
+        let mut search = SearchState {
+            open: true,
+            query: "汉字".into(),
+            ..Default::default()
+        };
+        search.recompute(&chars(text), 0);
+
+        assert_eq!(search.matches.len(), 2);
+
+        // 区间是字符下标，不是字节下标：直接拿去索引 chars/rects 才对得上高亮。
+        let chars: Vec<char> = text.chars().collect();
+        let first = *search.matches[0].start();
+        assert_eq!(chars[first], '汉');
+        assert_eq!(chars[*search.matches[0].end()], '字');
+        let second = *search.matches[1].start();
+        assert_eq!(chars[second], '汉');
+        assert_eq!(chars[*search.matches[1].end()], '字');
+    }
+
+    #[test]
+    fn chinese_query_matches_single_character_repeatedly() {
+        let mut search = SearchState {
+            open: true,
+            query: "字".into(),
+            ..Default::default()
+        };
+        search.recompute(&chars("字字不同字"), 0);
+        assert_eq!(search.matches.len(), 3);
+    }
+
+    #[test]
+    fn chinese_query_does_not_match_out_of_order_characters() {
+        let mut search = SearchState {
+            open: true,
+            query: "字汉".into(),
+            ..Default::default()
+        };
+        search.recompute(&chars("汉字之间"), 0);
+        assert!(search.matches.is_empty());
+    }
+
+    #[test]
     fn empty_query_clears_page_matches() {
         let mut search = SearchState {
             open: true,
