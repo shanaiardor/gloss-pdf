@@ -63,3 +63,10 @@ pub struct OutlineItem {
     pub page: usize,
     pub depth: usize,
 }
+
+/// 全文搜索时某一页的命中数。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageHits {
+    pub page: usize,
+    pub count: usize,
+}

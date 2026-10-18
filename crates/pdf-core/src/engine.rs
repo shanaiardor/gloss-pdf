@@ -10,7 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use futures::channel::mpsc::UnboundedSender;
 use pdfium_render::prelude::*;
 
-use crate::model::{CharBox, LinkBox, LinkTarget, OutlineItem, PageSize, RectPt};
+use crate::model::{CharBox, LinkBox, LinkTarget, OutlineItem, PageHits, PageSize, RectPt};
 
 /// 发给 PDF 工作线程的命令。
 pub enum Command {
@@ -18,6 +18,11 @@ pub enum Command {
     Render {
         page: usize,
         scale: f32,
+        request: u64,
+    },
+    /// 全文搜索：逐页提取文本统计命中数（文本会缓存，重复搜索只算一遍）。
+    Search {
+        query: String,
         request: u64,
     },
 }
@@ -38,6 +43,13 @@ pub enum Event {
         bgra: Vec<u8>,
         chars: Vec<CharBox>,
         links: Vec<LinkBox>,
+    },
+    /// 全文搜索结果：只包含有命中的页，`total` 是全文总命中数。
+    SearchResults {
+        request: u64,
+        query: String,
+        pages: Vec<PageHits>,
+        total: usize,
     },
     Error(String),
 }
@@ -61,6 +73,8 @@ impl PdfEngine {
 fn worker_loop(commands: Receiver<Command>, events: UnboundedSender<Event>) {
     let mut pdfium: Option<&'static Pdfium> = None;
     let mut document: Option<PdfDocument<'static>> = None;
+    // 每页的纯文本，全文搜索用；换文档时清空。
+    let mut page_text: Vec<Option<String>> = Vec::new();
 
     while let Ok(command) = commands.recv() {
         match command {
@@ -79,6 +93,7 @@ fn worker_loop(commands: Receiver<Command>, events: UnboundedSender<Event>) {
                 match open_document(instance, &path) {
                     Ok((opened, pages, outline)) => {
                         document = Some(opened);
+                        page_text.clear();
                         let _ = events.unbounded_send(Event::Opened { path, pages, outline });
                     }
                     Err(error) => {
@@ -105,8 +120,83 @@ fn worker_loop(commands: Receiver<Command>, events: UnboundedSender<Event>) {
                     }
                 }
             }
+            Command::Search { query, request } => {
+                let Some(document) = document.as_ref() else {
+                    continue;
+                };
+                let result = search_document(document, &mut page_text, &query, request);
+                let _ = events.unbounded_send(result);
+            }
         }
     }
+}
+
+/// 逐页统计命中数。文本按页缓存，第二遍搜索只做字符串比较。
+fn search_document(
+    document: &PdfDocument<'static>,
+    cache: &mut Vec<Option<String>>,
+    query: &str,
+    request: u64,
+) -> Event {
+    let needle = query.to_lowercase();
+    let mut pages = Vec::new();
+    let mut total = 0;
+
+    if !needle.is_empty() {
+        let page_count = document.pages().len() as usize;
+        for index in 0..page_count {
+            if cache.len() <= index {
+                cache.resize(index + 1, None);
+            }
+            let text = match &cache[index] {
+                Some(text) => text.clone(),
+                None => {
+                    let extracted = match document.pages().get(index as PdfPageIndex) {
+                        Ok(page) => match page.text() {
+                            Ok(text) => text.all(),
+                            Err(_) => String::new(),
+                        },
+                        Err(_) => String::new(),
+                    };
+                    cache[index] = Some(extracted.clone());
+                    extracted
+                }
+            };
+
+            let count = count_matches(&text.to_lowercase(), &needle);
+            if count > 0 {
+                total += count;
+                pages.push(PageHits {
+                    page: index,
+                    count,
+                });
+            }
+        }
+    }
+
+    Event::SearchResults {
+        request,
+        query: query.to_string(),
+        pages,
+        total,
+    }
+}
+
+/// 不重叠地数 `needle` 在 `haystack` 里出现的次数；与 UI 页内匹配的规则一致。
+fn count_matches(haystack: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(found) = haystack[start..].find(needle) {
+        count += 1;
+        start += found + needle.len();
+        if start >= haystack.len() {
+            break;
+        }
+    }
+    count
 }
 
 fn bind_pdfium() -> Result<&'static Pdfium> {
@@ -275,5 +365,19 @@ fn rect_from_pdfium(rect: PdfRect) -> RectPt {
         bottom: rect.bottom().value,
         right: rect.right().value,
         top: rect.top().value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::count_matches;
+
+    #[test]
+    fn counts_every_non_overlapping_hit() {
+        assert_eq!(count_matches("hello world", "o"), 2);
+        assert_eq!(count_matches("aaaa", "aa"), 2);
+        assert_eq!(count_matches("汉字里找汉字", "汉字"), 2);
+        assert_eq!(count_matches("abc", "x"), 0);
+        assert_eq!(count_matches("abc", ""), 0);
     }
 }

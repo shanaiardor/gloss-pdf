@@ -11,8 +11,8 @@ use dict_core::{
     ImageFormat as DictImageFormat, ImageSpan, Paragraph, Span, SpanStyle, Table, TableCell,
 };
 use gpui::{
-    AnyElement, Context, Div, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Hsla,
-    Image, ImageFormat, ObjectFit, Render, Rgba, StrikethroughStyle, StyledText, TextAlign,
+    AnyElement, Context, Div, Entity, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight,
+    Hsla, Image, ImageFormat, ObjectFit, Render, Rgba, StrikethroughStyle, StyledText, TextAlign,
     TextRun, UnderlineStyle, Window, div, img, point, prelude::*, px, relative,
 };
 
@@ -21,6 +21,7 @@ use gpui::{App, Bounds, MouseButton, MouseDownEvent, Pixels, Point, WindowId};
 
 use crate::dictionary::{DictLoadState, DictionaryView};
 use crate::theme::Theme;
+use crate::ui::text_input::{TextInput, TextInputEvent};
 #[cfg(target_os = "windows")]
 use crate::window_layout::{RectF, snap_origin};
 #[cfg(target_os = "windows")]
@@ -29,6 +30,10 @@ use crate::window_move;
 pub(crate) struct DictionaryWindow {
     view: DictionaryView,
     theme: Theme,
+    /// 查词输入框：双击查词和手动输入共用同一个框。
+    input: Entity<TextInput>,
+    /// 把查询词送回主窗口（查词逻辑和状态都在 `AppState`）。
+    lookup: futures::channel::mpsc::UnboundedSender<String>,
     /// 拖动标题栏时的起点快照（仅 Windows 手动移动窗口时需要）。
     #[cfg(target_os = "windows")]
     drag: Option<WindowDrag>,
@@ -48,18 +53,63 @@ struct WindowDrag {
 struct DictionaryWindowDrag;
 
 impl DictionaryWindow {
-    pub fn new(view: DictionaryView, theme: Theme) -> Self {
+    pub fn new(
+        view: DictionaryView,
+        theme: Theme,
+        lookup: futures::channel::mpsc::UnboundedSender<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new("输入字词，Enter 查词", theme.clone(), 13.0, cx);
+            if !view.word.is_empty() {
+                input.set_value(view.word.clone(), cx);
+            }
+            input
+        });
+
+        cx.subscribe(&input, |this, _input, event: &TextInputEvent, cx| match event {
+            TextInputEvent::Submitted { .. } => this.submit_query(cx),
+            TextInputEvent::Cancelled => {
+                // Esc 清空输入框；释义保持不动，方便继续看。
+                this.input.update(cx, |input, cx| input.clear(cx));
+            }
+            TextInputEvent::Changed => {}
+        })
+        .detach();
+
         Self {
             view,
             theme,
+            input,
+            lookup,
             #[cfg(target_os = "windows")]
             drag: None,
         }
     }
 
+    /// 把输入框里的词送去主窗口查词。
+    fn submit_query(&mut self, cx: &mut Context<Self>) {
+        let term = self.input.read(cx).value().trim().to_string();
+        if term.is_empty() {
+            return;
+        }
+        if self.lookup.unbounded_send(term).is_err() {
+            log::warn!("dictionary lookup channel closed");
+        }
+    }
+
     pub fn apply(&mut self, view: DictionaryView, theme: Theme, cx: &mut Context<Self>) {
         self.view = view;
-        self.theme = theme;
+        self.theme = theme.clone();
+        self.input
+            .update(cx, |input, cx| input.set_theme(theme, cx));
+
+        // 双击查词时把词回填到输入框，方便接着改字继续查。
+        let word = self.view.word.clone();
+        if !word.is_empty() && self.input.read(cx).value() != word {
+            self.input.update(cx, |input, cx| input.set_value(word, cx));
+        }
+
         cx.notify();
     }
 
@@ -217,6 +267,7 @@ impl Render for DictionaryWindow {
             .text_color(theme.text)
             .font_family(theme.font_family.clone())
             .child(self.titlebar(&theme, word, cx))
+            .child(self.query_row(&theme, cx))
             .child(body)
     }
 }
@@ -294,6 +345,54 @@ impl DictionaryWindow {
                         }),
                     )
                     .child("✕"),
+            )
+    }
+
+    /// 查词输入行：手动输入 + 「查」按钮。
+    fn query_row(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let hover = theme.accent_hover;
+
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .h(px(28.))
+                    .px_2()
+                    .rounded_md()
+                    .bg(theme.surface)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(self.input.clone()),
+            )
+            .child(
+                div()
+                    .id("dictionary-submit")
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .h(px(28.))
+                    .px_3()
+                    .rounded_md()
+                    .bg(theme.accent)
+                    .text_color(theme.accent_text)
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .on_click(
+                        cx.listener(|this, _event: &gpui::ClickEvent, _window, cx| {
+                            this.submit_query(cx);
+                        }),
+                    )
+                    .child("查"),
             )
     }
 }

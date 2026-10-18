@@ -21,8 +21,8 @@ mod window_move;
 
 use anyhow::Context as _;
 use gpui::{
-    App, AppContext as _, Bounds, Focusable as _, SharedString, TitlebarOptions, WindowBounds,
-    WindowOptions, px, size,
+    App, AppContext as _, Bounds, Focusable as _, KeyBinding, SharedString, TitlebarOptions,
+    WindowBounds, WindowOptions, px, size,
 };
 use gpui_platform::application;
 
@@ -55,6 +55,7 @@ fn init_logging() {
 
 fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
     fonts::install(cx);
+    bind_text_input_keys(cx);
 
     let bounds = Bounds::centered(None, size(px(1040.), px(720.)), cx);
 
@@ -83,4 +84,36 @@ fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
     cx.activate(true);
     log::info!("main window opened");
     Ok(())
+}
+
+/// 文本输入框的编辑快捷键。
+///
+/// 绑定在 `TextInput` 上下文里，只有输入框获得焦点时生效；这样阅读器的
+/// PageDown / H / Esc 等快捷键不会被输入框抢走，反之输入框也不会被页面的
+/// 快捷键打断。
+fn bind_text_input_keys(cx: &mut App) {
+    use ui::text_input::{
+        Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft,
+        SelectRight,
+    };
+
+    let context = Some("TextInput");
+    cx.bind_keys([
+        KeyBinding::new("backspace", Backspace, context),
+        KeyBinding::new("delete", Delete, context),
+        KeyBinding::new("left", Left, context),
+        KeyBinding::new("right", Right, context),
+        KeyBinding::new("shift-left", SelectLeft, context),
+        KeyBinding::new("shift-right", SelectRight, context),
+        KeyBinding::new("home", Home, context),
+        KeyBinding::new("end", End, context),
+        KeyBinding::new("ctrl-a", SelectAll, context),
+        KeyBinding::new("cmd-a", SelectAll, context),
+        KeyBinding::new("ctrl-c", Copy, context),
+        KeyBinding::new("cmd-c", Copy, context),
+        KeyBinding::new("ctrl-x", Cut, context),
+        KeyBinding::new("cmd-x", Cut, context),
+        KeyBinding::new("ctrl-v", Paste, context),
+        KeyBinding::new("cmd-v", Paste, context),
+    ]);
 }
