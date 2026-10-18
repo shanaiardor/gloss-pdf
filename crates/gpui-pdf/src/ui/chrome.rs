@@ -69,11 +69,10 @@ impl AppState {
                 theme,
                 cx.listener(|this, _event: &ClickEvent, _window, cx| {
                     if this.viewer.search.open {
-                        this.viewer.search.close();
+                        this.close_search(cx);
                     } else {
-                        this.viewer.search.open = true;
+                        this.open_search(cx);
                     }
-                    cx.notify();
                 }),
             ))
             .child(icon_button(
@@ -85,6 +84,17 @@ impl AppState {
                 theme,
                 cx.listener(|this, _event: &ClickEvent, _window, cx| {
                     this.add_highlight(cx);
+                }),
+            ))
+            .child(icon_button(
+                "annotations",
+                "icons/annotations.svg",
+                "批注 (Ctrl+H)",
+                self.highlight_panel_open,
+                true,
+                theme,
+                cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.toggle_highlight_panel(cx);
                 }),
             ))
             .child(icon_button(

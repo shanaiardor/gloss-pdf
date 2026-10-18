@@ -18,6 +18,7 @@ image.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+unicode-segmentation.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6"

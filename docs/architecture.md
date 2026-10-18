@@ -17,6 +17,7 @@
 │  selection.rs / search.rs / highlights.rs     │
 │  geometry.rs 纯几何工具                        │
 │  ui/*        纯呈现（impl AppState）           │
+│  ui/text_input.rs 单行输入框实体（IME）        │
 └───────────────┬─────────────────────────────┘
                 │ Command / Event（mpsc channel）
 ┌───────────────▼─────────────────────────────┐
@@ -39,7 +40,7 @@
 
 | 模块 | 负责 | 不负责 |
 |---|---|---|
-| `pdf-core::engine` | PDFium 生命周期、线程、渲染成 BGRA、文本/链接/目录提取 | 布局、坐标换算、交互 |
+| `pdf-core::engine` | PDFium 生命周期、线程、渲染成 BGRA、文本/链接/目录提取、全文搜索计数 | 布局、坐标换算、交互 |
 | `pdf-core::model` | UI 无关的数据类型 | 任何 GPUI 类型 |
 | `dict-core::engine` | MDX 线程、加载词典、查询与重定向、读取同名/拆分 MDD、外置 CSS 和字体 | 渲染、设置读写 |
 | `dict-core::css` | 用 `lightningcss` 解析样式表，用 `kuchiki`/Servo selectors 匹配选择器，做层叠与继承 | 元素布局、绘制 |
@@ -55,9 +56,11 @@
 | `layout` | 页边距、适宽/适页缩放、按纸张比例算窗口尺寸 | 绘制、窗口 API |
 | `viewer::Viewer` | 当前文档、页、缩放、滚动、页面缓存，恢复阅读位置，聚合 selection/search/highlights | GPUI 事件 |
 | `selection` | 锚点/焦点、矩形合并、复制文本、双击选词 | 绘制 |
-| `search` | 查询、匹配区间、当前匹配循环 | 输入法/键盘 |
-| `highlights` | 高亮模型、sidecar JSON 读写 | 屏幕坐标 |
+| `search` | 本页匹配区间、全文各页命中数、跨页跳转的目标（页 + 页内序号） | 键盘输入、绘制 |
+| `highlights` | 高亮模型（稳定 `id` + 选中文字）、sidecar JSON 读写、删除 | 屏幕坐标 |
 | `geometry` | 矩形合并等纯函数 | — |
+| `ui::text_input` | 单行输入框：IME 组合、选区、光标绘制、编辑 action | 业务语义（搜什么、查什么） |
+| `ui::annotations` | 批注侧栏：高亮列表、跳页、删除 | 持久化（走 `AppState`） |
 | `ui::home` | 首页布局：侧栏、顶栏搜索、拖拽区、最近阅读卡片 | 磁盘写入 |
 | `ui::chrome` | 顶部/底部浮动胶囊、窗口按钮、拖拽条 | 状态变更 |
 | `ui::page` | 滚动容器、页面位图、覆盖层、链接热区 | 命中测试 |
@@ -81,6 +84,13 @@
 7. 加载词典时 worker 会同时打开同名 `.mdd` 和拆分的 `.1.mdd` / `.2.mdd`，读取 MDX 头部描述里引用的外置 CSS，
    把 `@font-face` 的 WOFF 解包成 sfnt 后通过 `Event::Loaded` 交给 UI 注册到 GPUI 文本系统。
    每条释义的 HTML/CSS 都在 worker 里转成 `Block`，UI 只负责把 run、表格和图片画出来。
+8. 文本输入走平台输入通道：`ui::text_input` 在 paint 时把 `ElementInputHandler` 挂到窗口，
+   IME/键盘的字符通过 `replace_text_in_range` / `replace_and_mark_text_in_range` 落到
+   `TextField`；输入框把 `Changed` / `Submitted` / `Cancelled` 作为事件抛给外层实体。
+   `AppState` 订阅后同步 `viewer.search.query`，`DictionaryWindow` 订阅后把词发回主窗口查词。
+9. 全文搜索：输入变化 → `Command::Search` → worker 逐页提取文本（按页缓存）并统计命中 →
+   `Event::SearchResults` 回每页命中数。`Enter` 用全局序号换算出「页 + 页内序号」，
+   跨页时先 `set_page`，等 `Event::Rendered` 带回字符数据后再定位页内第 N 个匹配。
 
 约束：
 
@@ -101,15 +111,17 @@
 | 新的阅读状态（如连续滚动位置、阅读进度） | `progress.rs`（模型）+ `viewer.rs`（恢复）+ `app.rs`（采样与落盘） |
 | 新的文本交互（选区扩展、按词移动） | `selection.rs` + `app.rs` 的鼠标处理 |
 | 词典 / 查词 / 多词典 | `dict-core`（解析与查询）+ `dictionary.rs` + `ui::dictionary` + `settings.rs` |
-| 新的搜索能力（全文、正则） | `search.rs` + `pdf-core`（跨页搜索要新增 Command/Event） |
-| 新批注类型（下划线、便签） | `highlights.rs` 泛化为 `annotations.rs` |
+| 新的搜索能力（正则、高亮全部、结果列表） | `search.rs` + `pdf-core`（计数逻辑在 worker） |
+| 新的输入框（跳页、重命名批注） | 复用 `ui::text_input`，外层订阅 `TextInputEvent` |
+| 新批注类型（下划线、便签） | `highlights.rs` 泛化为 `annotations.rs` + `ui::annotations` |
 | 表单填写 | `pdf-core` 新增 Form API + `viewer` 状态 + `ui` 控件 |
 | 缩略图/连续多页 | `pdf-core` 增加低分辨率渲染命令 + `ui::page` 改为多页列表 |
 | 新的 PDF 后端（MuPDF 等） | 实现与 `PdfEngine` 相同的 Command/Event 契约 |
 
 ## 测试
 
-- 纯逻辑（`layout`、`selection`、`search`、`progress`、`home`、`viewer` 的进度恢复）有单元测试：
+- 纯逻辑（`layout`、`selection`、`search`、`progress`、`home`、`viewer` 的进度恢复、
+  `ui::text_input` 的 `TextField`、`highlights` 的 id/删除）有单元测试：
   `cargo test -p gpui-pdf`。
 - `dict-core` 有 CSS 层叠、选择器/伪元素、表格、图片、字体路径的单元测试：`cargo test -p dict-core`。
 - 真实词典回归测试默认忽略，需要指向《王力古漢語字典》的 `.mdx`：

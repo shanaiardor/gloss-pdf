@@ -242,37 +242,8 @@ impl AppState {
     // ---------- 顶栏搜索 ----------
 
     fn home_topbar(&self, colors: HomeColors, cx: &mut Context<Self>) -> gpui::Div {
-        let query = self.home.query.clone();
         let focused = self.home.search_focused;
-        let empty = query.is_empty();
         let search_width = (f32::from(self.viewport.width) - 168.0 - 64.0).clamp(200.0, 380.0);
-        let text_color = if empty {
-            colors.text.opacity(0.78)
-        } else {
-            colors.text
-        };
-
-        let mut text = div()
-            .h_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(px(13.))
-            .text_color(text_color)
-            .child(if empty {
-                "极简 PDF".to_string()
-            } else {
-                query.clone()
-            });
-
-        if empty {
-            text = text.justify_center();
-        } else {
-            text = text.justify_start().pl(px(34.));
-            if focused {
-                text = text.child(div().ml(px(1.)).w(px(1.)).h(px(14.)).bg(colors.text));
-            }
-        }
 
         let search = div()
             .id("home-search")
@@ -293,10 +264,10 @@ impl AppState {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                 this.open_dropped(paths.paths(), cx);
             }))
-            .on_click(cx.listener(|this, _event: &ClickEvent, window, cx| {
+            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                 this.home.search_focused = true;
                 this.home.menu_open = None;
-                window.focus(&this.focus_handle, cx);
+                this.pending_focus = Some(crate::app::FocusTarget::HomeSearch);
                 cx.notify();
             }))
             .child(
@@ -326,7 +297,16 @@ impl AppState {
                             .bg(colors.muted),
                     ),
             )
-            .child(text);
+            .child(
+                div()
+                    .pl(px(30.))
+                    .pr(px(10.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .w_full()
+                    .child(self.home_input.clone()),
+            );
 
         div()
             .h(px(46.))

@@ -15,4 +15,4 @@ mod engine;
 mod model;
 
 pub use engine::{Command, Event, PdfEngine};
-pub use model::{CharBox, LinkBox, LinkTarget, OutlineItem, PageSize, RectPt};
+pub use model::{CharBox, LinkBox, LinkTarget, OutlineItem, PageHits, PageSize, RectPt};

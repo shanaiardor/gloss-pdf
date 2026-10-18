@@ -1,4 +1,4 @@
-//! 浮动搜索框。
+//! 浮动搜索框：输入框本体由 [`crate::ui::text_input`] 绘制，这里只做外框和命中状态。
 
 use gpui::{div, prelude::*, px};
 
@@ -8,20 +8,18 @@ use crate::theme::Theme;
 impl AppState {
     pub(crate) fn search_overlay(&self, theme: &Theme) -> gpui::Div {
         let search = &self.viewer.search;
-        let result = if search.matches.is_empty() {
+
+        let status = if search.query.is_empty() {
             String::new()
+        } else if search.scanning {
+            "搜索中…".to_string()
+        } else if search.total == 0 {
+            "无匹配".to_string()
         } else {
-            format!("{}/{}", search.current + 1, search.matches.len())
-        };
-        let display = if search.query.is_empty() {
-            "输入关键词，Enter 下一个".to_string()
-        } else {
-            search.query.clone()
-        };
-        let color = if search.query.is_empty() {
-            theme.text_muted
-        } else {
-            theme.text
+            match search.hit_position() {
+                Some((index, total)) => format!("{index}/{total}"),
+                None => format!("全文 {}", search.total),
+            }
         };
 
         let bar = div()
@@ -37,9 +35,20 @@ impl AppState {
             .border_color(theme.accent)
             .shadow_lg()
             .text_size(px(13.))
-            .child(div().text_color(theme.text_muted).child("搜索"))
-            .child(div().flex_1().text_color(color).child(display))
-            .child(div().text_color(theme.text_muted).child(result));
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(theme.text_muted)
+                    .child("搜索"),
+            )
+            .child(self.search_input.clone())
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(12.))
+                    .text_color(theme.text_muted)
+                    .child(status),
+            );
 
         div()
             .absolute()

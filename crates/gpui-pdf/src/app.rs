@@ -8,10 +8,10 @@ use std::time::Duration;
 use dict_core::{Command as DictCommand, DictEngine, Event as DictEvent};
 use futures::StreamExt;
 use gpui::{
-    AnyWindowHandle, App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Point, Render,
-    RenderImage, Size, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions, div,
-    point, prelude::*, px, size,
+    AnyWindowHandle, App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
+    Point, Render, RenderImage, Size, TitlebarOptions, Window, WindowBounds, WindowHandle,
+    WindowOptions, div, point, prelude::*, px, size,
 };
 use pdf_core::{Command, Event, LinkTarget, PageSize, PdfEngine};
 
@@ -26,6 +26,7 @@ use crate::progress::{ReadingProgress, unix_now};
 use crate::settings::SettingsStore;
 use crate::theme::Theme;
 use crate::ui::dictionary::DictionaryWindow;
+use crate::ui::text_input::{TextInput, TextInputEvent};
 use crate::viewer::{Document, PageData, Viewer, scroll_offset_for_ratio};
 
 pub(crate) use crate::layout::{BOTTOM_INSET, PAGE_PAD, TOP_INSET};
@@ -152,15 +153,28 @@ fn is_edge_punctuation(ch: char) -> bool {
         )
 }
 
+/// 输入框需要焦点时，交给下一次 `render` 去设置（事件回调里拿不到 `Window`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FocusTarget {
+    Root,
+    Search,
+    HomeSearch,
+}
+
 pub struct AppState {
     pub(crate) theme: Theme,
     pub(crate) focus_handle: FocusHandle,
     pub(crate) engine: std::sync::mpsc::Sender<Command>,
     pub(crate) viewer: Viewer,
     pub(crate) home: HomeState,
+    pub(crate) search_input: Entity<TextInput>,
+    pub(crate) home_input: Entity<TextInput>,
+    pub(crate) pending_focus: Option<FocusTarget>,
     pub(crate) settings: SettingsStore,
     pub(crate) settings_open: bool,
     pub(crate) dict: DictEngine,
+    /// 词典窗口里手动输入查词时，把词送回主窗口。
+    dict_query: futures::channel::mpsc::UnboundedSender<String>,
     pub(crate) dictionary: DictionaryState,
     /// 独立词典窗口；关闭后保留的句柄会在下一次同步时清掉。
     pub(crate) dictionary_window: Option<WindowHandle<DictionaryWindow>>,
@@ -170,7 +184,11 @@ pub struct AppState {
     pub(crate) viewport: Size<gpui::Pixels>,
     pub(crate) scale_factor: f32,
     pub(crate) request_id: u64,
+    /// 全文搜索的请求代号，用来丢掉过期结果。
+    search_request_id: u64,
     pub(crate) outline_open: bool,
+    /// 批注（高亮）侧栏是否展开。
+    pub(crate) highlight_panel_open: bool,
     pub(crate) status: String,
     pub(crate) status_version: u64,
     /// 当前文档上一次采样到的阅读位置，用来跳过重复写盘。
@@ -232,6 +250,20 @@ impl AppState {
             dictionary.load_state = DictLoadState::Loading;
         }
 
+        // 词典窗口自己也有输入框：它只负责把词发回来，查词状态仍由主窗口维护。
+        let (dict_query, mut dict_query_rx) = futures::channel::mpsc::unbounded::<String>();
+        cx.spawn(async move |this, cx| {
+            while let Some(term) = dict_query_rx.next().await {
+                if this
+                    .update(cx, |this, cx| this.lookup_word(term, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         // 页内滚动不会触发专门的事件，按固定间隔采样，空闲时立即停手。
         cx.spawn(async move |this, cx| {
             loop {
@@ -279,15 +311,54 @@ impl AppState {
         })
         .detach();
 
+        let search_input = cx.new(|cx| {
+            TextInput::new("输入关键词，Enter 下一个", theme.clone(), 13.0, cx)
+        });
+        let home_input = cx.new(|cx| TextInput::new("极简 PDF", theme.clone(), 13.0, cx));
+
+        cx.subscribe(&search_input, |this, _input, event: &TextInputEvent, cx| {
+            match event {
+                TextInputEvent::Changed => {
+                    this.viewer.search.query = this.search_input.read(cx).value().to_string();
+                    this.on_search_query_changed(cx);
+                }
+                TextInputEvent::Submitted { forward } => this.next_match(*forward, cx),
+                TextInputEvent::Cancelled => this.close_search(cx),
+            }
+        })
+        .detach();
+
+        cx.subscribe(&home_input, |this, _input, event: &TextInputEvent, cx| {
+            match event {
+                TextInputEvent::Changed => {
+                    this.home.query = this.home_input.read(cx).value().to_string();
+                    this.home.search_focused = true;
+                    this.home.menu_open = None;
+                    cx.notify();
+                }
+                TextInputEvent::Submitted { .. } => {
+                    if let Some(index) = this.home.filtered().first().copied() {
+                        this.open_recent(index, cx);
+                    }
+                }
+                TextInputEvent::Cancelled => this.clear_home_query(cx),
+            }
+        })
+        .detach();
+
         Self {
             theme,
             focus_handle: cx.focus_handle(),
             engine,
             viewer: Viewer::new(),
             home: HomeState::load(),
+            search_input,
+            home_input,
+            pending_focus: None,
             settings,
             settings_open: false,
             dict,
+            dict_query,
             dictionary,
             dictionary_window: None,
             main_window_bounds: None,
@@ -298,7 +369,9 @@ impl AppState {
             },
             scale_factor: 1.0,
             request_id: 0,
+            search_request_id: 0,
             outline_open: false,
+            highlight_panel_open: false,
             status: String::new(),
             status_version: 0,
             last_progress: None,
@@ -445,7 +518,6 @@ impl AppState {
         };
         self.home.menu_open = None;
         self.home.search_focused = false;
-
         if !recent.path.is_file() {
             self.home.remove(index);
             self.set_status("文件已不存在，已从最近阅读移除", cx);
@@ -454,6 +526,15 @@ impl AppState {
         }
 
         self.open_path(recent.path);
+    }
+
+    /// 清空首页筛选（内含让输入框同步清空）。
+    pub(crate) fn clear_home_query(&mut self, cx: &mut Context<Self>) {
+        self.home_input.update(cx, |input, cx| input.clear(cx));
+        self.home.query.clear();
+        self.home.search_focused = false;
+        self.home.menu_open = None;
+        cx.notify();
     }
 
     /// 处理拖进窗口的文件，只接受第一个 PDF。
@@ -479,6 +560,11 @@ impl AppState {
         self.theme = self.theme.clone().toggled();
         self.settings.current.dark = self.theme.dark;
         self.settings.save();
+        let theme = self.theme.clone();
+        self.search_input
+            .update(cx, |input, cx| input.set_theme(theme.clone(), cx));
+        self.home_input
+            .update(cx, |input, cx| input.set_theme(theme, cx));
         self.sync_dictionary_window(cx);
         self.set_status(format!("主题：{}", self.theme.name()), cx);
         cx.notify();
@@ -674,8 +760,6 @@ impl AppState {
             }
         }
 
-        let view = DictionaryView::from(&self.dictionary);
-        let theme = self.theme.clone();
         let bounds = match (self.main_window_bounds, self.display_bounds) {
             (Some(main), Some(display)) => {
                 let work = rect_f(display);
@@ -709,8 +793,12 @@ impl AppState {
             ..Default::default()
         };
 
+        let view = DictionaryView::from(&self.dictionary);
+        let theme = self.theme.clone();
+        let dict_query = self.dict_query.clone();
+
         match cx.open_window(options, move |_window, cx| {
-            cx.new(|_cx| DictionaryWindow::new(view, theme))
+            cx.new(|cx| DictionaryWindow::new(view, theme, dict_query, cx))
         }) {
             Ok(handle) => {
                 self.dictionary_window = Some(handle);
@@ -929,6 +1017,8 @@ impl AppState {
     pub(crate) fn close_document(&mut self, cx: &mut Context<Self>) {
         self.flush_progress();
         self.viewer.close();
+        self.search_input.update(cx, |input, cx| input.clear(cx));
+        self.pending_focus = Some(FocusTarget::Root);
         self.last_progress = None;
         self.outline_open = false;
         self.settings_open = false;
@@ -937,6 +1027,7 @@ impl AppState {
         self.home.menu_open = None;
         self.home.search_focused = false;
         self.home.query.clear();
+        self.home_input.update(cx, |input, cx| input.clear(cx));
         self.pending_window_fit = None;
         self.pending_window_resize = self.reader_window_size.take();
         cx.notify();
@@ -965,6 +1056,7 @@ impl AppState {
                 self.home.search_focused = false;
                 self.dictionary.clear_results();
                 self.sync_dictionary_window(cx);
+                self.search_input.update(cx, |input, cx| input.clear(cx));
                 self.viewer.reset(
                     Document {
                         path,
@@ -1048,6 +1140,26 @@ impl AppState {
                     self.viewer.page.as_ref().map_or(0, |page| page.chars.len()),
                     self.viewer.page.as_ref().map_or(0, |page| page.links.len())
                 );
+            }
+            Event::SearchResults {
+                request,
+                query,
+                pages,
+                total,
+            } => {
+                if request != self.search_request_id || query != self.viewer.search.query {
+                    return;
+                }
+                self.viewer.search.set_doc_hits(pages, total);
+                // 从当前阅读位置往前找：第一次 Enter 跳到本页或之后的第一处命中。
+                self.viewer.search.rewind_to(self.viewer.current_page);
+                log::debug!(
+                    "full-text search for {:?}: {} hits on {} pages",
+                    query,
+                    total,
+                    self.viewer.search.pages.len()
+                );
+                cx.notify();
             }
             Event::Error(message) => {
                 log::error!("{message}");
@@ -1162,9 +1274,49 @@ impl AppState {
         }
 
         let page = self.viewer.current_page;
-        self.viewer.highlights.add(page, rects);
-        self.set_status("已添加高亮，Ctrl+S 保存", cx);
+        let text = self
+            .viewer
+            .selection
+            .text(self.viewer.chars())
+            .unwrap_or_default();
+        let added = self.viewer.highlights.add(page, rects, text).is_some();
+        if added {
+            self.set_status("已添加高亮，Ctrl+S 保存", cx);
+        }
         cx.notify();
+    }
+
+    /// 批注侧栏开关。
+    pub(crate) fn toggle_highlight_panel(&mut self, cx: &mut Context<Self>) {
+        self.highlight_panel_open = !self.highlight_panel_open;
+        if self.highlight_panel_open {
+            self.outline_open = false;
+        }
+        cx.notify();
+    }
+
+    /// 删除一条高亮并立即写盘，避免下次打开又冒出来。
+    pub(crate) fn delete_highlight(&mut self, id: u64, cx: &mut Context<Self>) {
+        if !self.viewer.highlights.remove(id) {
+            return;
+        }
+        match self.persist_highlights() {
+            Ok(()) => self.set_status("已删除高亮", cx),
+            Err(error) => self.set_status(format!("删除后保存失败: {error}"), cx),
+        }
+        cx.notify();
+    }
+
+    /// 写 sidecar，不弹提示。
+    fn persist_highlights(&self) -> Result<(), String> {
+        let Some(doc) = &self.viewer.doc else {
+            return Ok(());
+        };
+        let path = sidecar_path(&doc.path);
+        self.viewer
+            .highlights
+            .save(&path)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn save_highlights(&mut self, cx: &mut Context<Self>) {
@@ -1173,13 +1325,18 @@ impl AppState {
             cx.notify();
             return;
         }
-        let Some(doc) = &self.viewer.doc else {
-            return;
-        };
-        let path = sidecar_path(&doc.path);
 
-        match self.viewer.highlights.save(&path) {
-            Ok(()) => self.set_status(format!("高亮已保存到 {}", path.display()), cx),
+        match self.persist_highlights() {
+            Ok(()) => {
+                let path = self
+                    .viewer
+                    .doc
+                    .as_ref()
+                    .map(|doc| sidecar_path(&doc.path))
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                self.set_status(format!("高亮已保存到 {path}"), cx);
+            }
             Err(error) => self.set_status(format!("保存高亮失败: {error}"), cx),
         }
         cx.notify();
@@ -1192,16 +1349,77 @@ impl AppState {
             .as_ref()
             .map(|page| page.chars.as_slice())
             .unwrap_or_default();
-        let message = self.viewer.search.recompute(chars);
-        if let Some(message) = message {
-            self.set_status(message, cx);
+        let page = self.viewer.current_page;
+        self.viewer.search.recompute(chars, page);
+        cx.notify();
+    }
+
+    /// 打开搜索浮层并把焦点交给输入框。
+    pub(crate) fn open_search(&mut self, cx: &mut Context<Self>) {
+        self.viewer.search.open = true;
+        self.outline_open = false;
+        let value = self.viewer.search.query.clone();
+        self.search_input.update(cx, |input, cx| {
+            input.set_value(value, cx);
+            input.select_all(cx);
+        });
+        self.pending_focus = Some(FocusTarget::Search);
+        cx.notify();
+    }
+
+    /// 关闭搜索：清空查询、把焦点还给页面，页面快捷键恢复。
+    pub(crate) fn close_search(&mut self, cx: &mut Context<Self>) {
+        self.viewer.search.close();
+        self.search_input.update(cx, |input, cx| input.clear(cx));
+        self.pending_focus = Some(FocusTarget::Root);
+        cx.notify();
+    }
+
+    /// 查询串变化：先算本页匹配，再请 worker 统计全文。
+    pub(crate) fn on_search_query_changed(&mut self, cx: &mut Context<Self>) {
+        self.recompute_matches(cx);
+        self.request_doc_search(cx);
+    }
+
+    fn request_doc_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.viewer.search.query.clone();
+        self.search_request_id = self.search_request_id.wrapping_add(1);
+
+        if query.is_empty() {
+            self.viewer.search.clear_results();
+            cx.notify();
+            return;
         }
+
+        self.viewer.search.scanning = true;
+        let _ = self.engine.send(Command::Search {
+            query,
+            request: self.search_request_id,
+        });
+        cx.notify();
     }
 
     fn next_match(&mut self, forward: bool, cx: &mut Context<Self>) {
-        if !self.viewer.search.next(forward) {
-            self.set_status("本页无匹配", cx);
+        // 全文结果优先：能跨页跳。
+        if let Some((page, _local)) = self.viewer.search.next_doc(forward) {
+            if page != self.viewer.current_page {
+                self.set_page(page, cx);
+            } else {
+                self.recompute_matches(cx);
+            }
+            cx.notify();
+            return;
         }
+
+        if self.viewer.search.next(forward) {
+            cx.notify();
+            return;
+        }
+
+        if self.viewer.search.query.is_empty() {
+            return;
+        }
+        self.set_status("没有匹配", cx);
         cx.notify();
     }
 
@@ -1278,6 +1496,23 @@ impl AppState {
         let keystroke = &event.keystroke;
         let control = keystroke.modifiers.control || keystroke.modifiers.platform;
 
+        // 搜索框有焦点时，字符输入归 TextInput，这里只处理 Ctrl+F（全选便于改写）；
+        // 带 Ctrl 的全局快捷键继续放行。
+        if self
+            .home_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+        {
+            if control && keystroke.key.eq_ignore_ascii_case("f") {
+                self.home_input.update(cx, |input, cx| input.select_all(cx));
+                return;
+            }
+            if !control {
+                return;
+            }
+        }
+
         if control {
             match keystroke.key.as_str() {
                 "o" => self.open_pdf(window, cx),
@@ -1289,6 +1524,7 @@ impl AppState {
                 }
                 "f" => {
                     self.home.search_focused = true;
+                    self.pending_focus = Some(FocusTarget::HomeSearch);
                     self.set_status("输入关键词筛选最近阅读，Esc 清空", cx);
                     cx.notify();
                 }
@@ -1304,16 +1540,9 @@ impl AppState {
                 } else if self.dictionary_window.is_some() {
                     self.close_dictionary_window(cx);
                 } else {
-                    self.home.query.clear();
+                    self.clear_home_query(cx);
                     self.home.menu_open = None;
-                    self.home.search_focused = false;
-                    cx.notify();
-                }
-            }
-            "backspace" => {
-                if self.home.query.pop().is_some() {
-                    self.home.menu_open = None;
-                    cx.notify();
+                    self.pending_focus = Some(FocusTarget::Root);
                 }
             }
             "enter" => {
@@ -1322,13 +1551,16 @@ impl AppState {
                 }
             }
             _ => {
+                // 输入框没焦点时直接打字：先聚焦，再把这一下字符补进去。
                 if let Some(key_char) = &keystroke.key_char
                     && !key_char.chars().all(char::is_control)
                 {
-                    self.home.query.push_str(key_char);
+                    let text = key_char.clone();
                     self.home.search_focused = true;
                     self.home.menu_open = None;
-                    cx.notify();
+                    self.home_input
+                        .update(cx, |input, cx| input.insert_text(&text, cx));
+                    self.pending_focus = Some(FocusTarget::HomeSearch);
                 }
             }
         }
@@ -1343,21 +1575,42 @@ impl AppState {
         let keystroke = &event.keystroke;
         let control = keystroke.modifiers.control || keystroke.modifiers.platform;
 
+        // 搜索框有焦点时，字符输入和编辑键都由 TextInput 处理，这里不能重复处理，
+        // 也不能让 PageDown / H 之类的页面快捷键抢走空格、回车。带 Ctrl 的全局
+        // 快捷键（打开、保存、缩放……）仍然放行。
+        if self.viewer.search.open
+            && self
+                .search_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
+            if control && keystroke.key.eq_ignore_ascii_case("f") {
+                self.close_search(cx);
+                return;
+            }
+            if !control {
+                return;
+            }
+        }
+
+        if control && keystroke.key.eq_ignore_ascii_case("f") {
+            if self.viewer.search.open {
+                self.close_search(cx);
+            } else {
+                self.open_search(cx);
+            }
+            return;
+        }
+
         if self.viewer.search.open {
             match keystroke.key.as_str() {
                 "escape" => {
-                    self.viewer.search.close();
-                    cx.notify();
+                    self.close_search(cx);
                     return;
                 }
                 "enter" => {
                     self.next_match(!keystroke.modifiers.shift, cx);
-                    return;
-                }
-                "backspace" => {
-                    self.viewer.search.query.pop();
-                    self.recompute_matches(cx);
-                    cx.notify();
                     return;
                 }
                 _ => {}
@@ -1373,12 +1626,6 @@ impl AppState {
             match keystroke.key.as_str() {
                 "o" => self.open_pdf(window, cx),
                 "c" => self.copy_selection(cx),
-                "f" => {
-                    self.viewer.search.open = true;
-                    self.set_status("输入关键词，Enter 下一个，Shift+Enter 上一个", cx);
-                    cx.notify();
-                    return;
-                }
                 "=" | "+" => {
                     let zoom = self.viewer.zoom * 1.15;
                     self.set_zoom(zoom, cx);
@@ -1412,6 +1659,10 @@ impl AppState {
                 }
                 "s" => {
                     self.save_highlights(cx);
+                    return;
+                }
+                "h" => {
+                    self.toggle_highlight_panel(cx);
                     return;
                 }
                 "q" => {
@@ -1462,16 +1713,6 @@ impl AppState {
                 }
                 _ => {}
             }
-        }
-
-        if self.viewer.search.open
-            && !control
-            && let Some(key_char) = &keystroke.key_char
-            && !key_char.chars().all(char::is_control)
-        {
-            self.viewer.search.query.push_str(key_char);
-            self.recompute_matches(cx);
-            cx.notify();
         }
     }
 }
@@ -1541,11 +1782,26 @@ impl Render for AppState {
         if let Some(panel) = self.outline_panel(&theme, cx) {
             root = root.child(panel);
         }
+        if let Some(panel) = self.annotations_panel(&theme, cx) {
+            root = root.child(panel);
+        }
         if let Some(panel) = self.settings_panel(&theme, cx) {
             root = root.child(panel);
         }
         if self.viewer.search.open {
             root = root.child(self.search_overlay(&theme));
+        }
+
+        // 焦点只能在拿到 Window 的地方设置；放在帧尾延后执行，避免打断本次绘制。
+        if let Some(target) = self.pending_focus.take() {
+            cx.defer_in(&*window, move |this, window, cx| {
+                let handle = match target {
+                    FocusTarget::Root => this.focus_handle.clone(),
+                    FocusTarget::Search => this.search_input.read(cx).focus_handle(cx),
+                    FocusTarget::HomeSearch => this.home_input.read(cx).focus_handle(cx),
+                };
+                window.focus(&handle, cx);
+            });
         }
 
         root

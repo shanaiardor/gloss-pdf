@@ -27,11 +27,16 @@
 - **首页与最近阅读**：拖拽 PDF 到窗口任意位置即可打开；最近阅读按时间倒序持久化，支持搜索过滤、复制路径、移除记录；卡片显示上次读到的页码与百分比
 - **阅读进度**：页码、页内滚动位置、缩放（或适宽/适页模式）按文件保存，下次打开同一个 PDF 自动恢复；切页、缩放、滚动和退出时都会落盘
 - **文本选择**：鼠标拖选、双击选词、`Ctrl+C` 复制（按行重建换行与空格）
-- **全文搜索**：`Ctrl+F` 输入关键词，本页全部匹配高亮，`Enter` / `Shift+Enter` 切换
+- **全文搜索**：`Ctrl+F` 输入关键词（支持中文输入法），本页全部匹配高亮，同时统计全文命中；
+  `Enter` / `Shift+Enter` 在全文匹配中前后跳转，跨页时直接翻到目标页并定位到那一处
+- **文本输入**：搜索框和词典输入框都是自研的单行输入组件（`EntityInputHandler`），支持
+  输入法组合输入、选区、`Ctrl+A/C/X/V`、鼠标点选与横向滚动
 - **链接跳转**：识别 URI 链接与页内跳转链接，悬停变手型，点击打开/跳页
 - **目录导航**：浮动目录面板，读取 PDF 书签树
-- **高亮批注**：选中文字按 `H` 加高亮，`Ctrl+S` 保存；存在 PDF 旁边的 sidecar JSON，下次打开自动恢复
-- **词典查词**：双击 PDF 中的字词，在独立的无边框词典窗口里按 MDX 自带的 HTML/CSS 渲染释义
+- **高亮批注**：选中文字按 `H` 加高亮，`Ctrl+S` 保存；存在 PDF 旁边的 sidecar JSON，下次打开自动恢复。
+  `Ctrl+H` 打开批注侧栏：按页列出高亮、点击跳页、右侧 ✕ 删除（删除会立即写盘）
+- **词典查词**：双击 PDF 中的字词，或直接在词典窗口里输入（支持中文输入法）后回车，
+  在独立的无边框词典窗口里按 MDX 自带的 HTML/CSS 渲染释义
 - **缩放/主题**：`Ctrl+=` / `Ctrl+-` 缩放，`Ctrl+0` 适页，`Ctrl+1` 适宽；`Ctrl+D` 深/浅色切换
 
 ## 运行
@@ -56,9 +61,10 @@ cargo run -p gpui-pdf -- samples/dummy.pdf
 |---|---|
 | `Ctrl+O` | 打开 PDF |
 | `Ctrl+B` | 显示 / 隐藏目录浮层 |
-| `Ctrl+F` | 首页筛选最近阅读（`Enter` 打开第一条，`Esc` 清空）；阅读器内搜索（`Enter` 下一个，`Shift+Enter` 上一个，`Esc` 关闭） |
+| `Ctrl+F` | 首页筛选最近阅读（`Enter` 打开第一条，`Esc` 清空）；阅读器内全文搜索（`Enter` 下一个，`Shift+Enter` 上一个，`Esc` 关闭） |
 | `Ctrl+C` | 复制选中文本 |
 | `Ctrl+S` | 保存高亮 |
+| `Ctrl+H` | 批注侧栏（高亮列表，可跳转/删除） |
 | `Ctrl+=` / `Ctrl+-` | 放大 / 缩小 |
 | `Ctrl+0` / `Ctrl+1` | 适页（整页可见） / 适宽 |
 | `Ctrl+D` | 切换深色/浅色 |
@@ -74,8 +80,8 @@ Cargo.toml                 # workspace
 crates/
 ├── pdf-core/              # PDF 引擎（不依赖 UI，可单独测试）
 │   └── src/
-│       ├── engine.rs      # PDFium worker：打开、渲染、文本/链接/目录提取
-│       └── model.rs       # RectPt / CharBox / Link / Outline
+│       ├── engine.rs      # PDFium worker：打开、渲染、文本/链接/目录提取、全文搜索
+│       └── model.rs       # RectPt / CharBox / Link / Outline / PageHits
 └── gpui-pdf/              # GPUI 应用
     └── src/
         ├── main.rs        # 入口：日志、无边框窗口、命令行参数
@@ -87,8 +93,8 @@ crates/
         ├── progress.rs    # 阅读进度模型：页码/页内滚动/缩放/适应模式
         ├── viewer.rs      # 阅读器状态：文档/页/缩放/滚动/页面缓存
         ├── selection.rs   # 选区、文本重建、双击选词
-        ├── search.rs      # 页内搜索
-        ├── highlights.rs  # 高亮 + sidecar JSON
+        ├── search.rs      # 搜索状态：本页匹配 + 全文命中 + 跨页跳转
+        ├── highlights.rs  # 高亮 + sidecar JSON（稳定 id、可删除）
         ├── geometry.rs    # 矩形合并等纯函数
         ├── theme.rs       # 配色与字体
         └── ui/            # 纯呈现层
@@ -96,6 +102,8 @@ crates/
             ├── chrome.rs  # 顶部/底部胶囊、窗口按钮、拖拽条
             ├── page.rs    # 滚动容器、页面、覆盖层
             ├── outline.rs # 目录浮层
+            ├── annotations.rs # 批注侧栏：高亮列表、跳转、删除
+            ├── text_input.rs  # 单行输入框：EntityInputHandler + 自定义 Element
             ├── search_bar.rs
             ├── toast.rs
             └── empty.rs
@@ -138,6 +146,14 @@ cargo test -p gpui-pdf
   其他平台继续用系统原生标题栏拖拽。
 - **覆盖层用绝对定位 div**：选区/搜索/高亮用半透明矩形，链接用透明热区；
   文字量不大时比自绘 Element 简单，后续要优化可换成自定义 `Element::paint`。
+- **输入框走平台输入通道**：`ui/text_input.rs` 实现 `EntityInputHandler`，在自定义
+  `Element::paint` 里调 `window.handle_input(...)` 把 `ElementInputHandler` 交给窗口，
+  中文输入法的组合输入由 `replace_and_mark_text_in_range` 落到 `TextField`，绘制时给
+  组合段画下划线。编辑键（Backspace / 方向键 / 剪切复制粘贴）绑在 `TextInput` 上下文里，
+  只有输入框聚焦时生效，不会抢走阅读器的 PageDown / H。
+- **全文搜索在 worker 里做**：worker 按页缓存 `page.text().all()` 的纯文本，只回
+  「每页命中数」；UI 用这些计数把全局序号换算成「第几页第几个匹配」，跳页后等页面
+  字符数据回来，再定位到页内第 N 个匹配并高亮。
 
 ## 数据文件
 
@@ -161,13 +177,18 @@ samples/dummy.pdf.highlights.json
 
 不修改原始 PDF。原因见「已知限制」。
 
+每条高亮带一个稳定的 `id` 和高亮时的选中文字，批注侧栏用它做列表和删除；旧版本只写
+`page` / `rects` 的文件仍可直接读取，加载时会自动补上 `id`。
+
 ## 已知限制 / 下一步
 
-- **搜索框不支持输入法**：现在用 `on_key_down` 的 `key_char` 收集字符，中文 IME 组合输入
-  收不到；需要换成 `EntityInputHandler` 文本输入组件。
+- **全文搜索要先把每页文本过一遍**：第一次搜某个文档时 worker 会逐页调 PDFium 提取文本，
+  大文档开头会有几秒延迟（之后按页缓存在 worker 里，改关键词只重算字符串匹配）。
+  搜索期间搜索框显示「搜索中…」。
 - **高亮没有写进 PDF 标准注释**：PDFium 的公开 C API 不提供 `FPDFAnnot_GenerateAppearance`，
   手工创建的 Highlight 注释缺少 `/AP` 外观流，其他阅读器不一定渲染。因此先用 sidecar 持久化；
   后续可以自己生成 `/AP` Form XObject。
+- **批注只有高亮一种**：下划线、便签、备注文字还没做；侧栏也没有编辑/搜索。
 - **单页视图**：一次显示一页，页内可滚动；没有连续多页滚动、缩略图侧栏。
 - **最近阅读缩略图是占位排版**：没有读取 PDF 首页生成真实缩略图，卡片里的图形只是按路径稳定选择的示意图。
 - **自动调窗口不改变窗口位置**：GPUI 只暴露了改尺寸的接口；窗口靠屏幕下方时会按剩余空间缩小，避免伸出屏幕。
@@ -178,7 +199,7 @@ samples/dummy.pdf.highlights.json
 - `gpui` / `gpui_platform`：锁定 Zed `4bd19937`，Apache-2.0
 - `pdfium-render` 0.9.4：MIT OR Apache-2.0
 - PDFium（`pdfium.dll`）：BSD-3-Clause，另含 freetype / harfbuzz / icu 等第三方组件
-- 其他：`image`、`serde`、`serde_json`、`futures`、`anyhow`、`log`、`env_logger`
+- 其他：`image`、`serde`、`serde_json`、`futures`、`anyhow`、`log`、`env_logger`、`unicode-segmentation`
 
 本项目以 **MIT OR Apache-2.0** 发布：MIT 见 `LICENSE` / `LICENSE-MIT`，Apache-2.0 见 `LICENSE-APACHE`。
 随仓库分发的 `pdfium.dll` 及其第三方许可文本在 `third_party/pdfium/`，

@@ -3,3 +3,4 @@
 *.annotated.pdf
 screenshot*.png
 !/docs/screenshot.png
+.workbuddy/
