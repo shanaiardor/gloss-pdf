@@ -42,7 +42,7 @@ impl AppState {
             .child(icon_button(
                 "open",
                 "icons/open.svg",
-                "打开 (Ctrl+O)",
+                OPEN_LABEL,
                 false,
                 true,
                 theme,
@@ -53,7 +53,7 @@ impl AppState {
             .child(icon_button(
                 "outline",
                 "icons/outline.svg",
-                "目录 (Ctrl+B)",
+                OUTLINE_LABEL,
                 self.outline_open,
                 true,
                 theme,
@@ -65,7 +65,7 @@ impl AppState {
             .child(icon_button(
                 "search",
                 "icons/search.svg",
-                "搜索 (Ctrl+F)",
+                SEARCH_LABEL,
                 self.viewer.search.open,
                 true,
                 theme,
@@ -91,7 +91,7 @@ impl AppState {
             .child(icon_button(
                 "annotations",
                 "icons/annotations.svg",
-                "批注 (Ctrl+H)",
+                ANNOTATIONS_LABEL,
                 self.highlight_panel_open,
                 true,
                 theme,
@@ -113,7 +113,7 @@ impl AppState {
             .child(icon_button(
                 "save",
                 "icons/save.svg",
-                "保存 (Ctrl+S)",
+                SAVE_LABEL,
                 false,
                 can_save,
                 theme,
@@ -356,30 +356,64 @@ impl AppState {
     }
 
     pub(crate) fn window_controls(&self, _theme: &Theme) -> gpui::Div {
-        div()
-            .absolute()
-            .top(px(14.))
-            .left(px(16.))
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .child(window_control_dot(
-                "win-close",
-                WindowControlArea::Close,
-                rgb(0xff5f57),
-            ))
-            .child(window_control_dot(
-                "win-min",
-                WindowControlArea::Min,
-                rgb(0xfebc2e),
-            ))
-            .child(window_control_dot(
-                "win-max",
-                WindowControlArea::Max,
-                rgb(0x28c840),
-            ))
+        // macOS 上使用系统原生的红黄绿三色交通灯，避免在左上角出现重复的自绘按钮
+        #[cfg(target_os = "macos")]
+        {
+            div()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            div()
+                .absolute()
+                .top(px(14.))
+                .left(px(16.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(window_control_dot(
+                    "win-close",
+                    WindowControlArea::Close,
+                    rgb(0xff5f57),
+                ))
+                .child(window_control_dot(
+                    "win-min",
+                    WindowControlArea::Min,
+                    rgb(0xfebc2e),
+                ))
+                .child(window_control_dot(
+                    "win-max",
+                    WindowControlArea::Max,
+                    rgb(0x28c840),
+                ))
+        }
     }
 }
+
+/// 快捷键提示文案（macOS 为 ⌘，Windows/Linux 为 Ctrl+）
+#[cfg(target_os = "macos")]
+const OPEN_LABEL: &str = "打开 (⌘O)";
+#[cfg(not(target_os = "macos"))]
+const OPEN_LABEL: &str = "打开 (Ctrl+O)";
+
+#[cfg(target_os = "macos")]
+const OUTLINE_LABEL: &str = "目录 (⌘B)";
+#[cfg(not(target_os = "macos"))]
+const OUTLINE_LABEL: &str = "目录 (Ctrl+B)";
+
+#[cfg(target_os = "macos")]
+const SEARCH_LABEL: &str = "搜索 (⌘F)";
+#[cfg(not(target_os = "macos"))]
+const SEARCH_LABEL: &str = "搜索 (Ctrl+F)";
+
+#[cfg(target_os = "macos")]
+const ANNOTATIONS_LABEL: &str = "批注 (⌘H)";
+#[cfg(not(target_os = "macos"))]
+const ANNOTATIONS_LABEL: &str = "批注 (Ctrl+H)";
+
+#[cfg(target_os = "macos")]
+const SAVE_LABEL: &str = "保存 (⌘S)";
+#[cfg(not(target_os = "macos"))]
+const SAVE_LABEL: &str = "保存 (Ctrl+S)";
 
 /// 注册窗口级鼠标监听的零尺寸元素。
 ///
@@ -566,6 +600,7 @@ fn fit_button(
     }
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn window_control_dot(
     id: &'static str,
     area: WindowControlArea,

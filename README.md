@@ -9,7 +9,7 @@
 ## 界面
 
 - **首页**：左侧导航 + 顶部搜索 + 拖拽打开区 + 「最近阅读」网格；最近打开的文件和阅读位置都会持久化
-- **没有 Windows 原生标题栏**：左上角自绘红黄绿窗口按钮，顶部 46px 透明拖拽区
+- **无边框沉浸标题栏**：Windows 上自绘左上角红黄绿控制按钮；macOS 上原生集成系统交通灯，支持全屏与毛玻璃沉浸式拖拽，顶部 46px 透明拖拽区
 - 打开文档后切换为阅读器：顶部居中一颗浮动胶囊（首页、打开、目录、搜索、高亮、保存、主题）
 - 底部居中浮动胶囊：上一页 / 页码 / 下一页 / 缩放 / 适宽 / 适页；点击页码可直接输入跳转
 - 两颗胶囊会自动隐身：鼠标离开顶部/底部感应带 1.5 秒后隐藏（应用刚启动、鼠标还没动过时一直显示），鼠标回到该区域立刻出现；缩放、翻页、切换适应模式、开关面板、保存高亮等参数变化也会把它叫回来（隐身时不拦截页面的点击、滚轮、拖选与中键平移）
@@ -49,18 +49,31 @@
 
 ## 运行
 
-```powershell
+### 1. 准备 PDFium 动态链接库
+
+程序依赖 PDFium 渲染 PDF 页面：
+- **Windows**：仓库根目录已内置 `pdfium.dll`。
+- **macOS**：运行项目提供的脚本一键下载匹配当前芯片架构（Apple Silicon M系列 / Intel）的 `libpdfium.dylib`：
+  ```bash
+  bash scripts/setup-pdfium.sh
+  ```
+  *(也可通过 `brew install pdfium` 或手动放置 `libpdfium.dylib` 到项目根目录)*
+
+### 2. 启动运行
+
+```bash
+# Windows (PowerShell) / macOS (Terminal)
 cargo run -p gpui-pdf
+
 # 或直接打开一个文件
 cargo run -p gpui-pdf -- samples/dummy.pdf
 ```
 
-首次编译 GPUI 较慢。`pdfium.dll`（约 7.5 MB）已放在项目根目录，运行时按
-「exe 目录 → 当前目录 → 系统库」顺序查找。
+首次编译 GPUI 较慢。运行时按「exe 目录 → 当前目录 → macOS Frameworks 目录 → 系统/Homebrew 库」顺序查找动态库。
 
 界面默认使用 **LXGW 文楷 TC**。字体文件在
 `crates/gpui-pdf/assets/fonts/lxgw-wenkai-tc/`，编译时直接嵌进二进制，
-分发的 exe 自带字体，不再依赖本机的下载目录。需要换字体版本时，把
+分发的应用自带字体，不再依赖本机的下载目录。需要换字体版本时，把
 `GPUI_PDF_FONT_DIR` 指向包含 `LXGWWenKaiTC-Regular.ttf` 和
 `LXGWWenKaiMonoTC-Regular.ttf` 的目录即可（重启生效）；目录不完整或读取失败时
 使用内置字体，内置字体也注册失败时回退到系统字体。
@@ -69,42 +82,38 @@ cargo run -p gpui-pdf -- samples/dummy.pdf
 
 ## 分发与自动更新
 
-Windows 安装包由 Inno Setup 生成，脚本在 `installer/gpui-pdf.iss`；CI 在
-`.github/workflows/windows.yml`，推 tag 时自动打包并发布到 GitHub Releases。
+支持 **Windows** 与 **macOS** 两个平台的打包发布与自动更新：
+- **Windows**：Inno Setup 生成 `gpui-pdf-<version>-setup.exe`，CI 在 `.github/workflows/windows.yml`。
+- **macOS**：生成 `gpui-pdf.app` 独立包及 `.dmg` 挂载镜像，CI 在 `.github/workflows/macos.yml`。
 
 发布一个新版本：
 
-```powershell
+```bash
 # 1. 改 Cargo.toml 里的 [workspace.package] version（CI 会校验 tag 与它一致）
 # 2. 提交后打 tag 并推送
 git tag v0.1.1
 git push origin main --tags
 ```
 
-CI 会编译 release、生成 `gpui-pdf-0.1.1-setup.exe`，并作为 release 资产上传。
-普通 push 与 PR 只上传构建产物（artifact），不发 release。
+CI 会分别在 Windows 和 macOS runner 上自动编译 release、打包产物，并作为 Release 资产发布。
 
-release 构建关闭 debug 信息，并启用 fat LTO、单 codegen unit、`panic = "abort"` 与
-`strip = true`，在保证功能不变的前提下明显缩小 exe。
+**应用内更新**：设置面板的「更新」区块会调用 GitHub API 读取最新正式版，自动识别并下载匹配当前系统的更新包（Windows 下载 setup.exe 并静默运行，macOS 下载 .dmg 并调起系统挂载安装）。启动 4 秒后自动检查（发布构建才启用），可在设置中关闭。
 
-安装包安装到当前用户的 `%LOCALAPPDATA%\Programs\gpui-pdf`，不触发 UAC；
-`pdfium.dll` 与 exe 放在同一目录，运行时按「exe 目录 → 当前目录 → 系统库」
-顺序查找。
+### 本地手工打包
 
-**应用内更新**：设置面板的「更新」区块会调用 GitHub API 读取最新正式版
-（跳过带 `-` 的预发布），发现新版本后用 `self_update` 下载安装包，再以
-`/SILENT` 运行安装器并退出应用。仓库坐标在 CI 构建时由 `GITHUB_REPOSITORY`
-注入，本地构建回落到 `shanaiardor/gpui-pdf`。启动 4 秒后自动检查（发布构建
-才启用），可以在设置里关掉。
+- **macOS**（生成 `.dmg` 与 `.zip`）：
+  ```bash
+  bash installer/build-macos-app.sh
+  # 产物在 dist/ 目录下
+  ```
 
-本地手工打包（需要装 Inno Setup 6）：
-
-```powershell
-cargo build --release -p gpui-pdf
-& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
-  "/DAPP_VERSION=0.1.1" "installer\gpui-pdf.iss"
-# 输出：dist\gpui-pdf-0.1.1-setup.exe
-```
+- **Windows**（需要装 Inno Setup 6）：
+  ```powershell
+  cargo build --release -p gpui-pdf
+  & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+    "/DAPP_VERSION=0.1.1" "installer\gpui-pdf.iss"
+  # 输出：dist\gpui-pdf-0.1.1-setup.exe
+  ```
 
 不放安装包、直接发绿包时，需要带上：
 
@@ -120,24 +129,25 @@ crates/gpui-pdf/assets/fonts/lxgw-wenkai-tc/OFL.txt   # 字体许可（OFL 要�
 
 ## 快捷键
 
-| 快捷键 | 行为 |
-|---|---|
-| `Ctrl+O` | 打开 PDF |
-| `Ctrl+B` | 显示 / 隐藏目录浮层 |
-| `Ctrl+F` | 首页筛选最近阅读（`Enter` 打开第一条，`Esc` 清空）；阅读器内全文搜索（`Enter` 下一个，`Shift+Enter` 上一个，`Esc` 关闭） |
-| `Ctrl+C` | 复制选中文本 |
-| `Ctrl+S` | 保存高亮 |
-| `Ctrl+H` | 批注侧栏（高亮列表，可跳转/删除） |
-| `Ctrl+=` / `Ctrl+-` | 放大 / 缩小（每次 1%） |
-| `Ctrl+滚轮` | 以指针位置为锚缩放（每行 1%，一格约 3%；25%–400%） |
-| 按住中键拖动 | 上下（含左右）拖动阅读，半速跟随指针 |
-| 点击底部页码 | 输入页码后 `Enter` 跳转，`Esc` 取消 |
-| `Ctrl+0` / `Ctrl+1` | 适页（整页可见） / 适宽 |
-| `Ctrl+D` | 切换深色/浅色 |
-| `PageDown` / `PageUp` | 下一页 / 上一页 |
-| `Home` / `End` | 第一页 / 最后一页 |
-| `H` | 把当前选区加为高亮 |
-| `Esc` | 关闭搜索 / 目录，或清除选区 |
+| Windows / Linux | macOS | 行为 |
+|---|---|---|
+| `Ctrl+O` | `⌘O` | 打开 PDF |
+| `Ctrl+B` | `⌘B` | 显示 / 隐藏目录浮层 |
+| `Ctrl+F` | `⌘F` | 首页筛选最近阅读；阅读器内全文搜索 |
+| `Ctrl+C` | `⌘C` | 复制选中文本 |
+| `Ctrl+S` | `⌘S` | 保存高亮批注 |
+| `Ctrl+H` | `⌘H` | 打开 / 关闭批注侧栏 |
+| `Ctrl+=` / `Ctrl+-` | `⌘=` / `⌘-` | 放大 / 缩小（每次 1%） |
+| `Ctrl+滚轮` | `⌘+滚轮` | 以指针位置为锚缩放（每行 1%，一格约 3%；25%–400%） |
+| 按住中键拖动 | 按住中键拖动 | 上下（含左右）拖动阅读，半速跟随指针 |
+| 点击底部页码 | 点击底部页码 | 输入页码后 `Enter` 跳转，`Esc` 取消 |
+| `Ctrl+0` / `Ctrl+1` | `⌘0` / `⌘1` | 适页（整页可见） / 适宽 |
+| `Ctrl+D` | `⌘D` | 切换深色 / 浅色主题 |
+| `Ctrl+Q` | `⌘Q` | 退出程序 |
+| `PageDown` / `PageUp` | `PageDown` / `PageUp` | 下一页 / 上一页 |
+| `Home` / `End` | `Home` / `End` | 第一页 / 最后一页 |
+| `H` | `H` | 把当前选区加为高亮 |
+| `Esc` | `Esc` | 关闭搜索 / 目录，或清除选区 |
 
 ## 结构
 

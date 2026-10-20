@@ -14,8 +14,14 @@ use self_update::backends::github::ReleaseList;
 /// 当前版本号，与 `Cargo.toml` 保持一致；`Cargo.toml` 是唯一事实来源。
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// 安装包文件名后缀；CI 里由 `installer/gpui-pdf.iss` 生成。
+/// 安装包文件名后缀
+#[cfg(target_os = "windows")]
 const INSTALLER_SUFFIX: &str = "-setup.exe";
+#[cfg(target_os = "macos")]
+const INSTALLER_SUFFIX: &str = ".dmg";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const INSTALLER_SUFFIX: &str = ".tar.gz";
+
 /// release notes 太长会把设置面板撑开，截断到一段话。
 const MAX_NOTES_CHARS: usize = 800;
 
@@ -132,12 +138,30 @@ fn installer_asset(
 ) -> Option<&self_update::update::ReleaseAsset> {
     release.assets().iter().find(|asset| {
         let name = asset.name().to_ascii_lowercase();
-        name.ends_with(INSTALLER_SUFFIX) || (name.contains("setup") && name.ends_with(".exe"))
+        #[cfg(target_os = "windows")]
+        {
+            name.ends_with(INSTALLER_SUFFIX) || (name.contains("setup") && name.ends_with(".exe"))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            name.ends_with(INSTALLER_SUFFIX) || (name.contains("macos") && (name.ends_with(".dmg") || name.ends_with(".zip")))
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            name.ends_with(INSTALLER_SUFFIX) || name.ends_with(".tar.gz")
+        }
     })
 }
 
 fn download(info: &UpdateInfo, events: &UnboundedSender<Event>) -> Result<PathBuf> {
-    let path = std::env::temp_dir().join(format!("gpui-pdf-{}-setup.exe", info.version));
+    let filename = if cfg!(target_os = "windows") {
+        format!("gpui-pdf-{}-setup.exe", info.version)
+    } else if cfg!(target_os = "macos") {
+        format!("gpui-pdf-{}.dmg", info.version)
+    } else {
+        format!("gpui-pdf-{}.tar.gz", info.version)
+    };
+    let path = std::env::temp_dir().join(filename);
     let file = std::fs::File::create(&path)
         .with_context(|| format!("无法创建临时文件 {}", path.display()))?;
 
@@ -153,13 +177,31 @@ fn download(info: &UpdateInfo, events: &UnboundedSender<Event>) -> Result<PathBu
     Ok(path)
 }
 
-/// 静默运行安装器；调用方应该在之后退出应用，安装器才能覆盖正在使用的 exe。
+/// 静默运行安装器或打开安装包；调用方应该在之后退出应用。
 pub fn launch_installer(path: &Path) -> Result<()> {
-    std::process::Command::new(path)
-        // Inno Setup 的静默安装参数：显示进度条、关闭占用文件的程序、不自动重启。
-        .args(["/SILENT", "/CLOSEAPPLICATIONS", "/NORESTART"])
-        .spawn()
-        .with_context(|| format!("无法启动安装程序 {}", path.display()))?;
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new(path)
+            // Inno Setup 的静默安装参数：显示进度条、关闭占用文件的程序、不自动重启。
+            .args(["/SILENT", "/CLOSEAPPLICATIONS", "/NORESTART"])
+            .spawn()
+            .with_context(|| format!("无法启动安装程序 {}", path.display()))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS 上使用系统 open 命令挂载/打开 dmg 安装包
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .with_context(|| format!("无法打开安装包 {}", path.display()))?;
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .with_context(|| format!("无法打开更新包 {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -189,13 +231,25 @@ mod tests {
     }
 
     #[test]
-    fn installer_asset_prefers_setup_exe() {
-        let release = release(
-            "0.2.0",
-            &["gpui-pdf-0.2.0-sha256.txt", "gpui-pdf-0.2.0-setup.exe"],
-        );
-        let asset = installer_asset(&release).expect("installer");
-        assert_eq!(asset.name(), "gpui-pdf-0.2.0-setup.exe");
+    fn installer_asset_prefers_platform_package() {
+        #[cfg(target_os = "windows")]
+        {
+            let release = release(
+                "0.2.0",
+                &["gpui-pdf-0.2.0-sha256.txt", "gpui-pdf-0.2.0-setup.exe"],
+            );
+            let asset = installer_asset(&release).expect("installer");
+            assert_eq!(asset.name(), "gpui-pdf-0.2.0-setup.exe");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let release = release(
+                "0.2.0",
+                &["gpui-pdf-0.2.0-sha256.txt", "gpui-pdf-0.2.0-macos-arm64.dmg"],
+            );
+            let asset = installer_asset(&release).expect("installer");
+            assert_eq!(asset.name(), "gpui-pdf-0.2.0-macos-arm64.dmg");
+        }
     }
 
     #[test]

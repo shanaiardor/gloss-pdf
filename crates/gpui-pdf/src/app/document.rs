@@ -302,7 +302,8 @@ impl super::AppState {
         let text = self.viewer.selection.text(chars).unwrap_or_default();
         let added = self.viewer.highlights.add(page, rects, text).is_some();
         if added {
-            self.set_status("已添加高亮，Ctrl+S 保存", cx);
+            let key = if cfg!(target_os = "macos") { "⌘S" } else { "Ctrl+S" };
+            self.set_status(format!("已添加高亮，{key} 保存"), cx);
         }
         cx.notify();
     }

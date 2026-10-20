@@ -278,9 +278,29 @@ fn bind_pdfium() -> Result<&'static Pdfium> {
         && let Some(parent) = exe.parent()
     {
         directories.push(parent.to_path_buf());
+        // macOS app bundle: Contents/MacOS -> Contents/Frameworks
+        #[cfg(target_os = "macos")]
+        {
+            let frameworks = parent.join("../Frameworks");
+            if frameworks.is_dir() {
+                directories.push(frameworks);
+            }
+        }
     }
     if let Ok(cwd) = std::env::current_dir() {
         directories.push(cwd);
+    }
+
+    // 常见包管理器或系统库路径（如 macOS Homebrew）
+    #[cfg(target_os = "macos")]
+    {
+        directories.push(std::path::PathBuf::from("/opt/homebrew/lib"));
+        directories.push(std::path::PathBuf::from("/usr/local/lib"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        directories.push(std::path::PathBuf::from("/usr/local/lib"));
+        directories.push(std::path::PathBuf::from("/usr/lib"));
     }
 
     let mut last_error: Option<anyhow::Error> = None;
@@ -300,10 +320,18 @@ fn bind_pdfium() -> Result<&'static Pdfium> {
         }
     }
 
+    let lib_name = if cfg!(target_os = "windows") {
+        "pdfium.dll"
+    } else if cfg!(target_os = "macos") {
+        "libpdfium.dylib"
+    } else {
+        "libpdfium.so"
+    };
+
     match Pdfium::bind_to_system_library() {
         Ok(bindings) => Ok(Box::leak(Box::new(Pdfium::new(bindings)))),
         Err(error) => Err(last_error.unwrap_or_else(|| anyhow!(error)))
-            .context("找不到 pdfium.dll（放到 exe 或项目根目录）"),
+            .with_context(|| format!("找不到 {lib_name}（请放到可执行文件目录、项目根目录，或通过系统包管理器安装）")),
     }
 }
 
