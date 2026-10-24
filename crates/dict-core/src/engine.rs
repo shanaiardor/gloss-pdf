@@ -1,4 +1,7 @@
 //! 词典 worker：加载 `.mdx`（及同名 `.mdd`、外置 CSS/字体）并响应查询。
+//!
+//! 每本 MDX 首次加载时会在它旁边生成 `<文件名>.mdx.keyidx` 持久化 key index，
+//! 之后启动直接复用，避免每次进程第一次查词都重建约 94 万条词头的内存索引。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -7,7 +10,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
-use mdictlib::{MddFile, MdxFile};
+use mdictlib::{KeyEntry, KeyIndex, KeyIndexOptions, KeyIndexSourceIdentity, MddFile, MdxFile};
 
 use crate::css::Stylesheet;
 use crate::fonts::FontLibrary;
@@ -324,7 +327,7 @@ fn collect_prefixes(
     let mut suggestions = Vec::new();
     let mut seen = HashSet::new();
     for dictionary in dictionaries {
-        let keys = match dictionary.dictionary.mdx.prefix_keys(term, per_dictionary) {
+        let keys = match dictionary.dictionary.prefix_keys(term, per_dictionary) {
             Ok(keys) => keys,
             Err(error) => {
                 log::warn!("前缀联想失败 {}: {error:#}", dictionary.path.display());
@@ -347,6 +350,8 @@ fn collect_prefixes(
 /// 打开后的词典：MDX 词条 + 同名 MDD 资源 + 样式/字体。
 struct Dictionary {
     mdx: MdxFile,
+    /// 与 MDX 放在一起的持久化 key index；不可用时退回 mdictlib 的内存索引。
+    key_index: Option<KeyIndex>,
     mdd: Vec<MddFile>,
     base_dir: PathBuf,
     stylesheet: Stylesheet,
@@ -361,7 +366,8 @@ impl Dictionary {
         let mut seen = HashSet::new();
         seen.insert(term.to_lowercase());
 
-        let Some((mut headword, mut body)) = find_entry(&self.mdx, term)? else {
+        let Some((mut headword, mut body)) = find_entry(&self.mdx, self.key_index.as_ref(), term)?
+        else {
             return Ok(None);
         };
 
@@ -374,7 +380,7 @@ impl Dictionary {
                 break;
             }
 
-            match find_entry(&self.mdx, &target)? {
+            match find_entry(&self.mdx, self.key_index.as_ref(), &target)? {
                 Some((target_headword, target_body)) => {
                     headword = target_headword;
                     body = target_body;
@@ -421,10 +427,19 @@ impl Dictionary {
             redirected,
         )))
     }
+
+    /// 前缀联想同样优先走持久化索引，避免第一次输入触发 150ms 级的内存索引构建。
+    fn prefix_keys(&self, term: &str, limit: usize) -> Result<Vec<KeyEntry>> {
+        Ok(match &self.key_index {
+            Some(index) => self.mdx.prefix_keys_with_index(index, term, limit)?,
+            None => self.mdx.prefix_keys(term, limit)?,
+        })
+    }
 }
 
 fn load_dictionary(path: &Path) -> Result<(Dictionary, Option<String>, u64)> {
     let mdx = MdxFile::open(path).with_context(|| format!("无法打开 {}", path.display()))?;
+    let key_index = load_key_index(&mdx, path);
     let title = mdx.header().title().map(|title| title.to_string());
     let entries = mdx.len();
     let base_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -458,6 +473,7 @@ fn load_dictionary(path: &Path) -> Result<(Dictionary, Option<String>, u64)> {
     Ok((
         Dictionary {
             mdx,
+            key_index,
             mdd,
             base_dir,
             stylesheet,
@@ -469,6 +485,114 @@ fn load_dictionary(path: &Path) -> Result<(Dictionary, Option<String>, u64)> {
         title,
         entries,
     ))
+}
+
+/// 与 MDX 同目录的持久化 key index 路径：`foo.mdx` → `foo.mdx.keyidx`。
+fn key_index_path(mdx_path: &Path) -> PathBuf {
+    let mut name = mdx_path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(".keyidx");
+    mdx_path.with_file_name(name)
+}
+
+/// 先写到同目录的临时文件，成功后再换名，避免留下半个索引。
+fn key_index_temp_path(index_path: &Path) -> PathBuf {
+    let mut name = index_path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(".tmp");
+    index_path.with_file_name(name)
+}
+
+/// 打开 MDX 旁边的持久化索引；缺失或失效时构建一次。
+///
+/// 返回 `None` 表示目录不可写、索引损坏且重建失败等；此时查询照常使用
+/// mdictlib 的内存索引，只是第一次查词会慢一点。
+fn load_key_index(mdx: &MdxFile, mdx_path: &Path) -> Option<KeyIndex> {
+    let identity = match mdx.key_index_source_identity() {
+        Ok(identity) => identity,
+        Err(error) => {
+            log::warn!(
+                "无法读取 {} 的索引元数据，改用内存索引: {error:#}",
+                mdx_path.display()
+            );
+            return None;
+        }
+    };
+
+    let index_path = key_index_path(mdx_path);
+    let options = KeyIndexOptions::new();
+    if index_path.is_file() {
+        match mdx.open_key_index(&index_path, &identity, &options) {
+            Ok(index) => {
+                log::info!(
+                    "opened key index {} ({} keys)",
+                    index_path.display(),
+                    identity.key_count()
+                );
+                return Some(index);
+            }
+            Err(error) => log::info!(
+                "key index {} 已过期或损坏，正在重建: {error:#}",
+                index_path.display()
+            ),
+        }
+    }
+
+    match build_key_index(mdx, &identity, &index_path, &options) {
+        Ok(index) => Some(index),
+        Err(error) => {
+            log::warn!(
+                "无法为 {} 建立持久化索引，改用内存索引: {error:#}",
+                mdx_path.display()
+            );
+            None
+        }
+    }
+}
+
+fn build_key_index(
+    mdx: &MdxFile,
+    identity: &KeyIndexSourceIdentity,
+    index_path: &Path,
+    options: &KeyIndexOptions,
+) -> Result<KeyIndex> {
+    let temp_path = key_index_temp_path(index_path);
+    let _ = std::fs::remove_file(&temp_path);
+    let started = std::time::Instant::now();
+
+    let result = (|| -> Result<KeyIndex> {
+        let build = mdx
+            .build_key_index_to_path(&temp_path, options, || false)
+            .with_context(|| format!("创建索引 {}", temp_path.display()))?;
+        publish_key_index(&temp_path, index_path)
+            .with_context(|| format!("写入索引 {}", index_path.display()))?;
+        log::info!(
+            "built key index {} ({} keys, {} bytes, {:?})",
+            index_path.display(),
+            identity.key_count(),
+            build.bytes_written(),
+            started.elapsed()
+        );
+        mdx.open_key_index(index_path, identity, options)
+            .with_context(|| format!("打开新索引 {}", index_path.display()))
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn publish_key_index(temp_path: &Path, index_path: &Path) -> std::io::Result<()> {
+    // Windows 的 rename 不会覆盖已有文件；索引只是缓存，先删旧文件再换名。
+    if index_path.exists() {
+        std::fs::remove_file(index_path)?;
+    }
+    std::fs::rename(temp_path, index_path)
 }
 
 /// 打开基础 `.mdd` 和拆分出来的 `.1.mdd`、`.2.mdd`……
@@ -1185,12 +1309,27 @@ fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
     String::from_utf16_lossy(&units)
 }
 
-fn find_entry(dictionary: &MdxFile, term: &str) -> Result<Option<(String, String)>> {
+fn find_entry(
+    dictionary: &MdxFile,
+    key_index: Option<&KeyIndex>,
+    term: &str,
+) -> Result<Option<(String, String)>> {
     for candidate in candidates(term) {
-        if let Some(entry) = dictionary
-            .lookup(&candidate)
-            .with_context(|| format!("查询 {candidate:?} 失败"))?
-        {
+        let entry = match key_index {
+            Some(index) => match dictionary
+                .locate_with_key_index(index, &candidate)
+                .with_context(|| format!("查询 {candidate:?} 失败"))?
+            {
+                Some(matches) => dictionary
+                    .entry_at(matches.first())
+                    .with_context(|| format!("读取 {candidate:?} 的词条失败"))?,
+                None => None,
+            },
+            None => dictionary
+                .lookup(&candidate)
+                .with_context(|| format!("查询 {candidate:?} 失败"))?,
+        };
+        if let Some(entry) = entry {
             return Ok(Some((entry.key().to_string(), entry.text().to_string())));
         }
     }
@@ -1255,6 +1394,20 @@ mod tests {
     use crate::model::{Block, Span};
     use futures::StreamExt;
     use mdictlib::{MddBuilder, MdxBuilder, WriteEncoding, WriteOptions};
+
+    /// 删除测试词典以及它旁边的持久化索引，避免临时目录里越积越多。
+    fn remove_dictionary(path: &Path) {
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(key_index_path(path)).ok();
+    }
+
+    #[test]
+    fn key_index_path_sits_next_to_the_mdx() {
+        assert_eq!(
+            key_index_path(Path::new("dicts/foo.mdx")),
+            PathBuf::from("dicts/foo.mdx.keyidx")
+        );
+    }
 
     #[test]
     fn candidates_cover_case_and_possessive_variants() {
@@ -1453,6 +1606,10 @@ mod tests {
                 assert_eq!(dictionaries[0].entries, 2);
                 assert_eq!(dictionaries[0].title.as_deref(), Some("Test Dictionary"));
                 assert!(dictionaries[0].error.is_none());
+                assert!(
+                    key_index_path(&mdx_path).is_file(),
+                    "persistent key index should be written next to the mdx"
+                );
             }
             _ => panic!("expected Configured event"),
         }
@@ -1538,7 +1695,7 @@ mod tests {
             _ => panic!("expected redirected Found event"),
         }
 
-        std::fs::remove_file(mdx_path).ok();
+        remove_dictionary(&mdx_path);
         std::fs::remove_file(mdd_path).ok();
     }
 
@@ -1666,8 +1823,8 @@ mod tests {
             }
         }
 
-        std::fs::remove_file(first).ok();
-        std::fs::remove_file(second).ok();
+        remove_dictionary(&first);
+        remove_dictionary(&second);
     }
 
     #[test]
@@ -1806,8 +1963,8 @@ mod tests {
             _ => panic!("expected Found event"),
         }
 
-        std::fs::remove_file(first).ok();
-        std::fs::remove_file(second).ok();
+        remove_dictionary(&first);
+        remove_dictionary(&second);
     }
 
     #[test]
