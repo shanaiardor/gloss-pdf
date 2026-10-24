@@ -91,7 +91,7 @@ cargo run -p gpui-pdf -- samples/dummy.pdf
 ```bash
 # 1. 改 Cargo.toml 里的 [workspace.package] version（CI 会校验 tag 与它一致）
 # 2. 提交后打 tag 并推送
-git tag v0.1.2
+git tag v0.1.3
 git push origin main --tags
 ```
 
@@ -111,8 +111,8 @@ CI 会分别在 Windows 和 macOS runner 上自动编译 release、打包产物�
   ```powershell
   cargo build --release -p gpui-pdf
   & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
-  "/DAPP_VERSION=0.1.2" "installer\gpui-pdf.iss"
-  # 输出：dist\gpui-pdf-0.1.2-setup.exe
+  "/DAPP_VERSION=0.1.3" "installer\gpui-pdf.iss"
+  # 输出：dist\gpui-pdf-0.1.3-setup.exe
   ```
 
 不放安装包、直接发绿包时，需要带上：

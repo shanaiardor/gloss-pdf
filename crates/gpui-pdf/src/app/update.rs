@@ -83,8 +83,13 @@ impl AppState {
             return;
         };
         match update::launch_installer(&path) {
-            // 安装器要覆盖正在运行的 exe，必须先退出；/CLOSEAPPLICATIONS 只是兜底。
-            Ok(()) => cx.quit(),
+            // 安装器要覆盖正在运行的 exe，必须先退出；延后到当前事件处理结束再退，
+            // 避免在按钮回调的借用期间直接 quit 触发 GPUI 的 fail-fast。
+            Ok(()) => {
+                self.flush_progress();
+                self.settings.save();
+                cx.defer(|cx| cx.quit());
+            }
             Err(error) => {
                 self.update_phase = UpdatePhase::Failed(format!("{error:#}"));
                 cx.notify();

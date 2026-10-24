@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use futures::channel::mpsc::UnboundedSender;
 use self_update::backends::github::ReleaseList;
 
@@ -144,7 +144,8 @@ fn installer_asset(
         }
         #[cfg(target_os = "macos")]
         {
-            name.ends_with(INSTALLER_SUFFIX) || (name.contains("macos") && (name.ends_with(".dmg") || name.ends_with(".zip")))
+            name.ends_with(INSTALLER_SUFFIX)
+                || (name.contains("macos") && (name.ends_with(".dmg") || name.ends_with(".zip")))
         }
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
@@ -167,6 +168,11 @@ fn download(info: &UpdateInfo, events: &UnboundedSender<Event>) -> Result<PathBu
 
     let progress_events = events.clone();
     let mut download = self_update::Download::from_url(info.url.clone());
+    // GitHub 的 `assets.url` 是 API 地址；不带这个头会返回 JSON 元数据而不是文件。
+    download.request_header(
+        self_update::http::header::ACCEPT,
+        "application/octet-stream",
+    );
     download
         .progress_callback(move |downloaded, total| {
             let _ = progress_events.unbounded_send(Event::Progress { downloaded, total });
@@ -174,7 +180,29 @@ fn download(info: &UpdateInfo, events: &UnboundedSender<Event>) -> Result<PathBu
         .download_to(std::io::BufWriter::new(file))
         .context("下载安装包失败")?;
 
+    validate_installer(&path)?;
     Ok(path)
+}
+
+/// 防止把 GitHub API 的 JSON 错误页当成安装包启动。
+fn validate_installer(path: &Path) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::io::Read;
+
+        let mut file = std::fs::File::open(path)
+            .with_context(|| format!("无法读取安装包 {}", path.display()))?;
+        let mut magic = [0u8; 2];
+        file.read_exact(&mut magic)
+            .with_context(|| format!("安装包为空或过短 {}", path.display()))?;
+        if &magic != b"MZ" {
+            let size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+            return Err(anyhow!(
+                "下载内容不是 Windows 安装包（{size} 字节，可能是 GitHub API 返回的 JSON）"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 静默运行安装器或打开安装包；调用方应该在之后退出应用。
@@ -245,7 +273,10 @@ mod tests {
         {
             let release = release(
                 "0.2.0",
-                &["gpui-pdf-0.2.0-sha256.txt", "gpui-pdf-0.2.0-macos-arm64.dmg"],
+                &[
+                    "gpui-pdf-0.2.0-sha256.txt",
+                    "gpui-pdf-0.2.0-macos-arm64.dmg",
+                ],
             );
             let asset = installer_asset(&release).expect("installer");
             assert_eq!(asset.name(), "gpui-pdf-0.2.0-macos-arm64.dmg");
@@ -256,6 +287,67 @@ mod tests {
     fn installer_asset_ignores_other_binaries() {
         let release = release("0.2.0", &["gpui-pdf.exe"]);
         assert!(installer_asset(&release).is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn json_error_page_is_not_accepted_as_installer() {
+        let path = std::env::temp_dir().join(format!(
+            "gpui-pdf-json-test-{}-{}.exe",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, br#"{"url":"https://api.github.com/assets/1"}"#).unwrap();
+        let error = validate_installer(&path).expect_err("json must be rejected");
+        assert!(error.to_string().contains("不是 Windows 安装包"));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn pe_magic_is_accepted_as_installer() {
+        let path = std::env::temp_dir().join(format!(
+            "gpui-pdf-mz-test-{}-{}.exe",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"MZ\0\0").unwrap();
+        assert!(validate_installer(&path).is_ok());
+        std::fs::remove_file(path).ok();
+    }
+
+    /// 手动验证下载路径：`cargo test -p gpui-pdf download_latest -- --ignored --nocapture`
+    #[test]
+    #[ignore = "需要联网访问 GitHub API 并下载安装包"]
+    fn download_latest_release_is_an_installer() {
+        let (owner, repo) = repository();
+        let releases = ReleaseList::configure()
+            .repo_owner(owner)
+            .repo_name(repo)
+            .build()
+            .unwrap()
+            .fetch()
+            .unwrap();
+        let release = releases.all().first().expect("latest release");
+        let asset = installer_asset(release).expect("installer asset");
+        let info = UpdateInfo {
+            version: release.version().to_string(),
+            notes: String::new(),
+            url: asset.download_url().to_string(),
+        };
+        let (events, _receiver) = futures::channel::mpsc::unbounded();
+        let path = download(&info, &events).expect("download");
+        let size = std::fs::metadata(&path).expect("metadata").len();
+        println!("downloaded {} ({} bytes)", path.display(), size);
+        assert!(size > 1_000_000, "installer too small: {size}");
+        assert!(validate_installer(&path).is_ok());
+        std::fs::remove_file(path).ok();
     }
 
     #[test]
