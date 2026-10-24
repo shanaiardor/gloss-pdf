@@ -289,7 +289,7 @@ impl AppState {
 
         let search_input =
             cx.new(|cx| TextInput::new("输入关键词，Enter 下一个", theme.clone(), 13.0, cx));
-        let home_input = cx.new(|cx| TextInput::new("极简 PDF", theme.clone(), 13.0, cx));
+        let home_input = cx.new(|cx| TextInput::new("笺释", theme.clone(), 13.0, cx));
         let page_input = cx.new(|cx| TextInput::new("页码", theme.clone(), 12.0, cx));
 
         cx.subscribe(
@@ -368,7 +368,7 @@ impl AppState {
             chrome: ChromeVisibility::new(),
             status: String::new(),
             status_version: 0,
-            window_title: "极简 PDF".into(),
+            window_title: "笺释".into(),
             window_title_dirty: true,
             last_progress: None,
             progress_flush_scheduled: false,

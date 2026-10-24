@@ -157,7 +157,7 @@ impl super::AppState {
         // 恢复成功时以保存的位置为基线，等布局完成后采样再修正；
         // 失败时清空基线，让下一次采样覆盖掉过期的旧进度。
         self.last_progress = if restored { saved } else { None };
-        self.window_title = format!("{display_title} · 极简 PDF");
+        self.window_title = format!("{display_title} · 笺释");
         self.window_title_dirty = true;
 
         if let Some(doc) = &self.viewer.doc {
@@ -196,7 +196,7 @@ impl super::AppState {
         self.last_progress = None;
         self.outline_open = false;
         self.settings_open = false;
-        self.window_title = "极简 PDF".into();
+        self.window_title = "笺释".into();
         self.window_title_dirty = true;
         self.dictionary.clear_results();
         self.close_dictionary_window(cx);

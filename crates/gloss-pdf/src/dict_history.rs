@@ -129,7 +129,7 @@ mod tests {
             .as_nanos();
         std::env::temp_dir()
             .join(format!(
-                "gpui-pdf-history-{name}-{}-{stamp}",
+                "gloss-pdf-history-{name}-{}-{stamp}",
                 std::process::id()
             ))
             .join(FILE_NAME)

@@ -21,7 +21,7 @@ pub(crate) fn empty_state(theme: &Theme, cx: &mut Context<AppState>) -> gpui::Di
                 .text_size(px(24.))
                 .font_weight(gpui::FontWeight::BOLD)
                 .text_color(theme.text)
-                .child("GPUI PDF"),
+                .child("笺释"),
         )
         .child(
             div()

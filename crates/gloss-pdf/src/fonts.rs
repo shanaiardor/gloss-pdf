@@ -3,7 +3,7 @@
 //! 字体文件放在 `assets/fonts/lxgw-wenkai-tc`，编译时直接嵌进二进制：分发给
 //! 别人时只要带上 exe，界面就是文楷，不再依赖某台机器上的下载目录。
 //!
-//! 想在不重新编译的情况下换字体版本，把 `GPUI_PDF_FONT_DIR` 指向包含
+//! 想在不重新编译的情况下换字体版本，把 `GLOSS_PDF_FONT_DIR` 指向包含
 //! `LXGWWenKaiTC-Regular.ttf` 与 `LXGWWenKaiMonoTC-Regular.ttf` 的目录即可。
 //! 目录不存在、缺文件或读取失败时回退到内置字体；内置字体也注册失败时，
 //! GPUI 会退到系统 UI 字体，不影响启动。
@@ -19,7 +19,7 @@ use gpui::App;
 pub(crate) const UI_FAMILY: &str = "LXGW WenKai TC";
 pub(crate) const MONO_FAMILY: &str = "LXGW WenKai Mono TC";
 
-const FONT_DIR_ENV: &str = "GPUI_PDF_FONT_DIR";
+const FONT_DIR_ENV: &str = "GLOSS_PDF_FONT_DIR";
 const FONT_FILES: &[&str] = &["LXGWWenKaiTC-Regular.ttf", "LXGWWenKaiMonoTC-Regular.ttf"];
 
 /// `include_bytes!` 的数据位于只读段，生命周期是 `'static`。

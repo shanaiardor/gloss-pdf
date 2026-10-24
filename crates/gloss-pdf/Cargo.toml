@@ -1,10 +1,10 @@
 [package]
-name = "gpui-pdf"
+name = "gloss-pdf"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "A GPU-accelerated PDF reader built with GPUI"
+description = "笺释 (gloss-pdf) — A GPU-accelerated PDF reader with built-in dictionary lookup"
 
 [dependencies]
 pdf-core = { path = "../pdf-core" }

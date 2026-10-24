@@ -1,6 +1,6 @@
 //! 首页状态：最近阅读记录、搜索过滤、侧栏选中项。
 //!
-//! 最近阅读持久化在用户数据目录（Windows: `%APPDATA%\gpui-pdf\recent.json`），
+//! 最近阅读持久化在用户数据目录（Windows: `%APPDATA%\gloss-pdf\recent.json`），
 //! 每条记录同时保存最后阅读位置（页码、页内滚动和缩放），但不复制 PDF。
 
 use std::path::{Path, PathBuf};
@@ -267,17 +267,17 @@ fn same_path(left: &Path, right: &Path) -> bool {
         .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
-/// 用户数据目录（Windows: `%APPDATA%\gpui-pdf`）。
+/// 用户数据目录（Windows: `%APPDATA%\gloss-pdf`）。
 pub(crate) fn user_data_dir() -> Option<PathBuf> {
     if cfg!(target_os = "windows") {
         std::env::var_os("APPDATA")
             .map(PathBuf::from)
-            .map(|path| path.join("gpui-pdf"))
+            .map(|path| path.join("gloss-pdf"))
     } else if cfg!(target_os = "macos") {
         std::env::var_os("HOME").map(PathBuf::from).map(|path| {
             path.join("Library")
                 .join("Application Support")
-                .join("gpui-pdf")
+                .join("gloss-pdf")
         })
     } else {
         std::env::var_os("XDG_DATA_HOME")
@@ -287,7 +287,7 @@ pub(crate) fn user_data_dir() -> Option<PathBuf> {
                     .map(PathBuf::from)
                     .map(|path| path.join(".local").join("share"))
             })
-            .map(|path| path.join("gpui-pdf"))
+            .map(|path| path.join("gloss-pdf"))
     }
 }
 

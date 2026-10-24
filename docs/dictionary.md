@@ -72,7 +72,7 @@ stylesheet: 254 rules (279 source), at-rules {"media": 12}, unsupported declarat
 
 ```powershell
 cargo test -p dict-core
-$env:GPUI_PDF_TEST_DICT = 'C:\path\to\王力古漢語字典 (2000).mdx'
+$env:GLOSS_PDF_TEST_DICT = 'C:\path\to\王力古漢語字典 (2000).mdx'
 cargo test -p dict-core -- --ignored
 ```
 

@@ -6,7 +6,7 @@
 
 ```
 ┌─────────────────────────────────────────────┐
-│ crates/gpui-pdf（二进制）                     │
+│ crates/gloss-pdf（二进制）                    │
 │  app.rs      控制器装配：状态、订阅、顶层 Render      │
 │  app/events.rs   引擎/词典事件、键盘、鼠标、滚轮       │
 │  app/document.rs 打开/关闭、进度、高亮、检索、词典资源 │
@@ -146,15 +146,15 @@
 
 - 纯逻辑（`layout`、`tiles`、`selection`、`search`、`progress`、`home`、`viewer` 的瓦片/预算/进度恢复、
   `settings` 迁移、`dict_history`、`ui::text_input` 的 `TextField`、`highlights` 的 id/删除）有单元测试：
-  `cargo test -p gpui-pdf`。
+  `cargo test -p gloss-pdf`。
 - `dict-core` 有 CSS 层叠、选择器/伪元素、表格、图片、字体路径、多词典聚合与联想的单元测试：`cargo test -p dict-core`。
 - `pdf-core` 有元数据回退、文本匹配与元数据解析的单测：`cargo test -p pdf-core`。
 - 真实词典回归测试默认忽略，需要指向《王力古漢語字典》的 `.mdx`：
   ```powershell
-  $env:GPUI_PDF_TEST_DICT = 'C:\path\to\王力古漢語字典 (2000).mdx'
+  $env:GLOSS_PDF_TEST_DICT = 'C:\path\to\王力古漢語字典 (2000).mdx'
   cargo test -p dict-core -- --ignored
   ```
 - `pdf-core` 可加用 `samples/` 下 PDF 的集成测试（需要 `pdfium.dll`）。
-- 当前基线：`gpui-pdf` 128 项通过（另 1 项联网测试忽略）、`dict-core` 50 项通过（另 1 项真实词典测试忽略）、`pdf-core` 15 项通过。
-- GPUI 层目前靠手动验证：`cargo run -p gpui-pdf -- samples/dummy.pdf`。
+- 当前基线：`gloss-pdf` 128 项通过（另 1 项联网测试忽略）、`dict-core` 50 项通过（另 1 项真实词典测试忽略）、`pdf-core` 15 项通过。
+- GPUI 层目前靠手动验证：`cargo run -p gloss-pdf -- samples/dummy.pdf`。
 - 词典样式支持范围与限制见 [dictionary.md](dictionary.md)。

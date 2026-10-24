@@ -1,10 +1,10 @@
-# gpui-pdf 未完成工作清单
+# gloss-pdf 未完成工作清单
 
 阅读体验、互操作与工程化的剩余事项。
 
 > 基线：`main` / `32cdbb9` + 本轮 7 项改动（工作区）
 > 更新：2026-10-18 进度更新（跳页、Ctrl+滚轮、元数据、多词典/历史/联想、瓦片与内存预算、release 配置）
-> 代码量 18,935 行；`cargo test --workspace --locked` 全绿（gpui-pdf 128 项、dict-core 50 项、pdf-core 15 项，另 2 项联网/真实词典测试忽略）
+> 代码量 18,935 行；`cargo test --workspace --locked` 全绿（gloss-pdf 128 项、dict-core 50 项、pdf-core 15 项，另 2 项联网/真实词典测试忽略）
 
 ## 目录
 
@@ -19,7 +19,7 @@
 
 ## 一、优先级总览
 
-本文档汇总 gpui-pdf 当前版本已交付范围之外的全部待办事项，按阅读体验、互操作、遗留边界与工程化四类归纳。每条包含现状（已核实的代码位置）、缺口、改动落点与验收标准，可直接作为任务拆分的输入。
+本文档汇总 gloss-pdf 当前版本已交付范围之外的全部待办事项，按阅读体验、互操作、遗留边界与工程化四类归纳。每条包含现状（已核实的代码位置）、缺口、改动落点与验收标准，可直接作为任务拆分的输入。
 
 当前基线：`main` 已合并 P0 批次与 P1 连续滚动（最新提交 `32cdbb9`），工作区约 18.9k 行，`cargo test --workspace --locked` 全绿。本轮完成：跳页输入、Ctrl+滚轮指针锚定缩放、PDF 元数据、多词典/查词历史/输入联想、512×512 瓦片渲染与 256 MiB 内存预算、release 体积优化，并同步 README/architecture/todo。
 
@@ -196,7 +196,7 @@ worker 逐页提取文本并计数，大文档第一次搜索需要数秒；本�
 | 事项          | 现状                                    | 建议                                                         |
 | ----------- | ------------------------------------- | ---------------------------------------------------------- |
 | 持续集成        | ~~仓库根没有 CI 配置，没有任何自动化~~ | ✅ `.github/workflows/windows.yml`：PR 跑测试，tag 构建安装包并发 Release |
-| 打包分发        | ~~无 msi 或便携版配置~~ | ✅ Inno Setup 安装包（`installer/gpui-pdf.iss`），带 PDFium 动态库与字体许可；应用内自动更新读同一个 release 资产 |
+| 打包分发        | ~~无 msi 或便携版配置~~ | ✅ Inno Setup 安装包（`installer/gloss-pdf.iss`），带 PDFium 动态库与字体许可；应用内自动更新读同一个 release 资产 |
 | 测试覆盖        | `pdf-core` 15 项单元测试，仍无真实 PDF 集成测试；界面层以单测 + 手测为主       | 给 `pdf-core` 加真实 PDF 的打开、瓦片渲染、文本提取、搜索集成测试，样本放 `samples/`        |
 | `app.rs` 体量 | ~~已 1929 行，键盘、鼠标、引擎事件、窗口管理、词典窗口全在一个文件~~ | ✅ 已拆为 505 行装配层 + 四个职责模块，边界见下文                         |
 | 忽略规则        | ~~忽略文件缺 `.commandcode/` 与 `output/`~~ | ✅ 已完成（`9ed2bde`）                                           |
@@ -222,7 +222,7 @@ worker 逐页提取文本并计数，大文档第一次搜索需要数秒；本�
 3. **状态所有权不变**：四个模块都是 `impl AppState`，字段仍只有一份，避免把 `Viewer` / `HomeState` 拆散后出现跨实体同步；模块之间只通过 `pub(super)` 方法调用。
 4. **依赖单向**：`events` → {`document`, `render`, `window`}，`app.rs` → 全部；`render` 与 `window` 互不调用，`document` 只借用 `render` 的几何方法和 `window` 的浮窗方法。这样任何一个模块都不会反向依赖另一个模块的私有实现。
 
-拆分后的验证：本轮 `cargo test --workspace --locked` 全绿（gpui-pdf 128 项）；GUI 冒烟启动 `samples/dummy.pdf`，日志按 `gpui_pdf::app::{document,render,window,events}` 分模块输出，打开、瓦片渲染、按纸张调窗、词典字体注册均正常。另用 707 页文档实测扫描进度出现「已扫描 384/707 页」，并用连续截图确认光标亮灭。
+拆分后的验证：本轮 `cargo test --workspace --locked` 全绿（gloss-pdf 128 项）；GUI 冒烟启动 `samples/dummy.pdf`，日志按 `gloss_pdf::app::{document,render,window,events}` 分模块输出，打开、瓦片渲染、按纸张调窗、词典字体注册均正常。另用 707 页文档实测扫描进度出现「已扫描 384/707 页」，并用连续截图确认光标亮灭。
 
 ## 七、建议执行顺序
 
@@ -239,35 +239,35 @@ worker 逐页提取文本并计数，大文档第一次搜索需要数秒；本�
 
 | 文件                                      | 关联事项                                  |
 | --------------------------------------- | ------------------------------------- |
-| `crates/gpui-pdf/src/app.rs`            | 505 行，状态容器、订阅、顶层 `Render`             |
-| `crates/gpui-pdf/src/app/events.rs`     | 709 行，事件分派：引擎/词典事件、键盘、鼠标、滚轮、链接 |
-| `crates/gpui-pdf/src/app/document.rs`   | 729 行，文档生命周期：打开/关闭、进度、高亮、检索会话、多词典资源 |
-| `crates/gpui-pdf/src/app/render.rs`     | 435 行，渲染调度：布局几何、缩放、可视瓦片预取与内存淘汰 |
-| `crates/gpui-pdf/src/app/window.rs`     | 219 行，窗口管理：主窗口尺寸、视口度量、词典浮窗 |
-| `crates/gpui-pdf/src/tiles.rs`          | 512×512 瓦片网格与可视瓦片计算 |
-| `crates/gpui-pdf/src/settings.rs`       | 多词典设置、旧 `dictionary_path` 迁移 |
-| `crates/gpui-pdf/src/dict_history.rs`   | 查词历史持久化（上限 50） |
-| `crates/gpui-pdf/src/dict_suggest.rs`   | 联想去重/限长/防抖 |
+| `crates/gloss-pdf/src/app.rs`            | 505 行，状态容器、订阅、顶层 `Render`             |
+| `crates/gloss-pdf/src/app/events.rs`     | 709 行，事件分派：引擎/词典事件、键盘、鼠标、滚轮、链接 |
+| `crates/gloss-pdf/src/app/document.rs`   | 729 行，文档生命周期：打开/关闭、进度、高亮、检索会话、多词典资源 |
+| `crates/gloss-pdf/src/app/render.rs`     | 435 行，渲染调度：布局几何、缩放、可视瓦片预取与内存淘汰 |
+| `crates/gloss-pdf/src/app/window.rs`     | 219 行，窗口管理：主窗口尺寸、视口度量、词典浮窗 |
+| `crates/gloss-pdf/src/tiles.rs`          | 512×512 瓦片网格与可视瓦片计算 |
+| `crates/gloss-pdf/src/settings.rs`       | 多词典设置、旧 `dictionary_path` 迁移 |
+| `crates/gloss-pdf/src/dict_history.rs`   | 查词历史持久化（上限 50） |
+| `crates/gloss-pdf/src/dict_suggest.rs`   | 联想去重/限长/防抖 |
 | `crates/pdf-core/src/metadata.rs`       | `/ModDate` 等文件尾元数据兜底 |
-| `crates/gpui-pdf/src/viewer.rs`         | 瓦片缓存、字节预算、连续滚动与锚点恢复            |
-| `crates/gpui-pdf/src/layout.rs`         | `DocumentLayout`：每页位置、可视范围、指针/页内比例锚点正逆换算 |
-| `crates/gpui-pdf/src/ui/page.rs`        | 页面渲染与覆盖层坐标系                           |
-| `crates/gpui-pdf/src/progress.rs`       | 阅读进度的持久化模型                            |
-| `crates/gpui-pdf/src/ui/home.rs`        | 缩略图占位（第 704 行）、首页布局                   |
-| `crates/gpui-pdf/src/home.rs`           | 收藏与工具的死入口（第 53、54 行）                  |
-| `crates/gpui-pdf/src/ui/outline.rs`     | 目录面板（第 48 行）                          |
-| `crates/gpui-pdf/src/highlights.rs`     | 高亮模型与 sidecar 读写                      |
-| `crates/gpui-pdf/src/search.rs`         | 页内匹配适配层与全文命中换算                        |
+| `crates/gloss-pdf/src/viewer.rs`         | 瓦片缓存、字节预算、连续滚动与锚点恢复            |
+| `crates/gloss-pdf/src/layout.rs`         | `DocumentLayout`：每页位置、可视范围、指针/页内比例锚点正逆换算 |
+| `crates/gloss-pdf/src/ui/page.rs`        | 页面渲染与覆盖层坐标系                           |
+| `crates/gloss-pdf/src/progress.rs`       | 阅读进度的持久化模型                            |
+| `crates/gloss-pdf/src/ui/home.rs`        | 缩略图占位（第 704 行）、首页布局                   |
+| `crates/gloss-pdf/src/home.rs`           | 收藏与工具的死入口（第 53、54 行）                  |
+| `crates/gloss-pdf/src/ui/outline.rs`     | 目录面板（第 48 行）                          |
+| `crates/gloss-pdf/src/highlights.rs`     | 高亮模型与 sidecar 读写                      |
+| `crates/gloss-pdf/src/search.rs`         | 页内匹配适配层与全文命中换算                        |
 | `crates/pdf-core/src/text_match.rs`     | 页内匹配与全文计数共用的匹配规则（含汉字空格容错）             |
 | `crates/pdf-core/src/engine.rs`         | 渲染、文本提取、全文计数、搜索命令与扫描进度              |
-| `crates/gpui-pdf/src/ui/text_input.rs`  | 输入框与光标闪烁                              |
-| `crates/gpui-pdf/src/ui/search_bar.rs`  | 搜索框状态文案（扫描进度/命中数）                     |
+| `crates/gloss-pdf/src/ui/text_input.rs`  | 输入框与光标闪烁                              |
+| `crates/gloss-pdf/src/ui/search_bar.rs`  | 搜索框状态文案（扫描进度/命中数）                     |
 | `crates/dict-core/src/css.rs`           | flex 属性的解析与计算样式                       |
 | `crates/dict-core/src/fonts.rs`         | WOFF/WOFF2 解包（`wuff`）与 cmap 覆盖范围      |
 | `crates/dict-core/src/html.rs`          | `<a href>` → `LinkTarget`、flex 容器 → `Block::Container` |
 | `crates/dict-core/src/model.rs`         | `Container`/`FlexStyle`、`SpanStyle.link`  |
-| `crates/gpui-pdf/src/ui/dictionary.rs`  | flex 映射到 GPUI、`InteractiveText` 链接点击 |
+| `crates/gloss-pdf/src/ui/dictionary.rs`  | flex 映射到 GPUI、`InteractiveText` 链接点击 |
 
 ---
 
-gpui-pdf 项目内部文档 · 依据 `main` 分支 `32cdbb9` + 本轮工作区改动核实（2026-10-18 进度更新）
+gloss-pdf 项目内部文档 · 依据 `main` 分支 `32cdbb9` + 本轮工作区改动核实（2026-10-18 进度更新）

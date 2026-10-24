@@ -1,6 +1,6 @@
 # Third-party notices
 
-`gpui-pdf` 本身以 MIT OR Apache-2.0 发布（见 `LICENSE-MIT` / `LICENSE-APACHE`）。
+`gloss-pdf`（笺释）本身以 MIT OR Apache-2.0 发布（见 `LICENSE-MIT` / `LICENSE-APACHE`）。
 仓库同时包含以下第三方代码/二进制。
 
 ## PDFium（`pdfium.dll`）
@@ -17,15 +17,15 @@
 ## LXGW 文楷 TC / LXGW WenKai TC（界面字体）
 
 - 版本：`1.522`（2026-03-17）
-- 文件：`crates/gpui-pdf/assets/fonts/lxgw-wenkai-tc/LXGWWenKaiTC-Regular.ttf`、
+- 文件：`crates/gloss-pdf/assets/fonts/lxgw-wenkai-tc/LXGWWenKaiTC-Regular.ttf`、
   `LXGWWenKaiMonoTC-Regular.ttf`
 - 版权：Copyright 2022-2026 The LXGW WenKai Project Authors
   （<https://github.com/lxgw/LxgwWenkaiTC>，字形源自 The Klee Project Authors）
 - 许可：SIL Open Font License 1.1，完整文本见字体同目录的 `OFL.txt`
 - 上游：<https://github.com/lxgw/LxgwWenkaiTC>
 
-字体数据编译进 `gpui-pdf` 二进制。按 OFL 第 2 条，分发二进制时需要一并提供
-版权声明与许可文本：发布包里请保留 `crates/gpui-pdf/assets/fonts/lxgw-wenkai-tc/OFL.txt`
+字体数据编译进 `gloss-pdf` 二进制。按 OFL 第 2 条，分发二进制时需要一并提供
+版权声明与许可文本：发布包里请保留 `crates/gloss-pdf/assets/fonts/lxgw-wenkai-tc/OFL.txt`
 和本文件。
 
 ## pdfium-render

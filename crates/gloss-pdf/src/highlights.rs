@@ -192,7 +192,7 @@ mod tests {
             {"page":0,"rects":[{"left":1.0,"bottom":2.0,"right":3.0,"top":4.0}]}
         ]"#;
         let path = std::env::temp_dir().join(format!(
-            "gpui-pdf-highlights-test-{}-{}.json",
+            "gloss-pdf-highlights-test-{}-{}.json",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

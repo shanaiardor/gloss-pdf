@@ -40,8 +40,8 @@ jobs:
         shell: pwsh
         run: |
           $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-          $version = ($metadata.packages | Where-Object { $_.name -eq 'gpui-pdf' }).version
-          if (-not $version) { throw "读不到 gpui-pdf 的版本号" }
+          $version = ($metadata.packages | Where-Object { $_.name -eq 'gloss-pdf' }).version
+          if (-not $version) { throw "读不到 gloss-pdf 的版本号" }
           "APP_VERSION=$version" >> $env:GITHUB_ENV
           Write-Host "version = $version"
 
@@ -54,7 +54,7 @@ jobs:
           }
 
       - name: Build release binary
-        run: cargo build --release --locked -p gpui-pdf
+        run: cargo build --release --locked -p gloss-pdf
 
       - name: Build installer
         shell: pwsh
@@ -63,13 +63,13 @@ jobs:
           if (-not (Test-Path $iscc)) {
             choco install innosetup --no-progress -y
           }
-          & $iscc "/DAPP_VERSION=$env:APP_VERSION" "installer\gpui-pdf.iss"
+          & $iscc "/DAPP_VERSION=$env:APP_VERSION" "installer\gloss-pdf.iss"
           if ($LASTEXITCODE -ne 0) { throw "ISCC 失败（$LASTEXITCODE）" }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gpui-pdf-${{ env.APP_VERSION }}-windows-x64
+          name: gloss-pdf-${{ env.APP_VERSION }}-windows-x64
           path: dist/*setup.exe
           if-no-files-found: error
 

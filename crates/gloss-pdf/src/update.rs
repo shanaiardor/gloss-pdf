@@ -27,8 +27,8 @@ const MAX_NOTES_CHARS: usize = 800;
 
 /// 仓库坐标：CI 构建时用 `GITHUB_REPOSITORY` 注入，本地构建回落到默认值。
 pub fn repository() -> (&'static str, &'static str) {
-    let full = option_env!("GITHUB_REPOSITORY").unwrap_or("shanaiardor/gpui-pdf");
-    full.split_once('/').unwrap_or(("shanaiardor", "gpui-pdf"))
+    let full = option_env!("GITHUB_REPOSITORY").unwrap_or("shanaiardor/gloss-pdf");
+    full.split_once('/').unwrap_or(("shanaiardor", "gloss-pdf"))
 }
 
 /// 一次可用的更新。
@@ -156,11 +156,11 @@ fn installer_asset(
 
 fn download(info: &UpdateInfo, events: &UnboundedSender<Event>) -> Result<PathBuf> {
     let filename = if cfg!(target_os = "windows") {
-        format!("gpui-pdf-{}-setup.exe", info.version)
+        format!("gloss-pdf-{}-setup.exe", info.version)
     } else if cfg!(target_os = "macos") {
-        format!("gpui-pdf-{}.dmg", info.version)
+        format!("gloss-pdf-{}.dmg", info.version)
     } else {
-        format!("gpui-pdf-{}.tar.gz", info.version)
+        format!("gloss-pdf-{}.tar.gz", info.version)
     };
     let path = std::env::temp_dir().join(filename);
     let file = std::fs::File::create(&path)
@@ -264,28 +264,28 @@ mod tests {
         {
             let release = release(
                 "0.2.0",
-                &["gpui-pdf-0.2.0-sha256.txt", "gpui-pdf-0.2.0-setup.exe"],
+                &["gloss-pdf-0.2.0-sha256.txt", "gloss-pdf-0.2.0-setup.exe"],
             );
             let asset = installer_asset(&release).expect("installer");
-            assert_eq!(asset.name(), "gpui-pdf-0.2.0-setup.exe");
+            assert_eq!(asset.name(), "gloss-pdf-0.2.0-setup.exe");
         }
         #[cfg(target_os = "macos")]
         {
             let release = release(
                 "0.2.0",
                 &[
-                    "gpui-pdf-0.2.0-sha256.txt",
-                    "gpui-pdf-0.2.0-macos-arm64.dmg",
+                    "gloss-pdf-0.2.0-sha256.txt",
+                    "gloss-pdf-0.2.0-macos-arm64.dmg",
                 ],
             );
             let asset = installer_asset(&release).expect("installer");
-            assert_eq!(asset.name(), "gpui-pdf-0.2.0-macos-arm64.dmg");
+            assert_eq!(asset.name(), "gloss-pdf-0.2.0-macos-arm64.dmg");
         }
     }
 
     #[test]
     fn installer_asset_ignores_other_binaries() {
-        let release = release("0.2.0", &["gpui-pdf.exe"]);
+        let release = release("0.2.0", &["gloss-pdf.exe"]);
         assert!(installer_asset(&release).is_none());
     }
 
@@ -293,7 +293,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     fn json_error_page_is_not_accepted_as_installer() {
         let path = std::env::temp_dir().join(format!(
-            "gpui-pdf-json-test-{}-{}.exe",
+            "gloss-pdf-json-test-{}-{}.exe",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -310,7 +310,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     fn pe_magic_is_accepted_as_installer() {
         let path = std::env::temp_dir().join(format!(
-            "gpui-pdf-mz-test-{}-{}.exe",
+            "gloss-pdf-mz-test-{}-{}.exe",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -322,7 +322,7 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
-    /// 手动验证下载路径：`cargo test -p gpui-pdf download_latest -- --ignored --nocapture`
+    /// 手动验证下载路径：`cargo test -p gloss-pdf download_latest -- --ignored --nocapture`
     #[test]
     #[ignore = "需要联网访问 GitHub API 并下载安装包"]
     fn download_latest_release_is_an_installer() {
@@ -365,7 +365,7 @@ mod tests {
         assert!(shortened.ends_with('…'));
     }
 
-    /// 手动验证联网路径：`cargo test -p gpui-pdf check_github -- --ignored --nocapture`
+    /// 手动验证联网路径：`cargo test -p gloss-pdf check_github -- --ignored --nocapture`
     #[test]
     #[ignore = "需要联网访问 GitHub API"]
     fn check_github_release() {

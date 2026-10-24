@@ -1339,7 +1339,7 @@ mod tests {
     #[test]
     fn external_import_graph_is_expanded() {
         let directory = std::env::temp_dir().join(format!(
-            "gpui-pdf-css-test-{}-{}",
+            "gloss-pdf-css-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1403,7 +1403,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let stem = format!("gpui-pdf-dict-test-{}-{stamp}", std::process::id());
+        let stem = format!("gloss-pdf-dict-test-{}-{stamp}", std::process::id());
         let mdx_path = std::env::temp_dir().join(format!("{stem}.mdx"));
         let mdd_path = std::env::temp_dir().join(format!("{stem}.mdd"));
         std::fs::write(&mdx_path, &bytes).unwrap();
@@ -1557,7 +1557,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "gpui-pdf-{stem}-{}-{stamp}.mdx",
+            "gloss-pdf-{stem}-{}-{stamp}.mdx",
             std::process::id()
         ));
         std::fs::write(&path, &bytes).unwrap();
@@ -1811,9 +1811,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "需要 GPUI_PDF_TEST_DICT_ENTRY 指向一个把 CSS 放在词条 <link> 里的 MDX"]
+    #[ignore = "需要 GLOSS_PDF_TEST_DICT_ENTRY 指向一个把 CSS 放在词条 <link> 里的 MDX"]
     fn entry_level_stylesheet_is_applied() {
-        let path = std::env::var("GPUI_PDF_TEST_DICT_ENTRY").expect("GPUI_PDF_TEST_DICT_ENTRY");
+        let path = std::env::var("GLOSS_PDF_TEST_DICT_ENTRY").expect("GLOSS_PDF_TEST_DICT_ENTRY");
         let (mut dictionary, _, _) =
             load_dictionary(&PathBuf::from(path)).expect("load dictionary");
         let key = dictionary
@@ -1857,9 +1857,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "需要设置 GPUI_PDF_TEST_DICT 指向《王力古漢語字典》的 .mdx"]
+    #[ignore = "需要设置 GLOSS_PDF_TEST_DICT 指向《王力古漢語字典》的 .mdx"]
     fn wangli_dictionary_renders_styles_and_pseudo_content() {
-        let path = std::env::var("GPUI_PDF_TEST_DICT").expect("GPUI_PDF_TEST_DICT");
+        let path = std::env::var("GLOSS_PDF_TEST_DICT").expect("GLOSS_PDF_TEST_DICT");
         let (mut dictionary, _, _) =
             load_dictionary(&PathBuf::from(path)).expect("load dictionary");
         assert!(!dictionary.stylesheet.is_empty(), "external css not loaded");

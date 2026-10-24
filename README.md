@@ -1,4 +1,4 @@
-﻿# gpui-pdf
+# 笺释 (gloss-pdf)
 
 用 [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) 写的 PDF 阅读器：页面用 GPU 渲染，文字、链接、目录、搜索、高亮走 **PDF 元素层**，不是截图画布。
 
@@ -63,18 +63,18 @@
 
 ```bash
 # Windows (PowerShell) / macOS (Terminal)
-cargo run -p gpui-pdf
+cargo run -p gloss-pdf
 
 # 或直接打开一个文件
-cargo run -p gpui-pdf -- samples/dummy.pdf
+cargo run -p gloss-pdf -- samples/dummy.pdf
 ```
 
 首次编译 GPUI 较慢。运行时按「exe 目录 → 当前目录 → macOS Frameworks 目录 → 系统/Homebrew 库」顺序查找动态库。
 
 界面默认使用 **LXGW 文楷 TC**。字体文件在
-`crates/gpui-pdf/assets/fonts/lxgw-wenkai-tc/`，编译时直接嵌进二进制，
+`crates/gloss-pdf/assets/fonts/lxgw-wenkai-tc/`，编译时直接嵌进二进制，
 分发的应用自带字体，不再依赖本机的下载目录。需要换字体版本时，把
-`GPUI_PDF_FONT_DIR` 指向包含 `LXGWWenKaiTC-Regular.ttf` 和
+`GLOSS_PDF_FONT_DIR` 指向包含 `LXGWWenKaiTC-Regular.ttf` 和
 `LXGWWenKaiMonoTC-Regular.ttf` 的目录即可（重启生效）；目录不完整或读取失败时
 使用内置字体，内置字体也注册失败时回退到系统字体。
 
@@ -83,15 +83,15 @@ cargo run -p gpui-pdf -- samples/dummy.pdf
 ## 分发与自动更新
 
 支持 **Windows** 与 **macOS** 两个平台的打包发布与自动更新：
-- **Windows**：Inno Setup 生成 `gpui-pdf-<version>-setup.exe`，CI 在 `.github/workflows/windows.yml`。
-- **macOS**：生成 `gpui-pdf.app` 独立包及 `.dmg` 挂载镜像，CI 在 `.github/workflows/macos.yml`。
+- **Windows**：Inno Setup 生成 `gloss-pdf-<version>-setup.exe`，CI 在 `.github/workflows/windows.yml`。
+- **macOS**：生成 `gloss-pdf.app` 独立包及 `.dmg` 挂载镜像，CI 在 `.github/workflows/macos.yml`。
 
 发布一个新版本：
 
 ```bash
 # 1. 改 Cargo.toml 里的 [workspace.package] version（CI 会校验 tag 与它一致）
 # 2. 提交后打 tag 并推送
-git tag v0.1.3
+git tag v0.1.4
 git push origin main --tags
 ```
 
@@ -109,20 +109,20 @@ CI 会分别在 Windows 和 macOS runner 上自动编译 release、打包产物�
 
 - **Windows**（需要装 Inno Setup 6）：
   ```powershell
-  cargo build --release -p gpui-pdf
+  cargo build --release -p gloss-pdf
   & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
-  "/DAPP_VERSION=0.1.3" "installer\gpui-pdf.iss"
-  # 输出：dist\gpui-pdf-0.1.3-setup.exe
+  "/DAPP_VERSION=0.1.4" "installer\gloss-pdf.iss"
+  # 输出：dist\gloss-pdf-0.1.4-setup.exe
   ```
 
 不放安装包、直接发绿包时，需要带上：
 
 ```
-gpui-pdf.exe
+gloss-pdf.exe
 pdfium.dll
 THIRD_PARTY_NOTICES.md
 third_party/                        # PDFium 及其第三方许可
-crates/gpui-pdf/assets/fonts/lxgw-wenkai-tc/OFL.txt   # 字体许可（OFL 要求）
+crates/gloss-pdf/assets/fonts/lxgw-wenkai-tc/OFL.txt   # 字体许可（OFL 要求）
 ```
 
 字体已经嵌进 exe，不需要再带 `fonts/` 目录；`pdfium.dll` 仍必须与 exe 同目录。
@@ -161,14 +161,14 @@ crates/
 │       └── model.rs       # RectPt / CharBox / Link / Outline / PageHits / DocumentMetadata
 ├── dict-core/             # MDX 词典引擎（不依赖 UI）
 │   └── src/engine.rs      # 多词典加载、聚合查询、前缀联想、MDD/CSS/字体
-└── gpui-pdf/              # GPUI 应用
+└── gloss-pdf/             # GPUI 应用（笺释）
     ├── assets/
     │   ├── icons/         # 内嵌 SVG 图标
     │   └── fonts/lxgw-wenkai-tc/  # 文楷常规体/等宽体 + OFL.txt
     └── src/
         ├── main.rs        # 入口：日志、无边框窗口、命令行参数
         ├── assets.rs      # 内嵌静态资源
-        ├── fonts.rs       # 内嵌 LXGW 文楷，GPUI_PDF_FONT_DIR 可覆盖
+        ├── fonts.rs       # 内嵌 LXGW 文楷，GLOSS_PDF_FONT_DIR 可覆盖
         ├── app.rs         # 控制器：状态容器、订阅、顶层 Render
         ├── app/update.rs  # 更新状态机：检查/下载/启动安装器
         ├── update.rs      # GitHub Releases 检查与下载（self_update）
@@ -201,7 +201,7 @@ crates/
             ├── toast.rs
             └── empty.rs
 pdfium.dll                 # PDFium 动态库（运行时绑定）
-installer/gpui-pdf.iss     # Inno Setup 安装包定义
+installer/gloss-pdf.iss    # Inno Setup 安装包定义
 .github/workflows/         # GitHub Actions：测试、打包、发布 release
 samples/                   # 测试用 PDF（dummy.pdf / colors.pdf）
 ```
@@ -215,10 +215,10 @@ samples/                   # 测试用 PDF（dummy.pdf / colors.pdf）
 cargo test --workspace --locked
 ```
 
-当前基线：`gpui-pdf` 128 项通过（另 1 项联网测试忽略）、`dict-core` 50 项通过
+当前基线：`gloss-pdf` 128 项通过（另 1 项联网测试忽略）、`dict-core` 50 项通过
 （另 1 项真实词典测试忽略）、`pdf-core` 15 项通过。
 
-手动验证文本选择：`cargo run -p gpui-pdf -- samples/dummy.pdf`，拖选或双击选词后松开鼠标，
+手动验证文本选择：`cargo run -p gloss-pdf -- samples/dummy.pdf`，拖选或双击选词后松开鼠标，
 终端会打印页号、字符索引区间、字符数和选区文本（`Ctrl+C` 复制时同样打印），方便对照
 屏幕上选中的内容。
 
@@ -278,7 +278,7 @@ samples/dummy.pdf.highlights.json
 最近阅读（含阅读进度）保存在用户数据目录：
 
 ```
-%APPDATA%\gpui-pdf\recent.json
+%APPDATA%\gloss-pdf\recent.json
 ```
 
 只记录路径、文件名、打开时间，以及上次读到的页码、页内滚动比例、缩放和适应模式，不复制 PDF；
@@ -289,8 +289,8 @@ samples/dummy.pdf.highlights.json
 设置与查词历史也放在同一目录：
 
 ```
-%APPDATA%\gpui-pdf\settings.json
-%APPDATA%\gpui-pdf\dictionary_history.json
+%APPDATA%\gloss-pdf\settings.json
+%APPDATA%\gloss-pdf\dictionary_history.json
 ```
 
 `settings.json` 内保存多词典列表（路径、启用状态、顺序）。旧版本的单本 `dictionary_path`

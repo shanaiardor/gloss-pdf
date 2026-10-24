@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-APP_NAME="gpui-pdf"
+APP_NAME="gloss-pdf"
 VERSION="${APP_VERSION:-$(cargo metadata --no-deps --format-version 1 | grep -o '"version":"[^"]*"' | head -n1 | cut -d'"' -f4)}"
 ARCH="$(uname -m)"
 OUTPUT_DIR="$ROOT_DIR/dist"
@@ -52,11 +52,11 @@ cat <<EOF > "$APP_BUNDLE/Contents/Info.plist"
     <key>CFBundleExecutable</key>
     <string>${APP_NAME}</string>
     <key>CFBundleIdentifier</key>
-    <string>com.shanaiardor.gpui-pdf</string>
+    <string>com.shanaiardor.gloss-pdf</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>极简 PDF</string>
+    <string>笺释</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -84,7 +84,7 @@ ZIP_NAME="${APP_NAME}-${VERSION}-macos-${ARCH}.zip"
 
 echo "正在生成 DMG 镜像: $DMG_NAME ..."
 rm -f "$OUTPUT_DIR/$DMG_NAME"
-hdiutil create -volname "gpui-pdf" -srcfolder "$APP_BUNDLE" -ov -format UDZO "$OUTPUT_DIR/$DMG_NAME"
+hdiutil create -volname "gloss-pdf" -srcfolder "$APP_BUNDLE" -ov -format UDZO "$OUTPUT_DIR/$DMG_NAME"
 
 echo "正在生成 ZIP 压缩包: $ZIP_NAME ..."
 rm -f "$OUTPUT_DIR/$ZIP_NAME"

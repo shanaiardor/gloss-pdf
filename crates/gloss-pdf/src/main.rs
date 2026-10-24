@@ -32,7 +32,7 @@ use gpui_platform::application;
 
 fn main() {
     init_logging();
-    log::info!("starting gpui-pdf");
+    log::info!("starting gloss-pdf");
 
     application()
         .with_assets(assets::Assets)
@@ -71,7 +71,7 @@ fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
             WindowOptions {
                 window_bounds: Some(window_bounds),
                 titlebar: Some(TitlebarOptions {
-                    title: Some(SharedString::from("极简 PDF")),
+                    title: Some(SharedString::from("笺释")),
                     // 隐藏 Windows 原生标题栏，改用自绘的浮动控件。
                     appears_transparent: true,
                     ..Default::default()

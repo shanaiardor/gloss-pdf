@@ -230,7 +230,7 @@ impl AppState {
                     })
                     .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                         this.set_status(
-                            format!("gpui-pdf {} · GPUI + PDFium", env!("CARGO_PKG_VERSION")),
+                            format!("笺释 (gloss-pdf) {} · GPUI + PDFium", env!("CARGO_PKG_VERSION")),
                             cx,
                         );
                         cx.notify();
