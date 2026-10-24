@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use dict_core::Event as DictEvent;
 use gpui::{
     ClipboardItem, Context, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Point, ScrollDelta, ScrollWheelEvent, Window,
+    MouseUpEvent, Point, ScrollDelta, ScrollEvent, Window,
 };
 use pdf_core::{CharBox, Event, LinkTarget};
 
@@ -299,7 +299,7 @@ impl super::AppState {
     /// 触控板的小增量按比例折算，不量化成整百分点。
     pub(crate) fn on_scroll_wheel(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {

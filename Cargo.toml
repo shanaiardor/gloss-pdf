@@ -18,8 +18,8 @@ image = "0.25"
 unicode-segmentation = "1"
 env_logger = "0.11"
 pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_latest"] }
-gpui = { git = "https://github.com/zed-industries/zed", rev = "4bd1993783703e92affb781503916d1f152f599f", package = "gpui" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "4bd1993783703e92affb781503916d1f152f599f", package = "gpui_platform" }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "79fe6a645f68f8c9230578f154bf99852d9f716f", package = "gpui" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "79fe6a645f68f8c9230578f154bf99852d9f716f", package = "gpui_platform" }
 
 [profile.release]
 lto = "fat"

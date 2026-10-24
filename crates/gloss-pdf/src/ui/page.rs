@@ -23,7 +23,7 @@ impl AppState {
             .size_full()
             .overflow_scroll()
             .track_scroll(&self.viewer.scroll)
-            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+            .on_scroll(cx.listener(Self::on_scroll_wheel))
             // 拖选挂在容器上：指针滑出页面甚至滑到别的页也能继续扩展选区。
             .on_mouse_move(cx.listener(Self::on_page_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_page_mouse_up))
