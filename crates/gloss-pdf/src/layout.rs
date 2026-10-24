@@ -101,6 +101,24 @@ pub const GLOSS_RAIL_GAP: f32 = 16.0;
 pub const GLOSS_RAIL_EXTENT: f32 = GLOSS_RAIL_GAP + GLOSS_RAIL_WIDTH;
 /// 同页相邻两张页边笺注卡片之间的最小纵向间距。
 pub const GLOSS_CARD_GAP: f32 = 10.0;
+/// 预留笺注栏后，正文至少还要留下的宽度。
+///
+/// 低于这个宽度就不再预留笺注栏：宁可让笺注卡临时浮在纸张上，也不把正文压成一条。
+pub const MIN_READING_WIDTH_WITH_RAIL: f32 = 240.0;
+
+/// 视口是否宽到可以同时放下「正文 + 笺注栏」。
+///
+/// [`FitArea`] 与 [`DocumentLayout`] 必须共用这一个判断：一个扣栏宽、一个加栏宽，
+/// 两边口径不一致时，窗口刚过阈值页面会突然缩水，差一点又会要求横向滚动。
+pub fn rail_fits(viewport_width: f32) -> bool {
+    let viewport_width = if viewport_width.is_finite() {
+        viewport_width.max(0.0)
+    } else {
+        0.0
+    };
+    let base_width = (viewport_width - PAGE_PAD * 2.0).max(0.0);
+    base_width > GLOSS_RAIL_EXTENT + MIN_READING_WIDTH_WITH_RAIL
+}
 
 impl FitArea {
     /// 从窗口视口尺寸算出页面可用区域。
@@ -112,7 +130,7 @@ impl FitArea {
     /// 从窗口视口尺寸算出页面可用区域；开启页边笺注栏且视口足够宽时扣除笺注栏宽度。
     pub fn from_viewport_with_rail(width: f32, height: f32, has_rail: bool) -> Self {
         let base_width = (width - PAGE_PAD * 2.0).max(1.0);
-        let width = if has_rail && base_width > GLOSS_RAIL_EXTENT + 240.0 {
+        let width = if has_rail && rail_fits(width) {
             base_width - GLOSS_RAIL_EXTENT
         } else {
             base_width
@@ -214,7 +232,10 @@ pub struct GlossSlot {
 
 /// 计算同一页右侧笺注栏内多张卡片的纵向排布：
 /// 尽量对齐各自原文所在的 `desired_top`，发生重叠时向下顺延推开；
-/// 若底部超出页高，则在允许范围内向上回推，保证不重叠且 `top >= 0`。
+/// 若底部超出页高，则从最后一张开始向上回推，保证不重叠且 `top >= 0`。
+///
+/// 只有整列高度（含间距）不超过页高时，才能同时保证「底部不超页」；
+/// 卡片本身放不下时，这里优先保住顶部与最小间距，底部允许超出，由渲染层裁剪。
 pub fn layout_gloss_slots(inputs: &[GlossSlotInput], page_height: f32) -> Vec<GlossSlot> {
     if inputs.is_empty() {
         return Vec::new();
@@ -249,28 +270,33 @@ pub fn layout_gloss_slots(inputs: &[GlossSlotInput], page_height: f32) -> Vec<Gl
         });
     }
 
-    if page_height.is_finite() && page_height > 0.0 {
-        if let Some(last) = slots.last_mut()
-            && last.top + last.height > page_height
-        {
-            last.top = (page_height - last.height).max(0.0);
+    if !page_height.is_finite() || page_height <= 0.0 {
+        return slots;
+    }
+
+    let Some(last) = slots.last() else {
+        return slots;
+    };
+    if last.top + last.height <= page_height {
+        return slots;
+    }
+
+    // 从最后一张开始逐张压回页底；某张被压到 0 时，它前面的卡可能重叠，
+    // 因此再从前往后按最小间距摊开。整列确实放不下时，最后一版仍会超出页高。
+    let mut limit = page_height;
+    for slot in slots.iter_mut().rev() {
+        if slot.top + slot.height > limit {
+            slot.top = (limit - slot.height).max(0.0);
         }
-        for i in (0..slots.len().saturating_sub(1)).rev() {
-            let max_top = (slots[i + 1].top - slots[i].height - GLOSS_CARD_GAP).max(0.0);
-            if slots[i].top > max_top {
-                slots[i].top = max_top;
-            }
+        limit = slot.top - GLOSS_CARD_GAP;
+    }
+    let mut previous_bottom: Option<f32> = None;
+    for slot in &mut slots {
+        let min_top = previous_bottom.map_or(0.0, |bottom| bottom + GLOSS_CARD_GAP);
+        if slot.top < min_top {
+            slot.top = min_top;
         }
-        for i in 0..slots.len() {
-            let min_top = if i == 0 {
-                0.0
-            } else {
-                slots[i - 1].top + slots[i - 1].height + GLOSS_CARD_GAP
-            };
-            if slots[i].top < min_top {
-                slots[i].top = min_top;
-            }
-        }
+        previous_bottom = Some(slot.top + slot.height);
     }
 
     slots
@@ -295,8 +321,9 @@ impl DocumentLayout {
         Self::with_rail(pages, zoom, viewport_width, false)
     }
 
-    /// 排版整篇文档；`has_rail` 为真时在纸张右侧预留专属笺注栏（[`GLOSS_RAIL_EXTENT`]），
-    /// 让「PDF 纸张 + 右侧笺注栏」作为整体在视口内居中，并在窗口过窄时支持横向滚动。
+    /// 排版整篇文档；`has_rail` 为真且视口放得下时在纸张右侧预留专属笺注栏
+    /// （[`GLOSS_RAIL_EXTENT`]），让「PDF 纸张 + 右侧笺注栏」作为整体在视口内居中。
+    /// 视口太窄时不预留栏宽，笺注卡改由渲染层临时浮在纸张上，避免横向滚动。
     pub fn with_rail(pages: &[PageSize], zoom: f32, viewport_width: f32, has_rail: bool) -> Self {
         let zoom = if zoom.is_finite() && zoom > 0.0 {
             zoom
@@ -308,7 +335,11 @@ impl DocumentLayout {
         } else {
             0.0
         };
-        let extra_rail = if has_rail { GLOSS_RAIL_EXTENT } else { 0.0 };
+        let extra_rail = if has_rail && rail_fits(viewport_width) {
+            GLOSS_RAIL_EXTENT
+        } else {
+            0.0
+        };
 
         let mut boxes = Vec::with_capacity(pages.len());
         let mut top = TOP_INSET;
@@ -877,5 +908,73 @@ mod point_anchor_tests {
         // 第三张卡片原本在 780，高度 90 超出页高 800，被回推到 710。
         assert_eq!(slots[2].id, 3);
         assert!((slots[2].top - 710.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn layout_gloss_slots_pulls_a_fitting_stack_back_inside_the_page() {
+        // 三张 100 高、页高 340：算上两道间距仍然放得下，整列要完整落在页内。
+        let inputs = [(1, 100.0), (2, 260.0), (3, 300.0)].map(|(id, desired_top)| GlossSlotInput {
+            id,
+            desired_top,
+            height: 100.0,
+        });
+        let slots = layout_gloss_slots(&inputs, 340.0);
+
+        assert_eq!(slots.len(), 3);
+        assert!(slots[0].top >= 0.0);
+        for pair in slots.windows(2) {
+            assert!(pair[0].top + pair[0].height + GLOSS_CARD_GAP <= pair[1].top + 0.01);
+        }
+        let last = slots.last().unwrap();
+        assert!(last.top + last.height <= 340.0 + 0.01);
+    }
+
+    #[test]
+    fn layout_gloss_slots_documents_the_impossible_case() {
+        // 三张 100 高 + 两道间距 = 320 > 页高 300：任何排布都无法既不重叠又不超页。
+        // 这里只能保证顶部不为负、卡片之间不重叠，底部允许溢出交给渲染层裁剪。
+        let inputs = [(1, 0.0), (2, 0.0), (3, 0.0)].map(|(id, desired_top)| GlossSlotInput {
+            id,
+            desired_top,
+            height: 100.0,
+        });
+        let slots = layout_gloss_slots(&inputs, 300.0);
+
+        assert_eq!(slots[0].top, 0.0);
+        assert!((slots[1].top - 110.0).abs() < 0.01);
+        assert!((slots[2].top - 220.0).abs() < 0.01);
+        assert!(slots[2].top + slots[2].height > 300.0);
+    }
+
+    #[test]
+    fn rail_fits_matches_the_fit_area_and_document_layout() {
+        // 阈值两侧：两个使用方必须同时认为栏宽可预留 / 不可预留。
+        for viewport in [640.0, 652.0, 653.0, 900.0, 1400.0] {
+            let fits = rail_fits(viewport);
+            let area = FitArea::from_viewport_with_rail(viewport, 800.0, true);
+            let base = (viewport - PAGE_PAD * 2.0).max(1.0);
+            if fits {
+                assert!((area.width - (base - GLOSS_RAIL_EXTENT)).abs() < 0.01);
+            } else {
+                assert!((area.width - base).abs() < 0.01);
+            }
+
+            let layout = DocumentLayout::with_rail(
+                &[PageSize {
+                    width: 600.0,
+                    height: 800.0,
+                }],
+                1.0,
+                viewport,
+                true,
+            );
+            let page = layout.page_box(0).unwrap();
+            if fits {
+                assert!(layout.content_width >= page.width + GLOSS_RAIL_EXTENT);
+            } else {
+                // 不预留栏宽时，内容宽度只由纸张和页边距决定，不因笺注栏多出横向滚动。
+                assert!((layout.content_width - (PAGE_PAD * 2.0 + 600.0)).abs() < 0.01);
+            }
+        }
     }
 }

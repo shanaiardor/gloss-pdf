@@ -23,17 +23,20 @@ use crate::app::AppState;
 use crate::dictionary::{DictLoadState, DictRequest};
 use crate::highlights::PinnedGloss;
 use crate::layout::{
-    DocumentLayout, GLOSS_RAIL_GAP, GLOSS_RAIL_WIDTH, GlossSlotInput, layout_gloss_slots,
+    DocumentLayout, GLOSS_CARD_GAP, GLOSS_RAIL_GAP, GLOSS_RAIL_WIDTH, GlossSlotInput, PAGE_PAD,
+    layout_gloss_slots,
 };
 use crate::theme::Theme;
 
 /// 把释义内 `entry://` 链接的查词请求送回 `AppState` 的通道。
 type LookupSender = futures::channel::mpsc::UnboundedSender<DictRequest>;
 
-/// 钉住的紧凑笺注卡在排布避让时的估算高度（逻辑像素）。
-const PINNED_CARD_ESTIMATED_HEIGHT: f32 = 88.0;
-/// 激活态查词卡在排布避让时的估算高度（逻辑像素）。
-const ACTIVE_CARD_ESTIMATED_HEIGHT: f32 = 340.0;
+/// 钉住的紧凑笺注卡首帧还没有实测高度时的保守估算（逻辑像素）。
+///
+/// 真实高度按内容测量；估算值只用于第一帧，宁可多留一点也不能压住下一张卡。
+const PINNED_CARD_ESTIMATED_HEIGHT: f32 = 120.0;
+/// 激活态查词卡至少保留的高度；放不下时优先压缩正文滚动区。
+const MIN_ACTIVE_CARD_HEIGHT: f32 = 220.0;
 /// 激活态查词卡在 `GlossSlotInput` 中的保留 ID。
 const ACTIVE_SLOT_ID: u64 = u64::MAX;
 
@@ -41,6 +44,10 @@ impl AppState {
     /// 渲染第 `page` 页右侧的页边笺注栏（含该页已钉住的紧凑笺注卡与激活态查词卡）。
     ///
     /// 若该页既没有已钉住的笺注、也不是当前激活态查词卡所在页，则返回 `None`。
+    ///
+    /// 卡片高度优先用上一帧的实测值（[`Self::gloss_card_height`]），首帧才退回估算。
+    /// 所有卡片都放在一个 `overflow_hidden` 的裁剪层里：即使整列确实放不下，
+    /// 也不会越过页底盖到下一页的笺注栏上。
     pub(crate) fn page_gloss_rail(
         &self,
         page: usize,
@@ -71,68 +78,134 @@ impl AppState {
         }
 
         let zoom = self.viewer.zoom;
+        let pinned_heights: Vec<f32> = pinned
+            .iter()
+            .map(|gloss| {
+                self.gloss_card_height(gloss.id, PINNED_CARD_ESTIMATED_HEIGHT)
+                    .min(geometry.height)
+            })
+            .collect();
+        // 激活卡最多占「页高 - 已钉卡」的剩余空间，保证两张卡不会互相压住。
+        // 空间实在不够时保留一个最小可用高度，由裁剪层兜底。
+        let pinned_extent = pinned_heights.iter().sum::<f32>()
+            + GLOSS_CARD_GAP * pinned_heights.len().saturating_sub(1) as f32;
+        let active_max_height = (geometry.height - pinned_extent - GLOSS_CARD_GAP)
+            .max(MIN_ACTIVE_CARD_HEIGHT)
+            .min(geometry.height);
+
         let mut slot_inputs = Vec::with_capacity(pinned.len() + usize::from(active_here));
-        for gloss in &pinned {
+        for (gloss, height) in pinned.iter().zip(pinned_heights.iter().copied()) {
             slot_inputs.push(GlossSlotInput {
                 id: gloss.id,
                 desired_top: (gloss.anchor_top * zoom).clamp(0.0, geometry.height),
-                height: PINNED_CARD_ESTIMATED_HEIGHT,
+                height,
             });
         }
         if active_here {
+            let height = self
+                .gloss_card_height(ACTIVE_SLOT_ID, active_max_height)
+                .min(active_max_height)
+                .max(1.0);
             slot_inputs.push(GlossSlotInput {
                 id: ACTIVE_SLOT_ID,
                 desired_top: (self.dictionary.anchor_top * zoom).clamp(0.0, geometry.height),
-                height: ACTIVE_CARD_ESTIMATED_HEIGHT.min(geometry.height),
+                height,
             });
         }
 
         let slots = layout_gloss_slots(&slot_inputs, geometry.height);
+
+        // 视口放得下「纸张 + 栏」时栏在预留位；放不下时把整张卡夹回视口内，
+        // 临时浮在纸张右侧，既不要求横向滚动，也不改变纸张宽度和缩放。
+        let viewport_width = f32::from(self.viewport.width);
+        let rail_left = if layout.content_width <= viewport_width {
+            geometry
+                .rail_left()
+                .min((viewport_width - GLOSS_RAIL_WIDTH - PAGE_PAD).max(PAGE_PAD))
+        } else {
+            geometry.rail_left()
+        };
+        // 卡片被夹回纸张上方时，引线会横穿正文，这时不画引线。
+        let connected = rail_left + 0.5 >= geometry.rail_left();
+
         let mut rail = div()
             .absolute()
-            .left(px(geometry.rail_left()))
+            .left(px(rail_left))
             .top(px(geometry.top))
             .w(px(GLOSS_RAIL_WIDTH))
             .h(px(geometry.height));
+        let mut cards = div()
+            .absolute()
+            .left_0()
+            .top_0()
+            .w(px(GLOSS_RAIL_WIDTH))
+            .h(px(geometry.height))
+            .overflow_hidden();
+
+        let view = cx.entity().downgrade();
 
         for slot in slots {
             if slot.id == ACTIVE_SLOT_ID {
-                let anchor_y =
-                    (self.dictionary.anchor_top * zoom + 10.0).clamp(8.0, geometry.height - 8.0);
-                rail = rail
-                    .child(gloss_connector(
+                if connected {
+                    let anchor_y = (self.dictionary.anchor_top * zoom + 10.0)
+                        .clamp(8.0, geometry.height - 8.0);
+                    rail = rail.child(gloss_connector(
                         anchor_y,
                         slot.top + 18.0,
                         theme.accent.opacity(0.55),
-                    ))
-                    .child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .top(px(slot.top))
-                            .w(px(GLOSS_RAIL_WIDTH))
-                            .child(self.active_gloss_card(geometry.height, theme, cx)),
-                    );
+                    ));
+                }
+                cards = cards.child(measured_card(
+                    view.clone(),
+                    ACTIVE_SLOT_ID,
+                    slot.top,
+                    self.active_gloss_card(active_max_height, theme, cx),
+                ));
             } else if let Some(gloss) = pinned.iter().copied().find(|g| g.id == slot.id) {
-                let anchor_y = (gloss.anchor_top * zoom + 10.0).clamp(8.0, geometry.height - 8.0);
-                rail = rail
-                    .child(gloss_connector(
+                if connected {
+                    let anchor_y =
+                        (gloss.anchor_top * zoom + 10.0).clamp(8.0, geometry.height - 8.0);
+                    rail = rail.child(gloss_connector(
                         anchor_y,
                         slot.top + 16.0,
                         theme.accent.opacity(0.28),
-                    ))
-                    .child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .top(px(slot.top))
-                            .w(px(GLOSS_RAIL_WIDTH))
-                            .child(self.pinned_gloss_card(gloss, theme, cx)),
-                    );
+                    ));
+                }
+                cards = cards.child(measured_card(
+                    view.clone(),
+                    gloss.id,
+                    slot.top,
+                    self.pinned_gloss_card(gloss, theme, cx),
+                ));
             }
         }
 
-        Some(rail)
+        Some(rail.child(cards))
+    }
+
+    /// 上一帧实测到的卡片高度；没有测量结果时用 `fallback`。
+    fn gloss_card_height(&self, id: u64, fallback: f32) -> f32 {
+        self.gloss_card_heights
+            .get(&id)
+            .copied()
+            .filter(|height| height.is_finite() && *height > 0.0)
+            .unwrap_or(fallback)
+    }
+
+    /// 记录一张卡片的真实高度；变化时安排下一帧按新高度重新避让。
+    fn record_gloss_card_height(&mut self, id: u64, height: f32, cx: &mut Context<Self>) {
+        if !height.is_finite() || height <= 0.0 {
+            return;
+        }
+        if self
+            .gloss_card_heights
+            .get(&id)
+            .is_some_and(|measured| (*measured - height).abs() < 0.5)
+        {
+            return;
+        }
+        self.gloss_card_heights.insert(id, height);
+        cx.notify();
     }
 
     /// 紧凑态页边笺注卡：展示词头、音标与 1~2 行核心释义摘要，点击展开为完整查词卡。
@@ -227,13 +300,16 @@ impl AppState {
     }
 
     /// 激活态页边查词卡：包含标题栏（返回/最近/钉住/关闭）、手动查词框、前缀建议、历史与完整 MDX 释义。
+    ///
+    /// `max_height` 是排版为它预留的最大高度：卡片自身也被限制在这个高度内，
+    /// 释义区改为内部滚动，避免真实高度超出估算后压住下面的已钉卡片。
     fn active_gloss_card(
         &self,
-        page_height: f32,
+        max_height: f32,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let max_body_h = (page_height - 120.0).clamp(180.0, 320.0);
+        let max_body_h = (max_height - 150.0).clamp(60.0, 320.0);
         let mut body = div()
             .id("gloss-active-body-scroll")
             .max_h(px(max_body_h))
@@ -293,22 +369,24 @@ impl AppState {
         let mut card = div()
             .id("gloss-active-card")
             .w(px(GLOSS_RAIL_WIDTH))
+            .max_h(px(max_height))
             .flex()
             .flex_col()
+            .overflow_hidden()
             .rounded_lg()
             .bg(theme.surface.opacity(0.98))
             .border_1()
             .border_color(theme.accent.opacity(0.55))
             .shadow_lg()
             .occlude()
-            .on_scroll(cx.listener(
-                |_this, event: &ScrollEvent, _window: &mut Window, cx| {
+            .on_scroll(
+                cx.listener(|_this, event: &ScrollEvent, _window: &mut Window, cx| {
                     // 词典释义区滚轮独立滚动，不带动外层 PDF 页面。
                     if !event.modifiers.control {
                         cx.stop_propagation();
                     }
-                },
-            ))
+                }),
+            )
             .child(self.gloss_card_header(theme, cx))
             .child(self.gloss_query_row(theme, cx));
 
@@ -601,7 +679,35 @@ impl AppState {
     }
 }
 
+/// 把卡片包进一个只负责定位与测量的容器。
+///
+/// `on_children_prepainted` 在真正的绘制阶段拿到卡片的实际边界，下一帧排版
+/// 就能用真实高度避让；不再依赖 88/340 这种容易失真的常量。
+fn measured_card(
+    view: gpui::WeakEntity<AppState>,
+    id: u64,
+    top: f32,
+    card: impl IntoElement,
+) -> Div {
+    div()
+        .absolute()
+        .left_0()
+        .top(px(top))
+        .w(px(GLOSS_RAIL_WIDTH))
+        .on_children_prepainted(move |bounds, _window, cx| {
+            let Some(bounds) = bounds.first() else {
+                return;
+            };
+            let height = f32::from(bounds.size.height);
+            let _ = view.update(cx, |this, cx| this.record_gloss_card_height(id, height, cx));
+        })
+        .child(card)
+}
+
 /// 纸张右缘到页边笺注卡之间的引线标记：当卡片因避让发生纵向偏移时，用短折线保持锚点指向。
+///
+/// 纯装饰元素：不要给它加 `id`、`cursor`、点击监听或 `occlude()`，否则 GPUI 会为它
+/// 插入 hitbox，左缘伸进纸张与栏之间 14px 缝隙的那一段就会挡住页面点击。
 fn gloss_connector(anchor_y: f32, card_y: f32, color: Rgba) -> Div {
     let top = anchor_y.min(card_y);
     let height = (anchor_y - card_y).abs().max(1.5);

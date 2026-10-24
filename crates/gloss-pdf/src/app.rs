@@ -19,7 +19,7 @@ mod window;
 
 pub use window::initial_window_bounds;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use dict_core::{Command as DictCommand, DictEngine, DictionaryConfig};
@@ -72,6 +72,9 @@ pub struct AppState {
     /// 释义内 `entry://` 链接点击时把查词请求送回 `AppState`。
     pub(crate) dict_query: futures::channel::mpsc::UnboundedSender<DictRequest>,
     pub(crate) dictionary: DictionaryState,
+    /// 页边笺注卡上一帧实测高度，按卡片 id（钉住的 id / 激活卡占位 id）缓存。
+    /// 排版用真实高度避让，比「估算 88/340」可靠；首帧还没有数据时用估算值。
+    pub(crate) gloss_card_heights: HashMap<u64, f32>,
     /// 持久化的查词历史，最新的在前。
     pub(crate) dict_history: DictHistory,
     pub(crate) main_window_bounds: Option<Bounds<gpui::Pixels>>,
@@ -313,9 +316,8 @@ impl AppState {
                 }
                 TextInputEvent::Submitted { .. } => this.submit_dict_query(cx),
                 TextInputEvent::Cancelled => {
-                    this.dict_input.update(cx, |input, cx| input.clear(cx));
-                    this.pending_focus = Some(FocusTarget::Root);
-                    cx.notify();
+                    // 和其他位置的 Esc 保持一致：收起整张查词卡，而不是只清空输入框。
+                    this.close_dictionary(cx);
                 }
             },
         )
@@ -338,6 +340,7 @@ impl AppState {
             dict,
             dict_query,
             dictionary,
+            gloss_card_heights: HashMap::new(),
             dict_history,
             main_window_bounds: None,
             display_bounds: None,

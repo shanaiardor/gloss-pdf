@@ -159,8 +159,9 @@ impl super::AppState {
 
             let (room_width, room_height) = window_room(window, cx);
             let (mut width, height) = window_size_for_page(page, room_width, room_height);
-            // 若文档带有页边笺注或已开启词典，尽量给窗口留出页边笺注栏的横向余量。
-            if self.has_gloss_rail() || self.settings.current.has_enabled_dictionary() {
+            // 只有文档里已有钉住的笺注、确实需要常驻栏位时才加宽；
+            // 「配置了词典」本身不该把没打开词典的窗口也撑宽。
+            if self.has_gloss_rail() {
                 width = (width + GLOSS_RAIL_EXTENT).min(room_width);
             }
             log::info!(

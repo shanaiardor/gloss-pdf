@@ -132,8 +132,12 @@ impl AppState {
         }
 
         // 当前激活态查词锚点：在正文中标出正被查阅的词条。
-        if self.dictionary.open && self.dictionary.anchor_page == index {
-            for rect in &self.dictionary.anchor_rects {
+        // 只有锚点确实属于当前词时才画；词条内跳转/手动查词没有正文锚点。
+        if self.dictionary.open
+            && self.dictionary.anchor_page == index
+            && let Some(rects) = self.dictionary.anchor_rects_for(&self.dictionary.word)
+        {
+            for rect in rects {
                 overlays.push(
                     gloss_rect_overlay(
                         rect,

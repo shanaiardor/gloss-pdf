@@ -40,6 +40,11 @@ pub struct DictionaryState {
     pub anchor_page: usize,
     /// 原文被选词在页面上的 PDF 坐标框（pt，原点左下角）。
     pub anchor_rects: Vec<RectPt>,
+    /// `anchor_rects` 对应哪个词。
+    ///
+    /// 手动输入、词条内链接或前缀建议查到的词都没有正文锚点；只有这里记的词
+    /// 和当前词一致时，才能把被钉住的词画回原文位置，否则会画到上一个词身上。
+    pub anchor_word: Option<String>,
     /// 活动笺注卡距离该页顶部的纵向偏移（PDF pt，向下为正）。
     pub anchor_top: f32,
     /// 词条内点击 `entry://` 链接跳转时的历史词头栈，用于一键返回原词。
@@ -75,15 +80,49 @@ impl DictionaryState {
     }
 
     /// 设置活动笺注卡在文档中的页码与纵向锚点。
+    ///
+    /// 这是「没有正文锚点」的通用版本（手动查词、打开空卡）；有原文选区时用
+    /// [`Self::set_anchor_for_word`] 记下锚点属于哪个词。
     pub fn set_anchor(&mut self, page: usize, rects: Vec<RectPt>, anchor_top: f32) {
         self.anchor_page = page;
         self.anchor_rects = rects;
+        self.anchor_word = None;
         self.anchor_top = if anchor_top.is_finite() && anchor_top >= 0.0 {
             anchor_top
         } else {
             0.0
         };
         self.back_stack.clear();
+    }
+
+    /// 记录「正文选区属于 `word`」的锚点；空选区不记词，避免钉住时误用旧坐标。
+    pub fn set_anchor_for_word(
+        &mut self,
+        page: usize,
+        rects: Vec<RectPt>,
+        anchor_top: f32,
+        word: &str,
+    ) {
+        let has_rects = !rects.is_empty();
+        self.set_anchor(page, rects, anchor_top);
+        if has_rects {
+            let word = word.trim();
+            if !word.is_empty() {
+                self.anchor_word = Some(word.to_string());
+            }
+        }
+    }
+
+    /// 取当前词在正文里的锚点框；锚点属于别的词（或手动查词）时返回 `None`。
+    pub fn anchor_rects_for(&self, word: &str) -> Option<&[RectPt]> {
+        let word = word.trim();
+        if word.is_empty() || self.anchor_rects.is_empty() {
+            return None;
+        }
+        self.anchor_word
+            .as_deref()
+            .filter(|anchored| anchored.eq_ignore_ascii_case(word))
+            .map(|_| self.anchor_rects.as_slice())
     }
 
     /// 清空一次查询的结果，保留词典加载状态。
@@ -98,6 +137,7 @@ impl DictionaryState {
         self.error = None;
         self.pending_term = None;
         self.anchor_rects.clear();
+        self.anchor_word = None;
         self.back_stack.clear();
         self.show_history = false;
     }
@@ -251,6 +291,28 @@ mod tests {
     fn normalize_term_caps_length() {
         let term = normalize_term(&"a".repeat(100));
         assert_eq!(term.chars().count(), 64);
+    }
+
+    #[test]
+    fn anchor_rects_only_belong_to_the_word_they_were_selected_from() {
+        let mut state = DictionaryState::default();
+        let rect = RectPt {
+            left: 1.0,
+            bottom: 2.0,
+            right: 3.0,
+            top: 4.0,
+        };
+        state.set_anchor_for_word(2, vec![rect], 120.0, "apple");
+
+        assert_eq!(
+            state.anchor_rects_for("Apple").map(|rects| rects.len()),
+            Some(1)
+        );
+        // 手动输入 banana 后不能继续借用 apple 的坐标。
+        assert!(state.anchor_rects_for("banana").is_none());
+
+        state.set_anchor(2, Vec::new(), 24.0);
+        assert!(state.anchor_rects_for("apple").is_none());
     }
 
     #[test]

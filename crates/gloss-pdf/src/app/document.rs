@@ -25,6 +25,8 @@ use super::FocusTarget;
 pub(super) const PROGRESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// 连续滚动时合并写盘，避免每一帧都碰磁盘。
 const PROGRESS_FLUSH_DELAY: Duration = Duration::from_millis(800);
+/// 手动输入查词时，活动笺注卡在页内的默认纵向位置（PDF pt，距页顶）。
+const MANUAL_ANCHOR_TOP: f32 = 24.0;
 
 impl super::AppState {
     // ---------- 打开与关闭 ----------
@@ -127,6 +129,8 @@ impl super::AppState {
         self.dict_input.update(cx, |input, cx| input.clear(cx));
         self.search_input.update(cx, |input, cx| input.clear(cx));
         self.panning = None;
+        // 卡片高度是上一份文档实测的，换文档后重新测量。
+        self.gloss_card_heights.clear();
         // 换文档时重置胶囊可见性：新文档先亮着让用户看见按钮。
         self.chrome = crate::chrome_visibility::ChromeVisibility::new();
 
@@ -201,6 +205,7 @@ impl super::AppState {
         self.window_title_dirty = true;
         self.dictionary.clear_results();
         self.dictionary.open = false;
+        self.gloss_card_heights.clear();
         self.home.menu_open = None;
         self.home.search_focused = false;
         self.home.query.clear();
@@ -344,7 +349,13 @@ impl super::AppState {
         }
 
         let (phonetic, summary) = summarize_entries(&self.dictionary.entries, &word);
-        let rects = self.dictionary.anchor_rects.clone();
+        // 只有当前词确实对应正文选区时才沿用高亮坐标；手动输入、词条内链接
+        // 或前缀建议没有正文锚点，钉住时不能把上一个词的框画到这个词身上。
+        let rects = self
+            .dictionary
+            .anchor_rects_for(&word)
+            .map(<[pdf_core::RectPt]>::to_vec)
+            .unwrap_or_default();
         let anchor_top = self.dictionary.anchor_top;
         let had_rail = self.has_gloss_rail();
 
@@ -380,7 +391,7 @@ impl super::AppState {
         };
 
         self.dictionary
-            .set_anchor(gloss.page, gloss.rects, gloss.anchor_top);
+            .set_anchor_for_word(gloss.page, gloss.rects, gloss.anchor_top, &gloss.word);
         self.dict_input
             .update(cx, |input, cx| input.set_value(gloss.word.clone(), cx));
         self.lookup_word(gloss.word, cx);
@@ -556,6 +567,17 @@ impl super::AppState {
         .detach();
     }
 
+    /// 手动输入或以建议/历史词查词：这类查询没有正文选区，先清掉旧锚点。
+    ///
+    /// 锚点不清会让「钉住」把上一个词的高亮框画到新词身上（手动查 banana 却沿用
+    /// 双击 apple 时的坐标）。这里把卡放回当前页顶部，并让后续钉住不带高亮。
+    fn lookup_manually(&mut self, term: String, cx: &mut Context<Self>) {
+        let page = self.viewer.current_page;
+        self.dictionary
+            .set_anchor(page, Vec::new(), MANUAL_ANCHOR_TOP);
+        self.lookup_word(term, cx);
+    }
+
     /// 在查词输入框按 Enter 或点「查」按钮提交查询。
     pub(crate) fn submit_dict_query(&mut self, cx: &mut Context<Self>) {
         let term = self.dict_input.read(cx).value().trim().to_string();
@@ -563,7 +585,7 @@ impl super::AppState {
             return;
         }
         self.pending_focus = Some(FocusTarget::Root);
-        self.lookup_word(term, cx);
+        self.lookup_manually(term, cx);
     }
 
     /// 点击建议词或历史词：回填输入框并立即查词。
@@ -571,7 +593,7 @@ impl super::AppState {
         self.dict_input
             .update(cx, |input, cx| input.set_value(term.clone(), cx));
         self.pending_focus = Some(FocusTarget::Root);
-        self.lookup_word(term, cx);
+        self.lookup_manually(term, cx);
     }
 
     /// 点击释义内 `entry://` 链接：把当前词压入返回栈，保持当前页锚点不变并跳转查词。
@@ -597,7 +619,9 @@ impl super::AppState {
     }
 
     /// 工具栏词典按钮或 `Ctrl+Shift+D`：在当前页开启或收起页边查词卡。
-    pub(crate) fn toggle_dictionary_window(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// 活动卡只是浮层，不参与笺注栏宽度计算，所以开关它不重排、不重新缩放。
+    pub(crate) fn toggle_gloss_card(&mut self, cx: &mut Context<Self>) {
         if self.dictionary.open {
             self.close_dictionary(cx);
             return;
@@ -610,17 +634,13 @@ impl super::AppState {
             return;
         }
 
-        let had_rail = self.has_gloss_rail();
         let page = self.viewer.current_page;
         // 若还没有锚定在当前页，则把查词卡放在当前页靠上的舒适位置，并聚焦输入框。
         if self.dictionary.anchor_page != page || self.dictionary.word.is_empty() {
-            self.dictionary.set_anchor(page, Vec::new(), 24.0);
+            self.dictionary
+                .set_anchor(page, Vec::new(), MANUAL_ANCHOR_TOP);
         }
         self.dictionary.open = true;
-        if had_rail != self.has_gloss_rail() {
-            self.refit();
-            self.ensure_visible_pages();
-        }
         self.pending_focus = Some(FocusTarget::Dictionary);
         cx.notify();
     }
@@ -630,15 +650,10 @@ impl super::AppState {
         if !self.dictionary.open {
             return;
         }
-        let had_rail = self.has_gloss_rail();
         self.dictionary.open = false;
         self.dictionary.suggestions.clear();
         self.dictionary.show_history = false;
         self.pending_focus = Some(FocusTarget::Root);
-        if had_rail != self.has_gloss_rail() {
-            self.refit();
-            self.ensure_visible_pages();
-        }
         cx.notify();
     }
 
@@ -647,8 +662,6 @@ impl super::AppState {
         if term.is_empty() {
             return;
         }
-
-        let had_rail = self.has_gloss_rail();
 
         // 回车/点击确认后不再展示建议，并让尚未返回的联想结果失效。
         self.dictionary.suggest_request = self.dictionary.suggest_request.wrapping_add(1);
@@ -674,10 +687,6 @@ impl super::AppState {
             DictLoadState::Loading => {
                 self.dictionary.pending_term = Some(term);
                 self.dictionary.open = true;
-                if had_rail != self.has_gloss_rail() {
-                    self.refit();
-                    self.ensure_visible_pages();
-                }
                 self.set_status("词典正在加载…", cx);
                 cx.notify();
                 return;
@@ -691,10 +700,6 @@ impl super::AppState {
             DictLoadState::Failed(message) => {
                 self.dictionary.error = Some(message.clone());
                 self.dictionary.open = true;
-                if had_rail != self.has_gloss_rail() {
-                    self.refit();
-                    self.ensure_visible_pages();
-                }
                 self.set_status(message, cx);
                 cx.notify();
                 return;
@@ -711,11 +716,6 @@ impl super::AppState {
         self.dictionary.entries.clear();
         self.dictionary.pending_term = None;
         self.dictionary.open = true;
-
-        if had_rail != self.has_gloss_rail() {
-            self.refit();
-            self.ensure_visible_pages();
-        }
 
         if let Err(error) = self
             .dict
