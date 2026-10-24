@@ -1,9 +1,9 @@
-//! 页面区域：连续滚动的页面列、每页位图与选择/搜索/高亮/链接覆盖层。
+//! 页面区域：连续滚动的页面列、每页位图与选择/搜索/高亮/链接覆盖层，以及右侧页边笺注栏。
 //!
 //! 整篇文档是**一列绝对定位的页面**：每页的 top/left 由 `DocumentLayout` 算好，
 //! 总高度固定，所以只渲染可视范围附近的几页也不影响滚动条长度和滚动位移。
 
-use gpui::{Context, MouseButton, div, img, prelude::*, px};
+use gpui::{Context, ElementId, MouseButton, div, img, prelude::*, px};
 use pdf_core::RectPt;
 
 use crate::app::AppState;
@@ -48,16 +48,24 @@ impl AppState {
             PREFETCH_PAGES,
         );
 
+        let mut canvas_children: Vec<gpui::AnyElement> = Vec::new();
+        for page in range {
+            canvas_children.push(self.page_view(page, &layout, theme, cx).into_any_element());
+            if let Some(rail) = self.page_gloss_rail(page, &layout, theme, cx) {
+                canvas_children.push(rail.into_any_element());
+            }
+        }
+
         container.child(
             div()
                 .relative()
                 .w(px(layout.content_width))
                 .h(px(layout.content_height))
-                .children(range.map(|page| self.page_view(page, &layout, theme, cx))),
+                .children(canvas_children),
         )
     }
 
-    /// 一页：位图或占位，加上这一页自己的高亮/搜索命中/选区/链接覆盖层。
+    /// 一页：位图或占位，加上这一页自己的高亮/搜索命中/选区/笺注锚点/链接覆盖层。
     fn page_view(
         &self,
         index: usize,
@@ -89,6 +97,52 @@ impl AppState {
             for rect in &highlight.rects {
                 overlays.push(
                     rect_overlay(rect, page_size.height, zoom, theme.highlight).into_any_element(),
+                );
+            }
+        }
+
+        // 已钉住的词汇笺注：在原词下方画一条细下划线与淡底色，点击也能展开对应的查词卡。
+        for gloss in self.viewer.highlights.glosses_for_page(index) {
+            let gloss_id = gloss.id;
+            for (rect_idx, rect) in gloss.rects.iter().enumerate() {
+                let id = ElementId::NamedInteger(
+                    "gloss-anchor-rect".into(),
+                    gloss_id
+                        .wrapping_mul(31)
+                        .wrapping_add(rect_idx as u64),
+                );
+                overlays.push(
+                    gloss_rect_overlay(
+                        rect,
+                        page_size.height,
+                        zoom,
+                        theme.accent.opacity(0.10),
+                        theme.accent.opacity(0.65),
+                    )
+                    .id(id)
+                    .cursor_pointer()
+                    .on_click(
+                        cx.listener(move |this, _event: &gpui::ClickEvent, _window, cx| {
+                            this.open_pinned_gloss(gloss_id, cx);
+                        }),
+                    )
+                    .into_any_element(),
+                );
+            }
+        }
+
+        // 当前激活态查词锚点：在正文中标出正被查阅的词条。
+        if self.dictionary.open && self.dictionary.anchor_page == index {
+            for rect in &self.dictionary.anchor_rects {
+                overlays.push(
+                    gloss_rect_overlay(
+                        rect,
+                        page_size.height,
+                        zoom,
+                        theme.accent.opacity(0.18),
+                        theme.accent,
+                    )
+                    .into_any_element(),
                 );
             }
         }
@@ -204,4 +258,16 @@ fn rect_overlay(rect: &RectPt, page_height: f32, zoom: f32, color: gpui::Rgba) -
         .w(px((rect.width() * zoom).max(0.5)))
         .h(px((rect.height() * zoom).max(0.5)))
         .bg(color)
+}
+
+fn gloss_rect_overlay(
+    rect: &RectPt,
+    page_height: f32,
+    zoom: f32,
+    bg_color: gpui::Rgba,
+    underline_color: gpui::Rgba,
+) -> gpui::Div {
+    rect_overlay(rect, page_height, zoom, bg_color)
+        .border_b_2()
+        .border_color(underline_color)
 }

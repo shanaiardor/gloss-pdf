@@ -5,7 +5,7 @@
 //! - [`events`]：输入与引擎事件的分派入口；
 //! - [`document`]：文档会话与内容资源的生命周期；
 //! - [`render`]：排版几何、缩放与位图调度；
-//! - [`window`]：主窗口尺寸与词典浮窗。
+//! - [`window`]：主窗口尺寸与几何持久化。
 //!
 //! `app.rs` 只保留四者共享的状态和「谁都需要一点」的装配代码（构造、订阅、
 //! 顶层 `Render`、状态栏）。这样任何一个子模块都不必反向依赖另一个子模块的
@@ -25,8 +25,7 @@ use std::time::Duration;
 use dict_core::{Command as DictCommand, DictEngine, DictionaryConfig};
 use futures::StreamExt;
 use gpui::{
-    AnyWindowHandle, App, Bounds, Context, Entity, FocusHandle, Focusable, Render, Size, Window,
-    WindowHandle, div, prelude::*, px,
+    App, Bounds, Context, Entity, FocusHandle, Focusable, Render, Size, Window, div, prelude::*, px,
 };
 use pdf_core::{Command, PageSize, PdfEngine};
 
@@ -37,7 +36,6 @@ use crate::home::{HomeNav, HomeState};
 use crate::progress::ReadingProgress;
 use crate::settings::{SettingsStore, WindowState};
 use crate::theme::Theme;
-use crate::ui::dictionary::DictionaryWindow;
 use crate::ui::text_input::{TextInput, TextInputEvent};
 use crate::update::UpdateEngine;
 use crate::viewer::Viewer;
@@ -51,6 +49,7 @@ pub(crate) enum FocusTarget {
     Search,
     HomeSearch,
     Page,
+    Dictionary,
 }
 
 pub struct AppState {
@@ -64,22 +63,19 @@ pub struct AppState {
     /// 底部页码输入框；只有 `page_input_open` 为真时才出现在胶囊里。
     pub(crate) page_input: Entity<TextInput>,
     pub(crate) page_input_open: bool,
+    /// 页边查词卡里的查词输入框。
+    pub(crate) dict_input: Entity<TextInput>,
     pub(crate) pending_focus: Option<FocusTarget>,
     pub(crate) settings: SettingsStore,
     pub(crate) settings_open: bool,
     pub(crate) dict: DictEngine,
-    /// 词典窗口里手动输入/点击历史时，把请求送回主窗口。
-    dict_query: futures::channel::mpsc::UnboundedSender<DictRequest>,
+    /// 释义内 `entry://` 链接点击时把查词请求送回 `AppState`。
+    pub(crate) dict_query: futures::channel::mpsc::UnboundedSender<DictRequest>,
     pub(crate) dictionary: DictionaryState,
     /// 持久化的查词历史，最新的在前。
     pub(crate) dict_history: DictHistory,
-    /// 独立词典窗口；关闭后保留的句柄会在下一次同步时清掉。
-    pub(crate) dictionary_window: Option<WindowHandle<DictionaryWindow>>,
-    /// 词典浮窗相对主窗口的吸附锚点；`None` 表示没吸附、不跟随。
-    dictionary_follow: Option<crate::window_layout::Anchor>,
-    /// 主窗口与显示器工作区，用来把词典窗口放到主窗口右侧。
-    main_window_bounds: Option<Bounds<gpui::Pixels>>,
-    display_bounds: Option<Bounds<gpui::Pixels>>,
+    pub(crate) main_window_bounds: Option<Bounds<gpui::Pixels>>,
+    pub(crate) display_bounds: Option<Bounds<gpui::Pixels>>,
     pub(crate) viewport: Size<gpui::Pixels>,
     pub(crate) scale_factor: f32,
     /// 按住中键拖动时的上一次指针位置；`None` 表示没在拖。
@@ -88,7 +84,7 @@ pub struct AppState {
     /// 全文搜索的请求代号，用来丢掉过期结果。
     search_request_id: u64,
     pub(crate) outline_open: bool,
-    /// 批注（高亮）侧栏是否展开。
+    /// 批注（高亮与页边笺注）侧栏是否展开。
     pub(crate) highlight_panel_open: bool,
     /// 浮动胶囊的自动隐身状态机；纯逻辑在 [`crate::chrome_visibility`] 里。
     pub(crate) chrome: ChromeVisibility,
@@ -222,15 +218,12 @@ impl AppState {
             .detach();
         }
 
-        // 词典窗口自己也有输入框：它只负责把词发回来，查词状态仍由主窗口维护。
+        // 释义里的 entry:// 链接通过通道把目标词条送回主窗口就地跳转。
         let (dict_query, mut dict_query_rx) = futures::channel::mpsc::unbounded::<DictRequest>();
         cx.spawn(async move |this, cx| {
             while let Some(request) = dict_query_rx.next().await {
                 let updated = this.update(cx, |this, cx| match request {
-                    DictRequest::Lookup(term) => this.lookup_word(term, cx),
-                    DictRequest::Suggest(term) => this.request_suggestions(term, cx),
-                    DictRequest::ClearHistory => this.clear_dict_history(cx),
-                    DictRequest::FloatPlaced(rect) => this.dictionary_float_placed(rect, cx),
+                    DictRequest::Lookup(term) => this.lookup_word_from_link(term, cx),
                 });
                 if updated.is_err() {
                     break;
@@ -255,35 +248,10 @@ impl AppState {
         })
         .detach();
 
-        // 词典窗口自己关掉时（✕ 或 Alt+F4），同步主窗口里的状态和工具栏标签。
-        //
-        // 关闭回调可能在主窗口自己触发的 `remove_window` 里同步执行，这时直接
-        // `AppState::update` 会撞上还借着的实体；推迟到本轮事件处理结束后再改。
-        let app = cx.entity();
-        cx.on_window_closed(move |cx, window_id| {
-            let app = app.clone();
-            cx.defer(move |cx| {
-                let _ = app.update(cx, |this, cx| {
-                    let closed = this.dictionary_window.is_some_and(|handle| {
-                        AnyWindowHandle::from(handle).window_id() == window_id
-                    });
-                    if closed {
-                        this.dictionary_window = None;
-                        this.dictionary.open = false;
-                        cx.notify();
-                    }
-                });
-            });
-        })
-        .detach();
-
         // 关窗/退出时兜底保存一次，避免最后不到一秒的滚动丢失。
-        cx.on_release(|this, cx| {
+        cx.on_release(|this, _cx| {
             this.flush_progress();
             this.flush_window_state();
-            if let Some(handle) = this.dictionary_window.take() {
-                let _ = handle.update(cx, |_view, window, _cx| window.remove_window());
-            }
         })
         .detach();
 
@@ -291,6 +259,8 @@ impl AppState {
             cx.new(|cx| TextInput::new("输入关键词，Enter 下一个", theme.clone(), 13.0, cx));
         let home_input = cx.new(|cx| TextInput::new("笺释", theme.clone(), 13.0, cx));
         let page_input = cx.new(|cx| TextInput::new("页码", theme.clone(), 12.0, cx));
+        let dict_input =
+            cx.new(|cx| TextInput::new("输入字词，Enter 查词", theme.clone(), 12.0, cx));
 
         cx.subscribe(
             &search_input,
@@ -334,6 +304,23 @@ impl AppState {
         )
         .detach();
 
+        cx.subscribe(
+            &dict_input,
+            |this, _input, event: &TextInputEvent, cx| match event {
+                TextInputEvent::Changed => {
+                    let term = this.dict_input.read(cx).value().to_string();
+                    this.request_suggestions(term, cx);
+                }
+                TextInputEvent::Submitted { .. } => this.submit_dict_query(cx),
+                TextInputEvent::Cancelled => {
+                    this.dict_input.update(cx, |input, cx| input.clear(cx));
+                    this.pending_focus = Some(FocusTarget::Root);
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+
         Self {
             theme,
             focus_handle: cx.focus_handle(),
@@ -344,6 +331,7 @@ impl AppState {
             home_input,
             page_input,
             page_input_open: false,
+            dict_input,
             pending_focus: None,
             settings,
             settings_open: false,
@@ -351,8 +339,6 @@ impl AppState {
             dict_query,
             dictionary,
             dict_history,
-            dictionary_window: None,
-            dictionary_follow: None,
             main_window_bounds: None,
             display_bounds: None,
             viewport: Size {
@@ -414,8 +400,9 @@ impl AppState {
         self.home_input
             .update(cx, |input, cx| input.set_theme(theme.clone(), cx));
         self.page_input
+            .update(cx, |input, cx| input.set_theme(theme.clone(), cx));
+        self.dict_input
             .update(cx, |input, cx| input.set_theme(theme, cx));
-        self.sync_dictionary_window(cx);
         self.set_status(format!("主题：{}", self.theme.name()), cx);
         cx.notify();
     }
@@ -460,9 +447,6 @@ impl Render for AppState {
 
             // 浮动胶囊的自动隐身：鼠标位置靠窗口级监听（`chrome_mouse_watch`，只能在
             // 绘制阶段注册），这里只负责“鼠标没动但参数变了”和首帧的结算。
-            // 为什么需要窗口级监听：顶部 46px 拖拽条是 `WindowControlArea::Drag`，Windows
-            // 上是 HTCAPTION（非客户区），鼠标在它上面收不到元素的 hover/move；
-            // gpui_windows 会把 `WM_NCMOUSEMOVE` 翻译成同一种 `MouseMoveEvent` 走统一输入管线。
             self.settle_chrome(window.mouse_position(), false, cx);
         }
 
@@ -527,6 +511,7 @@ impl Render for AppState {
                     FocusTarget::Search => this.search_input.read(cx).focus_handle(cx),
                     FocusTarget::HomeSearch => this.home_input.read(cx).focus_handle(cx),
                     FocusTarget::Page => this.page_input.read(cx).focus_handle(cx),
+                    FocusTarget::Dictionary => this.dict_input.read(cx).focus_handle(cx),
                 };
                 window.focus(&handle, cx);
             });

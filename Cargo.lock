@@ -2021,12 +2021,10 @@ dependencies = [
  "image",
  "log",
  "pdf-core",
- "raw-window-handle",
  "self_update",
  "serde",
  "serde_json",
  "unicode-segmentation",
- "windows 0.61.3",
 ]
 
 [[package]]

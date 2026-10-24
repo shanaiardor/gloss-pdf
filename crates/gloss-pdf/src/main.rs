@@ -1,5 +1,9 @@
 //! 入口：初始化日志，打开主窗口，把错误收敛到日志里。
 
+// Release 构建时用 Windows GUI 子系统，避免启动时弹出控制台黑窗口；
+// Debug 构建保留控制台，方便看日志。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod assets;
 mod chrome_visibility;
@@ -21,8 +25,6 @@ mod ui;
 mod update;
 mod viewer;
 mod window_layout;
-#[cfg(target_os = "windows")]
-mod window_move;
 
 use anyhow::Context as _;
 use gpui::{
@@ -100,10 +102,6 @@ fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
 }
 
 /// 文本输入框的编辑快捷键。
-///
-/// 绑定在 `TextInput` 上下文里，只有输入框获得焦点时生效；这样阅读器的
-/// PageDown / H / Esc 等快捷键不会被输入框抢走，反之输入框也不会被页面的
-/// 快捷键打断。
 fn bind_text_input_keys(cx: &mut App) {
     use ui::text_input::{
         Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft,

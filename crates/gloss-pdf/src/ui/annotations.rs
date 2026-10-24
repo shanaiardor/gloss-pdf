@@ -1,9 +1,37 @@
-//! 批注侧栏：按页列出所有高亮，点击跳到该页，右侧 ✕ 删除。
+//! 批注侧栏：按页列出所有高亮与已钉住的词汇笺注，点击跳到该页（或展开笺注），右侧 ✕ 删除。
 
 use gpui::{ClickEvent, Context, FontWeight, div, prelude::*, px};
 
 use crate::app::AppState;
 use crate::theme::Theme;
+
+enum AnnotationRow {
+    Highlight {
+        id: u64,
+        page: usize,
+        snippet: String,
+    },
+    Gloss {
+        id: u64,
+        page: usize,
+        word: String,
+        summary: String,
+    },
+}
+
+impl AnnotationRow {
+    fn page(&self) -> usize {
+        match self {
+            Self::Highlight { page, .. } | Self::Gloss { page, .. } => *page,
+        }
+    }
+
+    fn id(&self) -> u64 {
+        match self {
+            Self::Highlight { id, .. } | Self::Gloss { id, .. } => *id,
+        }
+    }
+}
 
 impl AppState {
     pub(crate) fn annotations_panel(
@@ -15,8 +43,30 @@ impl AppState {
             return None;
         }
 
-        let items = self.viewer.highlights.sorted();
-        let count = items.len();
+        let mut rows: Vec<AnnotationRow> = self
+            .viewer
+            .highlights
+            .sorted()
+            .into_iter()
+            .map(|item| AnnotationRow::Highlight {
+                id: item.id,
+                page: item.page,
+                snippet: summarize(&item.text),
+            })
+            .collect();
+
+        for gloss in self.viewer.highlights.sorted_glosses() {
+            rows.push(AnnotationRow::Gloss {
+                id: gloss.id,
+                page: gloss.page,
+                word: gloss.word.clone(),
+                summary: summarize(&gloss.summary),
+            });
+        }
+
+        rows.sort_by_key(|row| (row.page(), row.id()));
+
+        let count = rows.len();
         let current_page = self.viewer.current_page;
 
         let mut list = div()
@@ -26,13 +76,13 @@ impl AppState {
             .overflow_y_scroll()
             .p_2();
 
-        if items.is_empty() {
+        if rows.is_empty() {
             list = list.child(
                 div()
                     .p_2()
                     .text_size(px(12.))
                     .text_color(theme.text_muted)
-                    .child("选中文字按 H 添加高亮"),
+                    .child("选中文字按 H 添加高亮，或双击查词后点击「钉住」添加页边笺注"),
             );
         } else {
             let hover = theme.surface_hover;
@@ -42,12 +92,17 @@ impl AppState {
             let mono = theme.mono_font.clone();
             let cx_list = &mut *cx;
 
-            list = list.children(items.into_iter().enumerate().map(move |(index, item)| {
-                let id = item.id;
-                let page = item.page;
-                let snippet = summarize(&item.text);
+            list = list.children(rows.into_iter().enumerate().map(move |(index, row)| {
+                let id = row.id();
+                let page = row.page();
                 let is_current = page == current_page;
                 let label_color = if is_current { accent } else { muted };
+                let (is_gloss, title) = match row {
+                    AnnotationRow::Highlight { snippet, .. } => (false, snippet),
+                    AnnotationRow::Gloss { word, summary, .. } => {
+                        (true, format!("笺 · {word}：{summary}"))
+                    }
+                };
 
                 div()
                     .id(300_000 + index)
@@ -62,6 +117,9 @@ impl AppState {
                     .on_click(
                         cx_list.listener(move |this, _event: &ClickEvent, _window, cx| {
                             this.set_page(page, cx);
+                            if is_gloss {
+                                this.open_pinned_gloss(id, cx);
+                            }
                         }),
                     )
                     .child(
@@ -78,8 +136,8 @@ impl AppState {
                             .min_w(px(0.))
                             .truncate()
                             .text_size(px(12.))
-                            .text_color(text)
-                            .child(snippet),
+                            .text_color(if is_gloss { accent } else { text })
+                            .child(title),
                     )
                     .child(
                         div()

@@ -102,8 +102,8 @@ impl AppState {
             .child(icon_button(
                 "dictionary",
                 "icons/dictionary.svg",
-                "词典",
-                self.dictionary_window.is_some(),
+                "页边词典",
+                self.dictionary.open,
                 true,
                 theme,
                 cx.listener(|this, _event: &ClickEvent, _window, cx| {
@@ -340,12 +340,6 @@ impl AppState {
     }
 
     /// 窗口级鼠标移动：胶囊可见性的实时输入。
-    ///
-    /// 为什么用窗口级监听而不是胶囊上的 `on_hover`：顶部的 46px `drag_strip()` 是
-    /// `WindowControlArea::Drag`，Windows 上对应 HTCAPTION（非客户区），鼠标可能在它
-    /// 上面收不到普通元素的 hover/move 事件。gpui_windows 会把 `WM_NCMOUSEMOVE` 翻译
-    /// 成同样的 `MouseMoveEvent` 走统一输入管线，窗口级监听两种移动都能收到；再把位置
-    /// 和几何感应带（[`band_at`]）比一下，就不依赖任何元素的命中测试。
     pub(crate) fn on_global_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         if !self.viewer.has_document() {
             return;
@@ -356,7 +350,6 @@ impl AppState {
     }
 
     pub(crate) fn window_controls(&self, _theme: &Theme) -> gpui::Div {
-        // macOS 上使用系统原生的红黄绿三色交通灯，避免在左上角出现重复的自绘按钮
         #[cfg(target_os = "macos")]
         {
             div()
@@ -416,21 +409,12 @@ const SAVE_LABEL: &str = "保存 (⌘S)";
 const SAVE_LABEL: &str = "保存 (Ctrl+S)";
 
 /// 注册窗口级鼠标监听的零尺寸元素。
-///
-/// `Window::on_mouse_event` 自带 `debug_assert_paint`：**只能在绘制阶段**调用。
-/// `Render::render` 是布局阶段跑的（`EntityRenderer::request_layout` 里调 `render`），
-/// 在那里注册会直接 panic（`this method can only be called during paint`），并且会让
-/// 已经借用的 `App` 在 panic 展开时泄漏，之后所有 `AsyncApp` 操作都跟着炸。
-/// 所以放到 `canvas` 的 paint 回调里：那是真正的绘制阶段，`in_paint` 为真。
-///
-/// 监听器每帧开画前会被清空，因此每帧都要重新注册一次。
 pub(crate) fn chrome_mouse_watch(cx: &mut Context<AppState>) -> impl gpui::IntoElement {
     let view = cx.entity().downgrade();
     gpui::canvas(
         |_bounds, _window, _cx| {},
         move |_bounds, (), window, _cx| {
             let view = view.clone();
-            // 同一个监听器在捕获阶段和冒泡阶段各被调一次，这里只吃捕获阶段那一遍。
             window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
                 if phase != gpui::DispatchPhase::Capture {
                     return;
@@ -442,10 +426,6 @@ pub(crate) fn chrome_mouse_watch(cx: &mut Context<AppState>) -> impl gpui::IntoE
 }
 
 /// 胶囊外层的可见性包装。
-///
-/// 隐身必须用 `hidden()`（`display: none`），不能 `invisible()`（`visibility: hidden`）：
-/// 后者仍然占着布局位置、仍然在命中测试树里，会把页面的点击、滚轮、拖选和中键平移全吞掉；
-/// `display: none` 的子树既不参与布局也不参与 hit-test，胶囊才算真的“隐身”。
 fn chrome_wrapper(wrapper: gpui::Div, visible: bool) -> gpui::Div {
     if visible { wrapper } else { wrapper.hidden() }
 }
@@ -464,9 +444,6 @@ pub(crate) fn drag_strip() -> gpui::Stateful<gpui::Div> {
 }
 
 /// 拖拽区域的鼠标样式。
-///
-/// Windows 端 GPUI 把 OpenHand/ClosedHand 都映射成箭头，只有 PointingHand 会变成手型，
-/// 所以这里在 Windows 上用 pointing hand，其他平台用更贴切的 grab hand。
 pub(crate) fn drag_cursor<D: gpui::Styled>(element: D) -> D {
     #[cfg(target_os = "windows")]
     {
@@ -613,7 +590,6 @@ fn window_control_dot(
         .bg(color)
         .cursor_pointer()
         .hover(|style| style.opacity(0.82))
-        // 首页顶部整条都可拖动，窗口按钮要挡住拖拽命中区。
         .occlude()
         .window_control_area(area)
 }

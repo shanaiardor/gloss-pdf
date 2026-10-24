@@ -174,7 +174,9 @@ impl super::AppState {
                 self.dictionary.error = None;
                 self.dictionary.entries = entries;
                 if redirected {
-                    self.dictionary.word = term;
+                    self.dictionary.word = term.clone();
+                    self.dict_input
+                        .update(cx, |input, cx| input.set_value(term, cx));
                 }
             }
             DictEvent::NotFound { request, term } => {
@@ -195,7 +197,6 @@ impl super::AppState {
                     return;
                 }
                 self.dictionary.suggestions = crate::dict_suggest::trim_suggestions(suggestions);
-                self.sync_dictionary_window(cx);
             }
             DictEvent::Error { request, message } => {
                 if let Some(request) = request
@@ -214,16 +215,12 @@ impl super::AppState {
                 self.set_status(message, cx);
             }
         }
-        self.sync_dictionary_window(cx);
         cx.notify();
     }
 
     // ---------- 坐标 ----------
 
     /// 鼠标位置 → 某一页的页内坐标（像素，原点在页面左上角）。
-    ///
-    /// 连续滚动下页面不再是屏幕原点，位置要减去「滚动偏移 + 这一页在文档里的位置」。
-    /// 超出页面时夹到页边：拖选越过页边界时仍能在这一页里取到最近的字符。
     fn page_point(&self, page: usize, position: Point<gpui::Pixels>) -> Option<(f32, f32)> {
         let layout = self.doc_layout()?;
         let page_box = layout.page_box(page)?;
@@ -278,7 +275,6 @@ impl super::AppState {
         event: &MouseDownEvent,
         cx: &mut Context<Self>,
     ) {
-        // 点正文即离开页码输入；否则输入框会一直占着页码的位置。
         if self.page_input_open {
             self.close_page_input(cx);
         }
@@ -295,8 +291,7 @@ impl super::AppState {
         cx.notify();
     }
 
-    /// Ctrl + 滚轮缩放。滚轮一格约 3 行，每行 1%（一格约 3%）；
-    /// 触控板的小增量按比例折算，不量化成整百分点。
+    /// Ctrl + 滚轮缩放。
     pub(crate) fn on_scroll_wheel(
         &mut self,
         event: &ScrollEvent,
@@ -334,7 +329,6 @@ impl super::AppState {
             return;
         }
         self.panning = Some(event.position);
-        // 中键按下不再往下传，避免别的元素拿它当「粘贴/快捷滚」一类快捷键。
         cx.stop_propagation();
         cx.notify();
     }
@@ -344,7 +338,6 @@ impl super::AppState {
         let Some(last) = self.panning else {
             return false;
         };
-        // 中键在窗口外松开时收不到 mouse_up，这里捎带把状态清掉。
         if event.pressed_button != Some(MouseButton::Middle) {
             self.panning = None;
             cx.notify();
@@ -396,7 +389,6 @@ impl super::AppState {
     ) {
         let was_dragging = self.viewer.selection.dragging;
         self.viewer.selection.dragging = false;
-        // 选择结束（拖选或双击选词）后打印选区，便于测试选中文字是否正确。
         if was_dragging {
             self.print_selection();
         }
@@ -450,11 +442,27 @@ impl super::AppState {
         );
     }
 
-    /// 双击选词后直接查词。
+    /// 双击选词后直接在页边笺注栏锚定该词位置并查词。
     fn lookup_selection(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = self.viewer.selection.text(self.selection_chars()) else {
+        let Some(page) = self.viewer.selection.page else {
             return;
         };
+        let chars = self.viewer.chars_of(page);
+        let Some(text) = self.viewer.selection.text(chars) else {
+            return;
+        };
+        let rects = self.viewer.selection.rects(chars);
+        let anchor_top = rects
+            .first()
+            .and_then(|rect| {
+                self.viewer
+                    .page_size_at(page)
+                    .map(|size| (size.height - rect.top).max(0.0))
+            })
+            .unwrap_or(0.0);
+
+        self.dictionary.set_anchor(page, rects, anchor_top);
+        self.pending_focus = Some(FocusTarget::Root);
         self.lookup_word(text, cx);
     }
 
@@ -506,8 +514,6 @@ impl super::AppState {
         let keystroke = &event.keystroke;
         let control = keystroke.modifiers.control || keystroke.modifiers.platform;
 
-        // 搜索框有焦点时，字符输入归 TextInput，这里只处理 Ctrl+F（全选便于改写）；
-        // 带 Ctrl 的全局快捷键继续放行。
         if self.home_input.read(cx).focus_handle(cx).is_focused(window) {
             if control && keystroke.key.eq_ignore_ascii_case("f") {
                 self.home_input.update(cx, |input, cx| input.select_all(cx));
@@ -542,8 +548,6 @@ impl super::AppState {
             "escape" => {
                 if self.settings_open {
                     self.toggle_settings(cx);
-                } else if self.dictionary_window.is_some() {
-                    self.close_dictionary_window(cx);
                 } else {
                     self.clear_home_query(cx);
                     self.home.menu_open = None;
@@ -556,7 +560,6 @@ impl super::AppState {
                 }
             }
             _ => {
-                // 输入框没焦点时直接打字：先聚焦，再把这一下字符补进去。
                 if let Some(key_char) = &keystroke.key_char
                     && !key_char.chars().all(char::is_control)
                 {
@@ -585,8 +588,8 @@ impl super::AppState {
         let keystroke = &event.keystroke;
         let control = keystroke.modifiers.control || keystroke.modifiers.platform;
 
-        // 页码输入框有焦点时，数字、退格、Enter、Esc 归 TextInput；否则
-        // PageDown / H 之类的快捷键会把正在输入的数字当成翻页指令。
+        // 页码输入框或页边词典输入框有焦点时，普通按键归 TextInput 处理，
+        // 避免输入字母 h / 空格时触发高亮或翻页快捷键。
         if self.page_input_open
             && self.page_input.read(cx).focus_handle(cx).is_focused(window)
             && !control
@@ -594,9 +597,13 @@ impl super::AppState {
             return;
         }
 
-        // 搜索框有焦点时，字符输入和编辑键都由 TextInput 处理，这里不能重复处理，
-        // 也不能让 PageDown / H 之类的页面快捷键抢走空格、回车。带 Ctrl 的全局
-        // 快捷键（打开、保存、缩放……）仍然放行。
+        if self.dictionary.open
+            && self.dict_input.read(cx).focus_handle(cx).is_focused(window)
+            && !control
+        {
+            return;
+        }
+
         if self.viewer.search.open
             && self
                 .search_input
@@ -691,7 +698,6 @@ impl super::AppState {
             }
         } else {
             match keystroke.key.as_str() {
-                // 连续滚动下 PageDown / 空格滚动一屏，左右键才是整页跳。
                 "pagedown" | "space" => {
                     self.scroll_by_viewport(1.0, cx);
                     return;
@@ -728,8 +734,8 @@ impl super::AppState {
                 "escape" => {
                     if self.settings_open {
                         self.toggle_settings(cx);
-                    } else if self.dictionary_window.is_some() {
-                        self.close_dictionary_window(cx);
+                    } else if self.dictionary.open {
+                        self.close_dictionary(cx);
                     } else {
                         self.viewer.selection.clear();
                         self.outline_open = false;

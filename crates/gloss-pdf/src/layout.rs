@@ -93,11 +93,32 @@ pub struct FitArea {
     pub height: f32,
 }
 
+/// 页边笺注栏的固定宽度（逻辑像素）。
+pub const GLOSS_RAIL_WIDTH: f32 = 340.0;
+/// 纸张右缘到页边笺注栏左缘的间距（逻辑像素）。
+pub const GLOSS_RAIL_GAP: f32 = 16.0;
+/// 页边笺注栏占用的额外横向总宽。
+pub const GLOSS_RAIL_EXTENT: f32 = GLOSS_RAIL_GAP + GLOSS_RAIL_WIDTH;
+/// 同页相邻两张页边笺注卡片之间的最小纵向间距。
+pub const GLOSS_CARD_GAP: f32 = 10.0;
+
 impl FitArea {
     /// 从窗口视口尺寸算出页面可用区域。
+    #[cfg(test)]
     pub fn from_viewport(width: f32, height: f32) -> Self {
+        Self::from_viewport_with_rail(width, height, false)
+    }
+
+    /// 从窗口视口尺寸算出页面可用区域；开启页边笺注栏且视口足够宽时扣除笺注栏宽度。
+    pub fn from_viewport_with_rail(width: f32, height: f32, has_rail: bool) -> Self {
+        let base_width = (width - PAGE_PAD * 2.0).max(1.0);
+        let width = if has_rail && base_width > GLOSS_RAIL_EXTENT + 240.0 {
+            base_width - GLOSS_RAIL_EXTENT
+        } else {
+            base_width
+        };
         Self {
-            width: (width - PAGE_PAD * 2.0).max(1.0),
+            width,
             height: (height - VERTICAL_INSETS).max(1.0),
         }
     }
@@ -166,6 +187,93 @@ impl PageBox {
     pub fn bottom(&self) -> f32 {
         self.top + self.height
     }
+
+    /// 页边笺注栏在滚动内容里的左边缘 x 坐标。
+    pub fn rail_left(&self) -> f32 {
+        self.left + self.width + GLOSS_RAIL_GAP
+    }
+}
+
+/// 待排布的一张页边笺注卡输入几何。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlossSlotInput {
+    pub id: u64,
+    /// 期望对齐的页内纵向位置（距页顶像素，0..=page_height）。
+    pub desired_top: f32,
+    /// 卡片自身预估高度（像素）。
+    pub height: f32,
+}
+
+/// 排布后的一张页边笺注卡纵向位置。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlossSlot {
+    pub id: u64,
+    pub top: f32,
+    pub height: f32,
+}
+
+/// 计算同一页右侧笺注栏内多张卡片的纵向排布：
+/// 尽量对齐各自原文所在的 `desired_top`，发生重叠时向下顺延推开；
+/// 若底部超出页高，则在允许范围内向上回推，保证不重叠且 `top >= 0`。
+pub fn layout_gloss_slots(inputs: &[GlossSlotInput], page_height: f32) -> Vec<GlossSlot> {
+    if inputs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted = inputs.to_vec();
+    sorted.sort_by(|a, b| {
+        a.desired_top
+            .total_cmp(&b.desired_top)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let mut slots: Vec<GlossSlot> = Vec::with_capacity(sorted.len());
+    for item in sorted {
+        let height = if item.height.is_finite() {
+            item.height.max(1.0)
+        } else {
+            1.0
+        };
+        let desired = if item.desired_top.is_finite() {
+            item.desired_top.max(0.0)
+        } else {
+            0.0
+        };
+        let min_top = slots
+            .last()
+            .map_or(0.0, |prev| prev.top + prev.height + GLOSS_CARD_GAP);
+        slots.push(GlossSlot {
+            id: item.id,
+            top: desired.max(min_top),
+            height,
+        });
+    }
+
+    if page_height.is_finite() && page_height > 0.0 {
+        if let Some(last) = slots.last_mut()
+            && last.top + last.height > page_height
+        {
+            last.top = (page_height - last.height).max(0.0);
+        }
+        for i in (0..slots.len().saturating_sub(1)).rev() {
+            let max_top = (slots[i + 1].top - slots[i].height - GLOSS_CARD_GAP).max(0.0);
+            if slots[i].top > max_top {
+                slots[i].top = max_top;
+            }
+        }
+        for i in 0..slots.len() {
+            let min_top = if i == 0 {
+                0.0
+            } else {
+                slots[i - 1].top + slots[i - 1].height + GLOSS_CARD_GAP
+            };
+            if slots[i].top < min_top {
+                slots[i].top = min_top;
+            }
+        }
+    }
+
+    slots
 }
 
 /// 整篇文档的排版：把各页从上到下排成一列，页间留 `PAGE_GAP`。
@@ -182,7 +290,14 @@ pub struct DocumentLayout {
 }
 
 impl DocumentLayout {
+    #[cfg(test)]
     pub fn new(pages: &[PageSize], zoom: f32, viewport_width: f32) -> Self {
+        Self::with_rail(pages, zoom, viewport_width, false)
+    }
+
+    /// 排版整篇文档；`has_rail` 为真时在纸张右侧预留专属笺注栏（[`GLOSS_RAIL_EXTENT`]），
+    /// 让「PDF 纸张 + 右侧笺注栏」作为整体在视口内居中，并在窗口过窄时支持横向滚动。
+    pub fn with_rail(pages: &[PageSize], zoom: f32, viewport_width: f32, has_rail: bool) -> Self {
         let zoom = if zoom.is_finite() && zoom > 0.0 {
             zoom
         } else {
@@ -193,6 +308,7 @@ impl DocumentLayout {
         } else {
             0.0
         };
+        let extra_rail = if has_rail { GLOSS_RAIL_EXTENT } else { 0.0 };
 
         let mut boxes = Vec::with_capacity(pages.len());
         let mut top = TOP_INSET;
@@ -204,15 +320,16 @@ impl DocumentLayout {
             }
             let width = (page.width * zoom).max(1.0);
             let height = (page.height * zoom).max(1.0);
+            let total_width = width + extra_rail;
             let available = viewport_width - PAGE_PAD * 2.0;
-            let left = PAGE_PAD + ((available - width) / 2.0).max(0.0);
+            let left = PAGE_PAD + ((available - total_width) / 2.0).max(0.0);
             boxes.push(PageBox {
                 top,
                 height,
                 width,
                 left,
             });
-            right_edge = right_edge.max(left + width + PAGE_PAD);
+            right_edge = right_edge.max(left + total_width + PAGE_PAD);
             top += height;
         }
 
@@ -712,5 +829,53 @@ mod point_anchor_tests {
         assert!(left >= 0.0);
         assert!(top >= 0.0);
         assert!(top <= layout.content_height);
+    }
+
+    #[test]
+    fn document_layout_with_rail_centers_page_and_rail_together() {
+        let pages = [PageSize {
+            width: 600.0,
+            height: 800.0,
+        }];
+        let without_rail = DocumentLayout::with_rail(&pages, 1.0, 1400.0, false);
+        let with_rail = DocumentLayout::with_rail(&pages, 1.0, 1400.0, true);
+
+        let box_no_rail = without_rail.page_box(0).unwrap();
+        let box_rail = with_rail.page_box(0).unwrap();
+
+        // 开启笺注栏后，纸张左移半个笺注栏宽度，让「纸张 + 笺注栏」整体居中。
+        assert!((box_no_rail.left - box_rail.left - GLOSS_RAIL_EXTENT / 2.0).abs() < 0.01);
+        assert!((box_rail.rail_left() - (box_rail.left + 600.0 + GLOSS_RAIL_GAP)).abs() < 0.01);
+    }
+
+    #[test]
+    fn layout_gloss_slots_resolves_overlaps_and_clamps_to_page_height() {
+        let inputs = [
+            GlossSlotInput {
+                id: 1,
+                desired_top: 100.0,
+                height: 80.0,
+            },
+            GlossSlotInput {
+                id: 2,
+                desired_top: 120.0,
+                height: 60.0,
+            },
+            GlossSlotInput {
+                id: 3,
+                desired_top: 780.0,
+                height: 90.0,
+            },
+        ];
+        let slots = layout_gloss_slots(&inputs, 800.0);
+        assert_eq!(slots.len(), 3);
+        assert_eq!(slots[0].id, 1);
+        assert!((slots[0].top - 100.0).abs() < 0.01);
+        // 第二张卡片原本在 120，与第一张 (100..180) 冲突，被推到 180 + GAP。
+        assert_eq!(slots[1].id, 2);
+        assert!((slots[1].top - (180.0 + GLOSS_CARD_GAP)).abs() < 0.01);
+        // 第三张卡片原本在 780，高度 90 超出页高 800，被回推到 710。
+        assert_eq!(slots[2].id, 3);
+        assert!((slots[2].top - 710.0).abs() < 0.01);
     }
 }

@@ -1,7 +1,8 @@
-//! 独立词典窗口：双击 PDF 查词后显示释义，不遮挡页面。
+//! 页边笺注（Marginalia）：在 PDF 纸张右侧的专属笺注栏里就地渲染查词卡片与已钉住的词汇笺注。
 //!
-//! 窗口没有系统标题栏：顶部自绘一条可拖拽的窄标题栏，拖到主窗口边缘时自动
-//! 吸附。释义按 CSS 计算样式渲染：段落用 GPUI 的 [`StyledText`] 行内 run 画
+//! 双击 PDF 正文查词时，激活态查词卡（Active Gloss）直接锚定在该页对应的词条高度；
+//! 点击「钉住」可将当前词条浓缩为一张紧凑笺注卡（[`PinnedGloss`]）常驻在页边，并随高亮
+//! sidecar 一起持久化。释义按 CSS 计算样式渲染：段落用 GPUI 的 [`StyledText`] 行内 run 画
 //! 颜色/字重/下划线，块级属性落到 `div` 上；表格按行列布局，图片直接交给 GPUI 解码。
 
 use std::sync::Arc;
@@ -12,415 +13,493 @@ use dict_core::{
     InlineBox, Justify, LinkTarget, Paragraph, Span, SpanStyle, Table, TableCell,
 };
 use gpui::{
-    AnyElement, Context, Div, ElementId, Entity, Font, FontFallbacks, FontFeatures, FontStyle,
-    FontWeight, Hsla, Image, ImageFormat, InteractiveText, ObjectFit, Render, Rgba,
-    StrikethroughStyle, StyledText, TextAlign, TextRun, UnderlineStyle, Window, div, img, point,
+    AnyElement, ClickEvent, Context, Div, ElementId, Font, FontFallbacks, FontFeatures, FontStyle,
+    FontWeight, Hsla, Image, ImageFormat, InteractiveText, ObjectFit, Rgba, ScrollEvent,
+    StrikethroughStyle, StyledText, TextAlign, TextRun, UnderlineStyle, Window, div, img,
     prelude::*, px, relative,
 };
 
-#[cfg(target_os = "windows")]
-use gpui::{App, Bounds, MouseButton, MouseDownEvent, Pixels, Point, WindowId};
-
-use crate::dictionary::{DictLoadState, DictRequest, DictionaryView};
+use crate::app::AppState;
+use crate::dictionary::{DictLoadState, DictRequest};
+use crate::highlights::PinnedGloss;
+use crate::layout::{
+    DocumentLayout, GLOSS_RAIL_GAP, GLOSS_RAIL_WIDTH, GlossSlotInput, layout_gloss_slots,
+};
 use crate::theme::Theme;
-use crate::ui::text_input::{TextInput, TextInputEvent};
-#[cfg(target_os = "windows")]
-use crate::window_layout::{RectF, snap_origin};
-#[cfg(target_os = "windows")]
-use crate::window_move;
 
-/// 把查词/清空历史请求送回主窗口的通道；释义里的链接复用查词部分。
+/// 把释义内 `entry://` 链接的查词请求送回 `AppState` 的通道。
 type LookupSender = futures::channel::mpsc::UnboundedSender<DictRequest>;
 
-pub(crate) struct DictionaryWindow {
-    view: DictionaryView,
-    theme: Theme,
-    /// 查词输入框：双击查词和手动输入共用同一个框。
-    input: Entity<TextInput>,
-    /// 把查询词送回主窗口（查词逻辑和状态都在 `AppState`）。
-    lookup: LookupSender,
-    /// 拖动标题栏时的起点快照（仅 Windows 手动移动窗口时需要）。
-    #[cfg(target_os = "windows")]
-    drag: Option<WindowDrag>,
-}
+/// 钉住的紧凑笺注卡在排布避让时的估算高度（逻辑像素）。
+const PINNED_CARD_ESTIMATED_HEIGHT: f32 = 88.0;
+/// 激活态查词卡在排布避让时的估算高度（逻辑像素）。
+const ACTIVE_CARD_ESTIMATED_HEIGHT: f32 = 340.0;
+/// 激活态查词卡在 `GlossSlotInput` 中的保留 ID。
+const ACTIVE_SLOT_ID: u64 = u64::MAX;
 
-#[cfg(target_os = "windows")]
-struct WindowDrag {
-    /// 按下鼠标时，鼠标在窗口内的位置；拖动时让这个点一直跟着鼠标。
-    cursor: Point<Pixels>,
-    /// 按下时窗口左上角的位置。目标位置一律从它加鼠标位移算出来：
-    /// 移动请求是异步执行、可能被丢弃的，不能拿当前（可能滞后的）位置累加。
-    origin: Point<Pixels>,
-    /// 按下时主窗口的位置；拖拽期间主窗口不会移动。
-    main: Option<RectF>,
-    work: RectF,
-}
-
-/// 用于启动窗口拖拽的占位 payload，本身不渲染任何东西。
-#[cfg(target_os = "windows")]
-struct DictionaryWindowDrag;
-
-impl DictionaryWindow {
-    pub fn new(
-        view: DictionaryView,
-        theme: Theme,
-        lookup: LookupSender,
+impl AppState {
+    /// 渲染第 `page` 页右侧的页边笺注栏（含该页已钉住的紧凑笺注卡与激活态查词卡）。
+    ///
+    /// 若该页既没有已钉住的笺注、也不是当前激活态查词卡所在页，则返回 `None`。
+    pub(crate) fn page_gloss_rail(
+        &self,
+        page: usize,
+        layout: &DocumentLayout,
+        theme: &Theme,
         cx: &mut Context<Self>,
-    ) -> Self {
-        let input = cx.new(|cx| {
-            let mut input = TextInput::new("输入字词，Enter 查词", theme.clone(), 13.0, cx);
-            if !view.word.is_empty() {
-                input.set_value(view.word.clone(), cx);
+    ) -> Option<gpui::Div> {
+        let geometry = layout.page_box(page)?;
+        let active_here = self.dictionary.open && self.dictionary.anchor_page == page;
+        let active_word = self.dictionary.word.trim();
+
+        // 若某个已钉住词条正好在当前页处于激活展开态，不重复渲染折叠态小卡，
+        // 由激活态查词卡右上角的「已钉」徽章直接表达其钉住状态。
+        let pinned: Vec<&PinnedGloss> = self
+            .viewer
+            .highlights
+            .glosses_for_page(page)
+            .into_iter()
+            .filter(|gloss| {
+                !(active_here
+                    && !active_word.is_empty()
+                    && gloss.word.trim().eq_ignore_ascii_case(active_word))
+            })
+            .collect();
+
+        if pinned.is_empty() && !active_here {
+            return None;
+        }
+
+        let zoom = self.viewer.zoom;
+        let mut slot_inputs = Vec::with_capacity(pinned.len() + usize::from(active_here));
+        for gloss in &pinned {
+            slot_inputs.push(GlossSlotInput {
+                id: gloss.id,
+                desired_top: (gloss.anchor_top * zoom).clamp(0.0, geometry.height),
+                height: PINNED_CARD_ESTIMATED_HEIGHT,
+            });
+        }
+        if active_here {
+            slot_inputs.push(GlossSlotInput {
+                id: ACTIVE_SLOT_ID,
+                desired_top: (self.dictionary.anchor_top * zoom).clamp(0.0, geometry.height),
+                height: ACTIVE_CARD_ESTIMATED_HEIGHT.min(geometry.height),
+            });
+        }
+
+        let slots = layout_gloss_slots(&slot_inputs, geometry.height);
+        let mut rail = div()
+            .absolute()
+            .left(px(geometry.rail_left()))
+            .top(px(geometry.top))
+            .w(px(GLOSS_RAIL_WIDTH))
+            .h(px(geometry.height));
+
+        for slot in slots {
+            if slot.id == ACTIVE_SLOT_ID {
+                let anchor_y =
+                    (self.dictionary.anchor_top * zoom + 10.0).clamp(8.0, geometry.height - 8.0);
+                rail = rail
+                    .child(gloss_connector(
+                        anchor_y,
+                        slot.top + 18.0,
+                        theme.accent.opacity(0.55),
+                    ))
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top(px(slot.top))
+                            .w(px(GLOSS_RAIL_WIDTH))
+                            .child(self.active_gloss_card(geometry.height, theme, cx)),
+                    );
+            } else if let Some(gloss) = pinned.iter().copied().find(|g| g.id == slot.id) {
+                let anchor_y = (gloss.anchor_top * zoom + 10.0).clamp(8.0, geometry.height - 8.0);
+                rail = rail
+                    .child(gloss_connector(
+                        anchor_y,
+                        slot.top + 16.0,
+                        theme.accent.opacity(0.28),
+                    ))
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top(px(slot.top))
+                            .w(px(GLOSS_RAIL_WIDTH))
+                            .child(self.pinned_gloss_card(gloss, theme, cx)),
+                    );
             }
-            input
-        });
-
-        cx.subscribe(
-            &input,
-            |this, _input, event: &TextInputEvent, cx| match event {
-                TextInputEvent::Submitted { .. } => this.submit_query(cx),
-                TextInputEvent::Cancelled => {
-                    // Esc 清空输入框；释义保持不动，方便继续看。
-                    this.input.update(cx, |input, cx| input.clear(cx));
-                }
-                TextInputEvent::Changed => this.suggest(cx),
-            },
-        )
-        .detach();
-
-        Self {
-            view,
-            theme,
-            input,
-            lookup,
-            #[cfg(target_os = "windows")]
-            drag: None,
         }
+
+        Some(rail)
     }
 
-    /// 把输入框里的词送去主窗口查词。
-    fn submit_query(&mut self, cx: &mut Context<Self>) {
-        let term = self.input.read(cx).value().trim().to_string();
-        if term.is_empty() {
-            return;
-        }
-        if self
-            .lookup
-            .unbounded_send(DictRequest::Lookup(term))
-            .is_err()
-        {
-            log::warn!("dictionary lookup channel closed");
-        }
-    }
-
-    /// 输入变化：把最新内容发给主窗口做防抖联想。
-    fn suggest(&mut self, cx: &mut Context<Self>) {
-        let term = self.input.read(cx).value().to_string();
-        if self
-            .lookup
-            .unbounded_send(DictRequest::Suggest(term))
-            .is_err()
-        {
-            log::warn!("dictionary lookup channel closed");
-        }
-    }
-
-    /// 点击历史/建议词条：回填输入框并立即重查。
-    fn query_history(&mut self, term: String, cx: &mut Context<Self>) {
-        self.input
-            .update(cx, |input, cx| input.set_value(term.clone(), cx));
-        if self
-            .lookup
-            .unbounded_send(DictRequest::Lookup(term))
-            .is_err()
-        {
-            log::warn!("dictionary lookup channel closed");
-        }
-    }
-
-    fn clear_history(&mut self) {
-        if self
-            .lookup
-            .unbounded_send(DictRequest::ClearHistory)
-            .is_err()
-        {
-            log::warn!("dictionary lookup channel closed");
-        }
-    }
-
-    pub fn apply(&mut self, view: DictionaryView, theme: Theme, cx: &mut Context<Self>) {
-        // 只有“查询词变了”才回填输入框；联想/加载状态同步不能覆盖用户正在输入的内容。
-        let word_changed = self.view.word != view.word;
-        self.view = view;
-        self.theme = theme.clone();
-        self.input
-            .update(cx, |input, cx| input.set_theme(theme, cx));
-
-        // 双击查词或点击历史/建议时把词回填到输入框，方便接着改字继续查。
-        let word = self.view.word.clone();
-        if word_changed && !word.is_empty() && self.input.read(cx).value() != word {
-            self.input.update(cx, |input, cx| input.set_value(word, cx));
-        }
-
-        cx.notify();
-    }
-
-    /// 记下拖拽起点，以及主窗口/工作区位置。
-    #[cfg(target_os = "windows")]
-    fn begin_window_drag(
-        &mut self,
-        event: &MouseDownEvent,
-        window: &mut Window,
+    /// 紧凑态页边笺注卡：展示词头、音标与 1~2 行核心释义摘要，点击展开为完整查词卡。
+    fn pinned_gloss_card(
+        &self,
+        gloss: &PinnedGloss,
+        theme: &Theme,
         cx: &mut Context<Self>,
-    ) {
-        let work = window
-            .display(&**cx)
-            .map(|display| rect_from_bounds(display.visible_bounds()))
-            .unwrap_or_else(|| RectF::new(0.0, 0.0, 1920.0, 1080.0));
-        let main = other_window_bounds(&mut **cx, window.window_handle().window_id())
-            .map(rect_from_bounds);
+    ) -> gpui::Stateful<gpui::Div> {
+        let id = gloss.id;
+        let word = gloss.word.clone();
+        let phonetic = gloss.phonetic.clone();
+        let summary = gloss.summary.clone();
+        let hover_bg = theme.surface_hover;
 
-        self.drag = Some(WindowDrag {
-            cursor: event.position,
-            origin: window.bounds().origin,
-            main,
-            work,
-        });
-    }
+        let mut header = div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .min_w(px(0.))
+            .child(
+                div()
+                    .w(px(3.))
+                    .h(px(12.))
+                    .rounded_full()
+                    .flex_shrink_0()
+                    .bg(theme.accent),
+            )
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .truncate()
+                    .child(word),
+            );
 
-    /// 跟随鼠标移动窗口；靠近主窗口或工作区边缘时吸附。
-    #[cfg(target_os = "windows")]
-    fn drag_window(
-        &mut self,
-        event: &gpui::DragMoveEvent<DictionaryWindowDrag>,
-        window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        let Some(drag) = &self.drag else {
-            return;
-        };
+        if let Some(phonetic) = phonetic.filter(|p| !p.is_empty()) {
+            header = header.child(
+                div()
+                    .text_size(px(11.))
+                    .font_family(theme.mono_font.clone())
+                    .text_color(theme.text_muted)
+                    .truncate()
+                    .child(format!("/{phonetic}/")),
+            );
+        }
 
-        // 窗口跟着鼠标走：让按下时鼠标在窗口内的那个点一直跟着鼠标。
-        let raw_origin = drag.origin + event.event.position - drag.cursor;
-        let size = window.bounds().size;
-        let (x, y) = snap_origin(
-            (f32::from(raw_origin.x), f32::from(raw_origin.y)),
-            (f32::from(size.width), f32::from(size.height)),
-            drag.main,
-            drag.work,
+        header = header.child(
+            div()
+                .id(ElementId::NamedInteger("gloss-unpin".into(), id))
+                .ml_auto()
+                .flex_shrink_0()
+                .px(px(5.))
+                .py(px(1.))
+                .rounded_md()
+                .text_size(px(11.))
+                .text_color(theme.text_muted)
+                .hover(move |style| style.bg(hover_bg))
+                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    this.delete_highlight(id, cx);
+                }))
+                .child("✕"),
         );
 
-        window_move::move_window(window, point(px(x), px(y)));
-
-        // 告诉主窗口浮窗现在在哪：贴边状态（和间距）只有它那边算得准，
-        // 拖动结束后主窗口移动时浮窗才会继续跟随。
-        self.lookup
-            .unbounded_send(DictRequest::FloatPlaced(RectF::new(
-                x,
-                y,
-                f32::from(size.width),
-                f32::from(size.height),
-            )))
-            .ok();
+        div()
+            .id(ElementId::NamedInteger("gloss-pinned-card".into(), id))
+            .w(px(GLOSS_RAIL_WIDTH))
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .bg(theme.surface.opacity(0.96))
+            .border_1()
+            .border_color(theme.border)
+            .shadow_md()
+            .occlude()
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover_bg))
+            .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                this.open_pinned_gloss(id, cx);
+            }))
+            .child(header)
+            .child(
+                div()
+                    .mt(px(4.))
+                    .text_size(px(12.))
+                    .line_height(relative(1.4))
+                    .text_color(theme.text_muted)
+                    .child(summary),
+            )
     }
-}
 
-#[cfg(target_os = "windows")]
-fn rect_from_bounds(bounds: Bounds<Pixels>) -> RectF {
-    RectF::new(
-        f32::from(bounds.origin.x),
-        f32::from(bounds.origin.y),
-        f32::from(bounds.size.width),
-        f32::from(bounds.size.height),
-    )
-}
-
-/// 找主窗口的 bounds：除了当前词典窗口以外最大的那个窗口。
-#[cfg(target_os = "windows")]
-fn other_window_bounds(cx: &mut App, current: WindowId) -> Option<Bounds<Pixels>> {
-    let mut best: Option<Bounds<Pixels>> = None;
-    for handle in cx.windows() {
-        if handle.window_id() == current {
-            continue;
-        }
-        let Ok(bounds) = handle.update(cx, |_view, window, _cx| window.bounds()) else {
-            continue;
-        };
-        let area = {
-            let size = bounds.size;
-            f32::from(size.width) * f32::from(size.height)
-        };
-        let is_larger = best.is_none_or(|best| {
-            let size = best.size;
-            f32::from(size.width) * f32::from(size.height) < area
-        });
-        if is_larger {
-            best = Some(bounds);
-        }
-    }
-    best
-}
-
-impl Render for DictionaryWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme.clone();
-        let view = &self.view;
-
-        let word = if view.word.is_empty() {
-            String::new()
-        } else {
-            format!("· {}", view.word)
-        };
-
+    /// 激活态页边查词卡：包含标题栏（返回/最近/钉住/关闭）、手动查词框、前缀建议、历史与完整 MDX 释义。
+    fn active_gloss_card(
+        &self,
+        page_height: f32,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let max_body_h = (page_height - 120.0).clamp(180.0, 320.0);
         let mut body = div()
-            .id("dictionary-window-scroll")
-            .flex_1()
+            .id("gloss-active-body-scroll")
+            .max_h(px(max_body_h))
             .min_h(px(0.))
             .overflow_y_scroll()
-            .p_4()
+            .p_3()
             .flex()
             .flex_col();
 
-        match &view.load_state {
+        match &self.dictionary.load_state {
             DictLoadState::Unconfigured => {
                 body = body
-                    .child(muted("还没有配置词典", &theme))
+                    .child(muted("还没有配置词典", theme))
                     .child(px_gap(6.))
-                    .child(muted("请在主窗口的设置中选择 .mdx 文件。", &theme));
+                    .child(muted("请在主窗口的设置中选择 .mdx 文件。", theme));
             }
             DictLoadState::Loading => {
-                body = body.child(muted("正在加载词典…", &theme));
+                body = body.child(muted("正在加载词典…", theme));
             }
             DictLoadState::Failed(message) => {
                 body = body
-                    .child(muted("词典加载失败", &theme))
-                    .child(error_text(message, &theme));
+                    .child(muted("词典加载失败", theme))
+                    .child(error_text(message, theme));
             }
             DictLoadState::Ready { title, entries } => {
-                if view.loading {
-                    body = body.child(muted("正在查询…", &theme));
-                } else if let Some(error) = &view.error {
-                    body = body.child(error_text(error, &theme));
-                } else if view.not_found {
-                    body = body.child(muted(format!("未找到「{}」", view.word), &theme));
-                } else if view.entries.is_empty() {
-                    body = body.child(muted("双击 PDF 中的单词或汉字开始查词", &theme));
+                if self.dictionary.loading {
+                    body = body.child(muted("正在查询…", theme));
+                } else if let Some(error) = &self.dictionary.error {
+                    body = body.child(error_text(error, theme));
+                } else if self.dictionary.not_found {
+                    body = body.child(muted(format!("未找到「{}」", self.dictionary.word), theme));
+                } else if self.dictionary.entries.is_empty() {
+                    body = body.child(muted("双击 PDF 中的单词或汉字开始查词", theme));
                 } else {
-                    for (entry_index, entry) in view.entries.iter().enumerate() {
+                    for (entry_index, entry) in self.dictionary.entries.iter().enumerate() {
                         body = body.child(entry_element(
                             entry,
-                            &theme,
-                            &self.lookup,
+                            theme,
+                            &self.dict_query,
                             mix_seed(0x9e37_79b9_7f4a_7c15, entry_index),
                         ));
                     }
                 }
 
-                if view.entries.is_empty() {
-                    body = body.child(px_gap(12.)).child(muted(
+                if self.dictionary.entries.is_empty() {
+                    body = body.child(px_gap(10.)).child(muted(
                         match title {
                             Some(title) => format!("词典：{title} · {entries} 条"),
                             None => format!("词典 · {entries} 条"),
                         },
-                        &theme,
+                        theme,
                     ));
                 }
             }
         }
 
-        div()
-            .size_full()
+        let mut card = div()
+            .id("gloss-active-card")
+            .w(px(GLOSS_RAIL_WIDTH))
             .flex()
             .flex_col()
-            .bg(theme.bg)
-            .text_color(theme.text)
-            .font_family(theme.font_family.clone())
-            .child(self.titlebar(&theme, word, cx))
-            .child(self.query_row(&theme, cx))
-            .child(self.suggestions_row(&theme, cx))
-            .child(self.history_row(&theme, cx))
-            .child(body)
-    }
-}
-
-impl DictionaryWindow {
-    /// 自绘标题栏：左边是标题和当前词，整条可拖动，右边是关闭按钮。
-    fn titlebar(&self, theme: &Theme, word: String, cx: &mut Context<Self>) -> gpui::Div {
-        let title = div()
-            .id("dictionary-titlebar")
-            .flex()
-            .flex_1()
-            .min_w(px(0.))
-            .items_center()
-            .gap(px(8.))
-            .h_full()
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(12.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("词典"),
-            )
-            .child(
-                div()
-                    .min_w(px(0.))
-                    .truncate()
-                    .text_size(px(12.))
-                    .text_color(theme.text_muted)
-                    .child(word),
-            );
-        let title = crate::ui::chrome::drag_cursor(title);
-
-        // Windows 上 GPUI 没有移动窗口的 API，这里自己跟踪拖拽并调 SetWindowPos；
-        // 其他平台交给系统的无边框标题栏拖拽。
-        #[cfg(target_os = "windows")]
-        let title = title
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_window_drag))
-            .on_drag(
-                DictionaryWindowDrag,
-                |_drag: &DictionaryWindowDrag, _offset, _window, cx| cx.new(|_| gpui::EmptyView),
-            )
-            .on_drag_move::<DictionaryWindowDrag>(cx.listener(
-                |this, event: &gpui::DragMoveEvent<DictionaryWindowDrag>, window, cx| {
-                    this.drag_window(event, window, cx);
+            .rounded_lg()
+            .bg(theme.surface.opacity(0.98))
+            .border_1()
+            .border_color(theme.accent.opacity(0.55))
+            .shadow_lg()
+            .occlude()
+            .on_scroll(cx.listener(
+                |_this, event: &ScrollEvent, _window: &mut Window, cx| {
+                    // 词典释义区滚轮独立滚动，不带动外层 PDF 页面。
+                    if !event.modifiers.control {
+                        cx.stop_propagation();
+                    }
                 },
-            ));
-        #[cfg(not(target_os = "windows"))]
-        let title = title.window_control_area(gpui::WindowControlArea::Drag);
+            ))
+            .child(self.gloss_card_header(theme, cx))
+            .child(self.gloss_query_row(theme, cx));
 
-        div()
+        if !self.dictionary.suggestions.is_empty() {
+            card = card.child(self.gloss_suggestions_row(theme, cx));
+        }
+
+        let show_history = (self.dictionary.show_history || self.dictionary.entries.is_empty())
+            && !self.dict_history.entries().is_empty();
+        if show_history {
+            card = card.child(self.gloss_history_row(theme, cx));
+        }
+
+        card.child(body)
+    }
+
+    /// 激活态查词卡顶栏：左侧词头与跳转返回，右侧「最近」「钉住/已钉」与关闭按钮。
+    fn gloss_card_header(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let hover_bg = theme.surface_hover;
+        let word_label = if self.dictionary.word.is_empty() {
+            "笺注".to_string()
+        } else {
+            format!("笺注 · {}", self.dictionary.word)
+        };
+
+        let is_pinned = !self.dictionary.word.trim().is_empty()
+            && self
+                .viewer
+                .highlights
+                .find_gloss(self.dictionary.anchor_page, &self.dictionary.word)
+                .is_some();
+        let can_pin =
+            !self.dictionary.word.trim().is_empty() && !self.dictionary.entries.is_empty();
+
+        let mut header = div()
             .flex()
             .items_center()
-            .gap(px(8.))
-            .h(px(40.))
+            .gap(px(6.))
+            .h(px(36.))
             .px_3()
             .border_b_1()
-            .border_color(theme.border)
-            .child(title)
-            .child(
+            .border_color(theme.border);
+
+        if !self.dictionary.back_stack.is_empty() {
+            header = header.child(
                 div()
-                    .id("dictionary-close")
+                    .id("gloss-back")
                     .flex_shrink_0()
                     .px(px(6.))
                     .py(px(2.))
                     .rounded_md()
+                    .text_size(px(11.))
+                    .text_color(theme.accent)
                     .cursor_pointer()
+                    .hover(move |style| style.bg(hover_bg))
+                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.navigate_dict_back(cx);
+                    }))
+                    .child("‹ 返回"),
+            );
+        }
+
+        header = header.child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .text_size(px(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text)
+                .child(word_label),
+        );
+
+        if !self.dict_history.entries().is_empty() {
+            let history_active = self.dictionary.show_history;
+            let history_btn = div()
+                .id("gloss-history-toggle")
+                .flex_shrink_0()
+                .px(px(6.))
+                .py(px(2.))
+                .rounded_md()
+                .text_size(px(11.))
+                .cursor_pointer()
+                .text_color(if history_active {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                })
+                .hover(move |style| style.bg(hover_bg))
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.dictionary.show_history = !this.dictionary.show_history;
+                    cx.notify();
+                }))
+                .child("最近");
+            header = header.child(history_btn);
+        }
+
+        if can_pin || is_pinned {
+            let pin_label = if is_pinned { "已钉" } else { "钉住" };
+            let mut pin_btn = div()
+                .id("gloss-pin-toggle")
+                .flex_shrink_0()
+                .px(px(7.))
+                .py(px(2.))
+                .rounded_md()
+                .text_size(px(11.))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.toggle_pin_current_gloss(cx);
+                }))
+                .child(pin_label);
+
+            if is_pinned {
+                pin_btn = pin_btn
+                    .bg(theme.accent.opacity(0.18))
+                    .text_color(theme.accent)
+                    .font_weight(FontWeight::SEMIBOLD);
+            } else {
+                pin_btn = pin_btn
                     .text_color(theme.text_muted)
-                    .hover({
-                        let hover_bg = theme.surface_hover;
-                        move |style| style.bg(hover_bg)
-                    })
-                    .on_click(
-                        cx.listener(|_this, _event: &gpui::ClickEvent, window, _cx| {
-                            window.remove_window();
-                        }),
-                    )
-                    .child("✕"),
+                    .hover(move |style| style.bg(hover_bg));
+            }
+            header = header.child(pin_btn);
+        }
+
+        header.child(
+            div()
+                .id("gloss-close")
+                .flex_shrink_0()
+                .px(px(6.))
+                .py(px(2.))
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(11.))
+                .text_color(theme.text_muted)
+                .hover(move |style| style.bg(hover_bg))
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.close_dictionary(cx);
+                }))
+                .child("✕"),
+        )
+    }
+
+    /// 查词输入行：手动输入 + 「查」按钮。
+    fn gloss_query_row(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let hover = theme.accent_hover;
+
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .h(px(26.))
+                    .px_2()
+                    .rounded_md()
+                    .bg(theme.bg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(self.dict_input.clone()),
+            )
+            .child(
+                div()
+                    .id("dictionary-submit")
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .h(px(26.))
+                    .px_3()
+                    .rounded_md()
+                    .bg(theme.accent)
+                    .text_color(theme.accent_text)
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.submit_dict_query(cx);
+                    }))
+                    .child("查"),
             )
     }
 
     /// 前缀建议：跨词典、去重、最多 8 条，点击填入并查询。
-    fn suggestions_row(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+    fn gloss_suggestions_row(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let mut row = div()
             .flex()
             .flex_wrap()
@@ -432,23 +511,19 @@ impl DictionaryWindow {
             .border_color(theme.border)
             .text_size(px(11.));
 
-        if self.view.suggestions.is_empty() {
-            return row;
-        }
-
         row = row.child(div().text_color(theme.text_muted).child("建议"));
-        for (index, term) in self.view.suggestions.clone().into_iter().enumerate() {
+        for (index, term) in self.dictionary.suggestions.clone().into_iter().enumerate() {
             let id = ElementId::NamedInteger("dict-suggestion".into(), index as u64);
             let label = term.clone();
             row = row.child(
                 div()
                     .id(id)
-                    .max_w(px(180.))
+                    .max_w(px(160.))
                     .truncate()
                     .px_2()
                     .py(px(2.))
                     .rounded_md()
-                    .bg(theme.surface)
+                    .bg(theme.bg)
                     .border_1()
                     .border_color(theme.border)
                     .cursor_pointer()
@@ -456,11 +531,9 @@ impl DictionaryWindow {
                         let hover = theme.accent_hover;
                         move |style| style.bg(hover)
                     })
-                    .on_click(
-                        cx.listener(move |this, _event: &gpui::ClickEvent, _window, cx| {
-                            this.query_history(label.clone(), cx);
-                        }),
-                    )
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                        this.query_dict_term(label.clone(), cx);
+                    }))
                     .child(term),
             );
         }
@@ -468,35 +541,31 @@ impl DictionaryWindow {
     }
 
     /// 查词历史：最新的在前，点击重查；右侧可一键清空。
-    fn history_row(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+    fn gloss_history_row(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let mut row = div()
             .flex()
             .flex_wrap()
             .items_center()
             .gap_1()
             .px_3()
-            .pb_2()
+            .py_2()
             .border_b_1()
             .border_color(theme.border)
             .text_size(px(11.));
 
-        if self.view.history.is_empty() {
-            return row;
-        }
-
         row = row.child(div().text_color(theme.text_muted).child("最近"));
-        for (index, term) in self.view.history.clone().into_iter().enumerate() {
+        for (index, term) in self.dict_history.entries().iter().cloned().enumerate() {
             let id = ElementId::NamedInteger("dict-history".into(), index as u64);
             let label = term.clone();
             row = row.child(
                 div()
                     .id(id)
-                    .max_w(px(140.))
+                    .max_w(px(130.))
                     .truncate()
                     .px_2()
                     .py(px(2.))
                     .rounded_md()
-                    .bg(theme.surface)
+                    .bg(theme.bg)
                     .border_1()
                     .border_color(theme.border)
                     .cursor_pointer()
@@ -504,11 +573,9 @@ impl DictionaryWindow {
                         let hover = theme.accent_hover;
                         move |style| style.bg(hover)
                     })
-                    .on_click(
-                        cx.listener(move |this, _event: &gpui::ClickEvent, _window, cx| {
-                            this.query_history(label.clone(), cx);
-                        }),
-                    )
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                        this.query_dict_term(label.clone(), cx);
+                    }))
                     .child(term),
             );
         }
@@ -526,60 +593,27 @@ impl DictionaryWindow {
                     let hover = theme.accent_hover;
                     move |style| style.bg(hover)
                 })
-                .on_click(
-                    cx.listener(|this, _event: &gpui::ClickEvent, _window, _cx| {
-                        this.clear_history();
-                    }),
-                )
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.clear_dict_history(cx);
+                }))
                 .child("清空"),
         )
     }
+}
 
-    /// 查词输入行：手动输入 + 「查」按钮。
-    fn query_row(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
-        let hover = theme.accent_hover;
-
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .items_center()
-                    .h(px(28.))
-                    .px_2()
-                    .rounded_md()
-                    .bg(theme.surface)
-                    .border_1()
-                    .border_color(theme.border)
-                    .child(self.input.clone()),
-            )
-            .child(
-                div()
-                    .id("dictionary-submit")
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .h(px(28.))
-                    .px_3()
-                    .rounded_md()
-                    .bg(theme.accent)
-                    .text_color(theme.accent_text)
-                    .text_size(px(12.))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(hover))
-                    .on_click(cx.listener(|this, _event: &gpui::ClickEvent, _window, cx| {
-                        this.submit_query(cx);
-                    }))
-                    .child("查"),
-            )
-    }
+/// 纸张右缘到页边笺注卡之间的引线标记：当卡片因避让发生纵向偏移时，用短折线保持锚点指向。
+fn gloss_connector(anchor_y: f32, card_y: f32, color: Rgba) -> Div {
+    let top = anchor_y.min(card_y);
+    let height = (anchor_y - card_y).abs().max(1.5);
+    div()
+        .absolute()
+        .left(px(-GLOSS_RAIL_GAP + 2.0))
+        .top(px(top))
+        .w(px(GLOSS_RAIL_GAP - 2.0))
+        .h(px(height))
+        .border_t_1()
+        .border_l_1()
+        .border_color(color)
 }
 
 fn entry_element(entry: &DictEntry, theme: &Theme, lookup: &LookupSender, seed: u64) -> Div {

@@ -1,4 +1,4 @@
-//! 文档生命周期：打开/关闭文档、恢复与保存阅读进度、高亮 sidecar、全文检索
+//! 文档生命周期：打开/关闭文档、恢复与保存阅读进度、高亮与页边笺注 sidecar、全文检索
 //! 会话，以及词典资源的加载与查词。
 //!
 //! 边界是「资源状态机」：什么被打开、上次读到哪、关闭前要写什么。这里会直接
@@ -14,7 +14,7 @@ use gpui::{Context, PathPromptOptions, Window};
 use pdf_core::{Command, DocumentMetadata, OutlineItem, PageHits, PageSize};
 
 use crate::dict_suggest::{MAX_SUGGESTIONS, SUGGEST_DEBOUNCE};
-use crate::dictionary::{DictLoadState, normalize_term};
+use crate::dictionary::{DictLoadState, normalize_term, summarize_entries};
 use crate::highlights::sidecar_path;
 use crate::progress::{ReadingProgress, unix_now};
 use crate::viewer::Document;
@@ -98,9 +98,7 @@ impl super::AppState {
         }
     }
 
-    /// 引擎报告文档已打开：重置会话状态、恢复进度、加载高亮。
-    ///
-    /// 由 [`super::events::AppState::handle_event`] 在收到 `Event::Opened` 时调用。
+    /// 引擎报告文档已打开：重置会话状态、恢复进度、加载高亮与页边笺注。
     pub(super) fn on_document_opened(
         &mut self,
         path: PathBuf,
@@ -121,17 +119,18 @@ impl super::AppState {
         let display_title = metadata.title_or(&name).to_string();
         let saved = self.home.progress_for(&path);
 
-        let area = self.fit_area();
         self.home.record(path.clone(), display_title.clone());
         self.home.query.clear();
         self.home.search_focused = false;
         self.dictionary.clear_results();
-        self.sync_dictionary_window(cx);
+        self.dictionary.open = false;
+        self.dict_input.update(cx, |input, cx| input.clear(cx));
         self.search_input.update(cx, |input, cx| input.clear(cx));
         self.panning = None;
-        // 换文档时重置胶囊可见性：新文档先亮着让用户看见按钮，
-        // 否则上一份文档留下的「已隐身」会直接沿用过来。
+        // 换文档时重置胶囊可见性：新文档先亮着让用户看见按钮。
         self.chrome = crate::chrome_visibility::ChromeVisibility::new();
+
+        let initial_area = self.fit_area();
         self.viewer.reset(
             Document {
                 path,
@@ -139,9 +138,17 @@ impl super::AppState {
                 outline,
                 metadata,
             },
-            area,
+            initial_area,
         );
 
+        // 先加载 sidecar（可能含已钉住的页边笺注，会影响 fit_area 预留的页边栏宽度）。
+        if let Some(doc) = &self.viewer.doc {
+            let path = sidecar_path(&doc.path);
+            self.viewer.highlights.load(&path);
+        }
+
+        let area = self.fit_area();
+        let _ = self.viewer.fit(self.viewer.fit_mode, area);
         let restored = saved.is_some_and(|progress| self.viewer.restore_progress(&progress, area));
         self.apply_pending_scroll();
 
@@ -154,16 +161,9 @@ impl super::AppState {
                 && page.height > 0.0
         });
         self.pending_window_resize = None;
-        // 恢复成功时以保存的位置为基线，等布局完成后采样再修正；
-        // 失败时清空基线，让下一次采样覆盖掉过期的旧进度。
         self.last_progress = if restored { saved } else { None };
         self.window_title = format!("{display_title} · 笺释");
         self.window_title_dirty = true;
-
-        if let Some(doc) = &self.viewer.doc {
-            let path = sidecar_path(&doc.path);
-            self.viewer.highlights.load(&path);
-        }
 
         self.ensure_visible_pages();
         if restored {
@@ -192,6 +192,7 @@ impl super::AppState {
         self.panning = None;
         self.page_input_open = false;
         self.search_input.update(cx, |input, cx| input.clear(cx));
+        self.dict_input.update(cx, |input, cx| input.clear(cx));
         self.pending_focus = Some(FocusTarget::Root);
         self.last_progress = None;
         self.outline_open = false;
@@ -199,7 +200,7 @@ impl super::AppState {
         self.window_title = "笺释".into();
         self.window_title_dirty = true;
         self.dictionary.clear_results();
-        self.close_dictionary_window(cx);
+        self.dictionary.open = false;
         self.home.menu_open = None;
         self.home.search_focused = false;
         self.home.query.clear();
@@ -219,8 +220,6 @@ impl super::AppState {
     }
 
     /// 把当前页、页内滚动比例和缩放写进最近阅读（只改内存）。
-    ///
-    /// 返回 `false` 表示没有文档或位置没变。
     pub(super) fn capture_progress(&mut self) -> bool {
         let Some(progress) = self.current_progress() else {
             return false;
@@ -242,7 +241,6 @@ impl super::AppState {
         let doc = self.viewer.doc.as_ref()?;
         let layout = self.doc_layout()?;
         let (page, ratio_y) = layout.anchor_at(self.scroll_top(), f32::from(self.viewport.height));
-        // serde_json 不接受 NaN/Infinity，缩放异常时退回 1.0。
         let zoom = if self.viewer.zoom.is_finite() {
             self.viewer.zoom
         } else {
@@ -252,7 +250,6 @@ impl super::AppState {
             page,
             pages: doc.pages.len(),
             zoom,
-            // 新记录总是带模式，包括手动缩放（free）；缺字段表示旧版本。
             fit: Some(self.viewer.fit_mode),
             scroll_x: self.scroll_ratio_x(&layout),
             scroll_y: ratio_y,
@@ -282,10 +279,9 @@ impl super::AppState {
         .detach();
     }
 
-    // ---------- 高亮 ----------
+    // ---------- 高亮与页边笺注 ----------
 
     pub(crate) fn add_highlight(&mut self, cx: &mut Context<Self>) {
-        // 高亮跟着选区走：在哪一页选的，就写到哪一页。
         let Some(page) = self.viewer.selection.page else {
             self.set_status("先选中要标注的文本", cx);
             cx.notify();
@@ -317,16 +313,77 @@ impl super::AppState {
         cx.notify();
     }
 
-    /// 删除一条高亮并立即写盘，避免下次打开又冒出来。
+    /// 删除一条高亮或页边笺注并立即写盘，避免下次打开又冒出来。
     pub(crate) fn delete_highlight(&mut self, id: u64, cx: &mut Context<Self>) {
+        let had_rail = self.has_gloss_rail();
         if !self.viewer.highlights.remove(id) {
             return;
         }
+        if had_rail != self.has_gloss_rail() {
+            self.refit();
+            self.ensure_visible_pages();
+        }
         match self.persist_highlights() {
-            Ok(()) => self.set_status("已删除高亮", cx),
-            Err(error) => self.set_status(format!("删除后保存失败: {error}"), cx),
+            Ok(()) => self.set_status("已移除批注", cx),
+            Err(error) => self.set_status(format!("移除后保存失败: {error}"), cx),
         }
         cx.notify();
+    }
+
+    /// 钉住或取消钉住当前激活态查词卡中的词条，并立即落盘到 sidecar。
+    pub(crate) fn toggle_pin_current_gloss(&mut self, cx: &mut Context<Self>) {
+        let word = self.dictionary.word.trim().to_string();
+        if word.is_empty() {
+            return;
+        }
+        let page = self.dictionary.anchor_page;
+        if let Some(existing) = self.viewer.highlights.find_gloss(page, &word) {
+            let id = existing.id;
+            self.delete_highlight(id, cx);
+            return;
+        }
+
+        let (phonetic, summary) = summarize_entries(&self.dictionary.entries, &word);
+        let rects = self.dictionary.anchor_rects.clone();
+        let anchor_top = self.dictionary.anchor_top;
+        let had_rail = self.has_gloss_rail();
+
+        if self
+            .viewer
+            .highlights
+            .add_gloss(page, rects, anchor_top, word.clone(), phonetic, summary)
+            .is_some()
+        {
+            if had_rail != self.has_gloss_rail() {
+                self.refit();
+                self.ensure_visible_pages();
+            }
+            match self.persist_highlights() {
+                Ok(()) => self.set_status(format!("已钉住页边笺注「{word}」"), cx),
+                Err(error) => self.set_status(format!("笺注保存失败: {error}"), cx),
+            }
+            cx.notify();
+        }
+    }
+
+    /// 点击已钉住的紧凑笺注卡（或正文下划线词条）：在原锚点位置展开为完整查词卡。
+    pub(crate) fn open_pinned_gloss(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(gloss) = self
+            .viewer
+            .highlights
+            .glosses
+            .iter()
+            .find(|g| g.id == id)
+            .cloned()
+        else {
+            return;
+        };
+
+        self.dictionary
+            .set_anchor(gloss.page, gloss.rects, gloss.anchor_top);
+        self.dict_input
+            .update(cx, |input, cx| input.set_value(gloss.word.clone(), cx));
+        self.lookup_word(gloss.word, cx);
     }
 
     /// 写 sidecar，不弹提示。
@@ -343,7 +400,7 @@ impl super::AppState {
 
     pub(crate) fn save_highlights(&mut self, cx: &mut Context<Self>) {
         if self.viewer.highlights.is_empty() {
-            self.set_status("还没有高亮", cx);
+            self.set_status("还没有高亮或页边笺注", cx);
             cx.notify();
             return;
         }
@@ -357,9 +414,9 @@ impl super::AppState {
                     .map(|doc| sidecar_path(&doc.path))
                     .map(|path| path.display().to_string())
                     .unwrap_or_default();
-                self.set_status(format!("高亮已保存到 {path}"), cx);
+                self.set_status(format!("批注与页边笺注已保存到 {path}"), cx);
             }
-            Err(error) => self.set_status(format!("保存高亮失败: {error}"), cx),
+            Err(error) => self.set_status(format!("保存批注失败: {error}"), cx),
         }
         cx.notify();
     }
@@ -402,7 +459,6 @@ impl super::AppState {
         self.search_request_id = self.search_request_id.wrapping_add(1);
 
         if query.trim().is_empty() {
-            // 纯空白与空串等价：匹配时空白会被全部去掉，没必要扫全文。
             self.viewer.search.clear_results();
             cx.notify();
             return;
@@ -429,7 +485,6 @@ impl super::AppState {
             return;
         }
         self.viewer.search.set_doc_hits(pages, total);
-        // 从当前阅读位置往前找：第一次 Enter 跳到本页或之后的第一处命中。
         self.viewer.search.rewind_to(self.viewer.current_page);
         log::debug!(
             "full-text search for {:?}: {} hits on {} pages",
@@ -449,7 +504,6 @@ impl super::AppState {
     }
 
     pub(super) fn next_match(&mut self, forward: bool, cx: &mut Context<Self>) {
-        // 全文结果优先：能跨页跳。
         if let Some((page, _local)) = self.viewer.search.next_doc(forward) {
             if page != self.viewer.current_page {
                 self.set_page(page, cx);
@@ -472,7 +526,7 @@ impl super::AppState {
         cx.notify();
     }
 
-    // ---------- 词典资源 ----------
+    // ---------- 词典资源与页边笺注交互 ----------
 
     /// 输入变化后防抖请求前缀建议；每次输入都会推进代次号，过期结果直接丢弃。
     pub(super) fn request_suggestions(&mut self, raw: String, cx: &mut Context<Self>) {
@@ -480,7 +534,7 @@ impl super::AppState {
         self.dictionary.suggest_request = self.dictionary.suggest_request.wrapping_add(1);
         let request = self.dictionary.suggest_request;
         self.dictionary.suggestions.clear();
-        self.sync_dictionary_window(cx);
+        cx.notify();
 
         if term.is_empty() || !matches!(self.dictionary.load_state, DictLoadState::Ready { .. }) {
             return;
@@ -495,12 +549,97 @@ impl super::AppState {
                 let _ = this.dict.commands.send(DictCommand::Prefix {
                     request,
                     term,
-                    // 每本多取一些，聚合去重后仍能凑满 8 条。
                     limit: MAX_SUGGESTIONS * 3,
                 });
             });
         })
         .detach();
+    }
+
+    /// 在查词输入框按 Enter 或点「查」按钮提交查询。
+    pub(crate) fn submit_dict_query(&mut self, cx: &mut Context<Self>) {
+        let term = self.dict_input.read(cx).value().trim().to_string();
+        if term.is_empty() {
+            return;
+        }
+        self.pending_focus = Some(FocusTarget::Root);
+        self.lookup_word(term, cx);
+    }
+
+    /// 点击建议词或历史词：回填输入框并立即查词。
+    pub(crate) fn query_dict_term(&mut self, term: String, cx: &mut Context<Self>) {
+        self.dict_input
+            .update(cx, |input, cx| input.set_value(term.clone(), cx));
+        self.pending_focus = Some(FocusTarget::Root);
+        self.lookup_word(term, cx);
+    }
+
+    /// 点击释义内 `entry://` 链接：把当前词压入返回栈，保持当前页锚点不变并跳转查词。
+    pub(crate) fn lookup_word_from_link(&mut self, term: String, cx: &mut Context<Self>) {
+        let prev = self.dictionary.word.trim().to_string();
+        let next = normalize_term(&term);
+        if !prev.is_empty() && !prev.eq_ignore_ascii_case(&next) {
+            self.dictionary.back_stack.push(prev);
+        }
+        self.dict_input
+            .update(cx, |input, cx| input.set_value(next.clone(), cx));
+        self.lookup_word(next, cx);
+    }
+
+    /// 从 `entry://` 跨词条跳转后点「‹ 返回」回到上一个词条。
+    pub(crate) fn navigate_dict_back(&mut self, cx: &mut Context<Self>) {
+        let Some(prev) = self.dictionary.back_stack.pop() else {
+            return;
+        };
+        self.dict_input
+            .update(cx, |input, cx| input.set_value(prev.clone(), cx));
+        self.lookup_word(prev, cx);
+    }
+
+    /// 工具栏词典按钮或 `Ctrl+Shift+D`：在当前页开启或收起页边查词卡。
+    pub(crate) fn toggle_dictionary_window(&mut self, cx: &mut Context<Self>) {
+        if self.dictionary.open {
+            self.close_dictionary(cx);
+            return;
+        }
+
+        if !self.settings.current.has_enabled_dictionary() {
+            self.settings_open = true;
+            self.set_status("请先在设置中添加并启用 MDX 词典", cx);
+            cx.notify();
+            return;
+        }
+
+        let had_rail = self.has_gloss_rail();
+        let page = self.viewer.current_page;
+        // 若还没有锚定在当前页，则把查词卡放在当前页靠上的舒适位置，并聚焦输入框。
+        if self.dictionary.anchor_page != page || self.dictionary.word.is_empty() {
+            self.dictionary.set_anchor(page, Vec::new(), 24.0);
+        }
+        self.dictionary.open = true;
+        if had_rail != self.has_gloss_rail() {
+            self.refit();
+            self.ensure_visible_pages();
+        }
+        self.pending_focus = Some(FocusTarget::Dictionary);
+        cx.notify();
+    }
+
+    /// 收起当前激活态页边查词卡（已钉住的紧凑笺注卡继续保留在页边）。
+    pub(crate) fn close_dictionary(&mut self, cx: &mut Context<Self>) {
+        if !self.dictionary.open {
+            return;
+        }
+        let had_rail = self.has_gloss_rail();
+        self.dictionary.open = false;
+        self.dictionary.suggestions.clear();
+        self.dictionary.show_history = false;
+        self.pending_focus = Some(FocusTarget::Root);
+        if had_rail != self.has_gloss_rail() {
+            self.refit();
+            self.ensure_visible_pages();
+        }
+        cx.notify();
     }
 
     pub(super) fn lookup_word(&mut self, term: String, cx: &mut Context<Self>) {
@@ -509,10 +648,12 @@ impl super::AppState {
             return;
         }
 
+        let had_rail = self.has_gloss_rail();
+
         // 回车/点击确认后不再展示建议，并让尚未返回的联想结果失效。
         self.dictionary.suggest_request = self.dictionary.suggest_request.wrapping_add(1);
         self.dictionary.suggestions.clear();
-        self.sync_dictionary_window(cx);
+        self.dictionary.show_history = false;
 
         if !self.settings.current.has_enabled_dictionary() {
             self.settings_open = true;
@@ -523,11 +664,20 @@ impl super::AppState {
 
         self.dict_history.record(&term);
 
+        if self.dict_input.read(cx).value() != term {
+            let value = term.clone();
+            self.dict_input
+                .update(cx, |input, cx| input.set_value(value, cx));
+        }
+
         match self.dictionary.load_state.clone() {
             DictLoadState::Loading => {
                 self.dictionary.pending_term = Some(term);
                 self.dictionary.open = true;
-                self.ensure_dictionary_window(cx);
+                if had_rail != self.has_gloss_rail() {
+                    self.refit();
+                    self.ensure_visible_pages();
+                }
                 self.set_status("词典正在加载…", cx);
                 cx.notify();
                 return;
@@ -541,7 +691,10 @@ impl super::AppState {
             DictLoadState::Failed(message) => {
                 self.dictionary.error = Some(message.clone());
                 self.dictionary.open = true;
-                self.ensure_dictionary_window(cx);
+                if had_rail != self.has_gloss_rail() {
+                    self.refit();
+                    self.ensure_visible_pages();
+                }
                 self.set_status(message, cx);
                 cx.notify();
                 return;
@@ -558,7 +711,11 @@ impl super::AppState {
         self.dictionary.entries.clear();
         self.dictionary.pending_term = None;
         self.dictionary.open = true;
-        self.ensure_dictionary_window(cx);
+
+        if had_rail != self.has_gloss_rail() {
+            self.refit();
+            self.ensure_visible_pages();
+        }
 
         if let Err(error) = self
             .dict
@@ -567,7 +724,6 @@ impl super::AppState {
         {
             self.dictionary.loading = false;
             self.dictionary.error = Some(format!("词典线程不可用: {error}"));
-            self.sync_dictionary_window(cx);
         }
         cx.notify();
     }
@@ -710,13 +866,11 @@ impl super::AppState {
             dictionaries,
         });
         self.dictionary.clear_results();
-        self.sync_dictionary_window(cx);
         cx.notify();
     }
 
-    pub(super) fn clear_dict_history(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn clear_dict_history(&mut self, cx: &mut Context<Self>) {
         self.dict_history.clear();
-        self.sync_dictionary_window(cx);
         self.set_status("已清空查词历史", cx);
         cx.notify();
     }
@@ -729,7 +883,6 @@ impl super::AppState {
         self.dictionary.statuses.clear();
         self.dictionary.clear_results();
         self.dictionary.load_state = DictLoadState::Unconfigured;
-        self.sync_dictionary_window(cx);
         self.set_status("已清除全部词典", cx);
         cx.notify();
     }

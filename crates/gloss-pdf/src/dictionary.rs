@@ -1,18 +1,15 @@
-//! 词典域：窗口的界面状态（当前词、加载状态、查询结果）与词条清洗。
+//! 词典域：页边笺注的界面状态（当前词、页面锚点、加载状态、查询结果）与词条清洗/摘要。
 
 use std::path::PathBuf;
 
 use dict_core::DictEntry;
+use pdf_core::RectPt;
 
-/// 词典窗口发回主窗口的请求：查词，或清空持久化历史。
+/// 词条内超链接或交互发回主状态的请求。
 #[derive(Clone, Debug)]
 pub enum DictRequest {
+    /// 词条内 `entry://` 链接跳转查词（保留当前页面锚点并压入返回栈）。
     Lookup(String),
-    /// 输入框内容变化后请求前缀联想；主窗口负责防抖。
-    Suggest(String),
-    ClearHistory,
-    /// 用户刚把浮窗拖到新位置（全局逻辑像素）：主窗口据此重算跟随锚点。
-    FloatPlaced(crate::window_layout::RectF),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -28,21 +25,6 @@ pub enum DictLoadState {
     Failed(String),
 }
 
-/// 词典窗口需要的最小快照；主窗口状态变化时推送给独立窗口。
-#[derive(Clone, Default)]
-pub struct DictionaryView {
-    pub word: String,
-    /// 最近查过的词，最新的在前；最多 50 条。
-    pub history: Vec<String>,
-    /// 当前输入的前缀建议，最多 8 条。
-    pub suggestions: Vec<String>,
-    pub loading: bool,
-    pub entries: Vec<DictEntry>,
-    pub not_found: bool,
-    pub error: Option<String>,
-    pub load_state: DictLoadState,
-}
-
 /// 一本已配置词典的加载状态。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DictStatus {
@@ -52,7 +34,18 @@ pub struct DictStatus {
 
 #[derive(Default)]
 pub struct DictionaryState {
+    /// 当前是否展开活动页边笺注卡。
     pub open: bool,
+    /// 活动笺注卡所在的页码（0-based）。
+    pub anchor_page: usize,
+    /// 原文被选词在页面上的 PDF 坐标框（pt，原点左下角）。
+    pub anchor_rects: Vec<RectPt>,
+    /// 活动笺注卡距离该页顶部的纵向偏移（PDF pt，向下为正）。
+    pub anchor_top: f32,
+    /// 词条内点击 `entry://` 链接跳转时的历史词头栈，用于一键返回原词。
+    pub back_stack: Vec<String>,
+    /// 是否展开「最近查词」列表（默认收起以保持页边卡片紧凑）。
+    pub show_history: bool,
     pub word: String,
     pub loading: bool,
     pub entries: Vec<DictEntry>,
@@ -73,27 +66,24 @@ pub struct DictionaryState {
     pub pending_term: Option<String>,
 }
 
-impl From<&DictionaryState> for DictionaryView {
-    fn from(state: &DictionaryState) -> Self {
-        Self {
-            word: state.word.clone(),
-            history: Vec::new(),
-            suggestions: Vec::new(),
-            loading: state.loading,
-            entries: state.entries.clone(),
-            not_found: state.not_found,
-            error: state.error.clone(),
-            load_state: state.load_state.clone(),
-        }
-    }
-}
-
 impl DictionaryState {
     pub fn status_for(&self, path: &std::path::Path) -> Option<&DictLoadState> {
         self.statuses
             .iter()
             .find(|status| status.path == path)
             .map(|status| &status.state)
+    }
+
+    /// 设置活动笺注卡在文档中的页码与纵向锚点。
+    pub fn set_anchor(&mut self, page: usize, rects: Vec<RectPt>, anchor_top: f32) {
+        self.anchor_page = page;
+        self.anchor_rects = rects;
+        self.anchor_top = if anchor_top.is_finite() && anchor_top >= 0.0 {
+            anchor_top
+        } else {
+            0.0
+        };
+        self.back_stack.clear();
     }
 
     /// 清空一次查询的结果，保留词典加载状态。
@@ -107,7 +97,82 @@ impl DictionaryState {
         self.not_found = false;
         self.error = None;
         self.pending_term = None;
+        self.anchor_rects.clear();
+        self.back_stack.clear();
+        self.show_history = false;
     }
+}
+
+/// 从查询结果中提取音标与精简释义摘要（供钉住的页边笺注常驻展示）。
+pub(crate) fn summarize_entries(entries: &[DictEntry], word: &str) -> (Option<String>, String) {
+    let phonetic = entries
+        .iter()
+        .find_map(|entry| entry.phonetic.as_ref())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+
+    let headword = word.trim();
+    let mut lines = Vec::new();
+    let mut total_chars = 0usize;
+
+    for entry in entries {
+        for block in &entry.blocks {
+            for raw_line in block.text().lines() {
+                let cleaned = raw_line.split_whitespace().collect::<Vec<_>>().join(" ");
+                let cleaned = cleaned.trim();
+                if cleaned.is_empty() {
+                    continue;
+                }
+                // 跳过与词头或音标完全重复的首行。
+                if cleaned.eq_ignore_ascii_case(headword) {
+                    continue;
+                }
+                if phonetic.as_deref().is_some_and(|p| cleaned == p) {
+                    continue;
+                }
+                let cleaned = if let Some(rest) = cleaned.strip_prefix(headword) {
+                    let rest = rest.trim_start_matches(|c: char| {
+                        c.is_whitespace() || matches!(c, '·' | ':' | '：' | '-' | '—')
+                    });
+                    if rest.is_empty() {
+                        continue;
+                    }
+                    rest.to_string()
+                } else {
+                    cleaned.to_string()
+                };
+
+                if lines.iter().any(|existing: &String| existing == &cleaned) {
+                    continue;
+                }
+
+                total_chars += cleaned.chars().count();
+                lines.push(cleaned);
+                if lines.len() >= 3 || total_chars >= 110 {
+                    break;
+                }
+            }
+            if lines.len() >= 3 || total_chars >= 110 {
+                break;
+            }
+        }
+        if !lines.is_empty() {
+            break;
+        }
+    }
+
+    let joined = lines.join("\n");
+    let summary = if joined.is_empty() {
+        "（已加笺）".to_string()
+    } else if joined.chars().count() > 120 {
+        let mut truncated: String = joined.chars().take(120).collect();
+        truncated.push('…');
+        truncated
+    } else {
+        joined
+    };
+
+    (phonetic, summary)
 }
 
 /// 查词前清洗：取第一行、去掉首尾标点与空白、限制长度。
@@ -162,6 +227,18 @@ fn is_edge_punctuation(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dict_core::{Block, BlockKind, BlockStyle, Paragraph, Span, SpanStyle, TextSpan};
+
+    fn make_paragraph(text: &str) -> Block {
+        Block::Paragraph(Paragraph {
+            kind: BlockKind::Paragraph,
+            style: BlockStyle::default(),
+            spans: vec![Span::Text(TextSpan {
+                text: text.to_string(),
+                style: SpanStyle::default(),
+            })],
+        })
+    }
 
     #[test]
     fn normalize_term_trims_punctuation_and_takes_first_line() {
@@ -174,5 +251,23 @@ mod tests {
     fn normalize_term_caps_length() {
         let term = normalize_term(&"a".repeat(100));
         assert_eq!(term.chars().count(), 64);
+    }
+
+    #[test]
+    fn summarize_entries_extracts_phonetic_and_skips_duplicate_headword() {
+        let entry = DictEntry {
+            headword: "gloss".into(),
+            phonetic: Some("/ɡlɒs/".into()),
+            blocks: vec![
+                make_paragraph("gloss"),
+                make_paragraph("/ɡlɒs/"),
+                make_paragraph("n. 页边批注；训诂"),
+                make_paragraph("v. 给…加注释"),
+            ],
+            source: Some("Oxford".into()),
+        };
+        let (phonetic, summary) = summarize_entries(&[entry], "gloss");
+        assert_eq!(phonetic.as_deref(), Some("/ɡlɒs/"));
+        assert_eq!(summary, "n. 页边批注；训诂\nv. 给…加注释");
     }
 }
