@@ -8,7 +8,7 @@
 //!
 //! let (tx, _rx) = mpsc::unbounded();
 //! let engine = PdfEngine::spawn(tx);
-//! engine.commands.send(Command::Open("book.pdf".into())).ok();
+//! engine.send(Command::Open("book.pdf".into())).ok();
 //! ```
 
 mod engine;
@@ -16,7 +16,7 @@ mod metadata;
 mod model;
 pub mod text_match;
 
-pub use engine::{Command, Event, PdfEngine};
+pub use engine::{Command, Event, PdfEngine, TileId, Visibility};
 pub use model::{
     CharBox, DocumentMetadata, LinkBox, LinkTarget, OutlineItem, PageHits, PageSize, RectPt,
 };

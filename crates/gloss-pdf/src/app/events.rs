@@ -37,12 +37,26 @@ impl super::AppState {
                 height,
                 bgra,
             } => self.on_tile_rendered(page, request, origin_x, origin_y, width, height, bgra, cx),
+            Event::TileSkipped {
+                page,
+                request,
+                origin_x,
+                origin_y,
+            } => {
+                // 只是撤回一条还没回来的请求，画面没变，不必重绘。
+                self.on_tile_skipped(page, origin_x, origin_y, request);
+                return;
+            }
             Event::PageElements {
                 page,
                 request,
                 chars,
                 links,
             } => self.on_page_elements(page, request, chars, links, cx),
+            Event::ElementsSkipped { page, request } => {
+                self.on_elements_skipped(page, request);
+                return;
+            }
             Event::SearchResults {
                 request,
                 query,

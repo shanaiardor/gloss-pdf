@@ -25,7 +25,10 @@ pub const MAX_CACHED_PAGES: usize = 12;
 pub const DEFAULT_CACHE_BUDGET: usize = 256 * 1024 * 1024;
 
 /// 一个瓦片在缓存里的唯一标识：(页号, 整页像素坐标原点)。
-pub type TileKey = (usize, i32, i32);
+///
+/// 与引擎的 [`pdf_core::TileId`] 是同一个类型，每帧的可视快照直接用它发布，
+/// 不用做任何换算。
+pub type TileKey = pdf_core::TileId;
 
 pub struct Document {
     pub path: PathBuf,

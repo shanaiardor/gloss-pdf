@@ -2,9 +2,21 @@
 //!
 //! PDFium 不是线程安全的，而且 `PdfDocument` 的生命周期绑在 `Pdfium` 上，
 //! 所以这里把 `Pdfium` 泄漏成 `'static`，文档只存在于工作线程内部。
+//!
+//! 只有一条命令队列，但工作线程按优先级取活：位图和「打开文档」拿到就做，
+//! 文字/链接提取、全文搜索这类慢任务排进本地待办，等位图安静下来才开工——
+//! 读者在翻页时，时间应该花在让当前页出图上。
+//!
+//! 积压的请求也不一定还值得做：快速翻页时槽里大半瓦片已经滚出视口，渲完只会
+//! 被 UI 丢掉。UI 每帧发布一份 [`Visibility`] 快照，工作线程动手之前先查一下，
+//! 不在快照里的直接跳过并回一条 [`Event::TileSkipped`] / [`Event::ElementsSkipped`]，
+//! 让 UI 把对应的「在跑」标记清掉，滚回来时能重新排队。
 
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures::channel::mpsc::UnboundedSender;
@@ -14,6 +26,61 @@ use crate::model::{
     CharBox, DocumentMetadata, LinkBox, LinkTarget, OutlineItem, PageHits, PageSize, RectPt,
 };
 use crate::text_match::count_matches;
+
+/// 一个瓦片在整个文档像素坐标系里的唯一标识：(页号, 整页像素坐标原点)。
+///
+/// 和调用方切瓦片用的键是同一个东西（见 `gloss_pdf::viewer::TileKey`），
+/// 所以发布快照时不用做任何换算。
+pub type TileId = (usize, i32, i32);
+
+/// UI 线程每帧发布、工作线程只读的「现在真正需要什么」。
+///
+/// 快速翻页时请求槽里积压的大多是已经滚出视口的东西，渲完/提取完也只会被
+/// UI 丢掉；有这份快照，工作线程在动手之前就能把它们整批作废，省下的时间
+/// 正好留给屏幕上的那一页。
+#[derive(Clone, Default)]
+pub struct Visibility {
+    inner: Arc<Mutex<Snapshot>>,
+}
+
+#[derive(Default)]
+struct Snapshot {
+    tiles: HashSet<TileId>,
+    /// 允许提取文字/链接的页：可视范围再往外扩 `PREFETCH_PAGES` 页，和
+    /// `ensure_visible_pages` 实际发请求的页完全一致。
+    pages: HashSet<usize>,
+}
+
+impl Visibility {
+    /// 用这一帧的可视范围替换上一帧的快照。
+    pub fn publish(
+        &self,
+        tiles: impl IntoIterator<Item = TileId>,
+        pages: impl IntoIterator<Item = usize>,
+    ) {
+        let mut snapshot = self.lock();
+        snapshot.tiles.clear();
+        snapshot.pages.clear();
+        snapshot.tiles.extend(tiles);
+        snapshot.pages.extend(pages);
+    }
+
+    fn wants_tile(&self, page: usize, origin_x: i32, origin_y: i32) -> bool {
+        self.lock().tiles.contains(&(page, origin_x, origin_y))
+    }
+
+    fn wants_page(&self, page: usize) -> bool {
+        self.lock().pages.contains(&page)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Snapshot> {
+        // 持锁线程 panic 只会留下半帧快照：多做一个不影响正确性，少做的那个会
+        // 收到「作废」回执、下一帧重新排队，所以中毒时直接取回数据。
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
 
 /// 发给 PDF 工作线程的命令。
 pub enum Command {
@@ -59,12 +126,25 @@ pub enum Event {
         /// BGRA 像素，直接对应 GPUI `RenderImage` 的缓冲区约定。
         bgra: Vec<u8>,
     },
+    /// 一条积压的瓦片请求在渲染前就被判定为过期（这一瓦片已经滚出视口），
+    /// 所以没有位图。UI 收到后清掉「在跑」标记即可，画面不用重绘。
+    TileSkipped {
+        page: usize,
+        request: u64,
+        origin_x: i32,
+        origin_y: i32,
+    },
     /// 页面文字与链接覆盖层；坐标一律是整页点坐标，与瓦片无关。
     PageElements {
         page: usize,
         request: u64,
         chars: Vec<CharBox>,
         links: Vec<LinkBox>,
+    },
+    /// 同 [`Event::TileSkipped`]，针对文字/链接提取：这一页已经滚出可视范围。
+    ElementsSkipped {
+        page: usize,
+        request: u64,
     },
     /// 全文搜索结果：只包含有命中的页，`total` 是全文总命中数。
     SearchResults {
@@ -82,63 +162,102 @@ pub enum Event {
     Error(String),
 }
 
-/// 引擎句柄：持有命令通道，worker 在后台线程跑。
+/// 引擎句柄：持有命令通道与可视快照，worker 在后台线程跑。
+#[derive(Clone)]
 pub struct PdfEngine {
     pub commands: Sender<Command>,
+    /// UI 每帧发布的可视范围；工作线程据此把积压的过期请求整批作废。
+    pub visibility: Visibility,
 }
 
 impl PdfEngine {
     pub fn spawn(events: UnboundedSender<Event>) -> Self {
         let (commands, receiver) = mpsc::channel();
+        let visibility = Visibility::default();
+        let worker_visibility = visibility.clone();
         std::thread::Builder::new()
             .name("pdfium-worker".into())
-            .spawn(move || worker_loop(receiver, events))
+            .spawn(move || worker_loop(receiver, worker_visibility, events))
             .expect("failed to spawn pdf worker");
-        Self { commands }
+        Self {
+            commands,
+            visibility,
+        }
+    }
+
+    /// 发送一条命令；引擎线程已经退出时把命令原样退回。
+    pub fn send(&self, command: Command) -> Result<(), mpsc::SendError<Command>> {
+        self.commands.send(command)
     }
 }
 
-fn worker_loop(commands: Receiver<Command>, events: UnboundedSender<Event>) {
-    let mut pdfium: Option<&'static Pdfium> = None;
-    let mut document: Option<PdfDocument<'static>> = None;
-    // 每页的纯文本，全文搜索用；换文档时清空。
-    let mut page_text: Vec<Option<String>> = Vec::new();
-    // 每页的文字/链接覆盖层，与缩放无关；换文档时清空。
-    let mut page_elements: Vec<Option<(Vec<CharBox>, Vec<LinkBox>)>> = Vec::new();
+/// 位图安静多久之后，才允许文字提取/全文搜索这类慢任务开工。
+///
+/// 快速翻页时每一帧都有新瓦片，慢任务就一直往后排；手一停下来，30 ms 之后
+/// 它们立刻轮到，所以不会饿死。
+const SLOW_JOB_SETTLE: Duration = Duration::from_millis(30);
 
-    while let Ok(command) = commands.recv() {
+/// 本地待办：把「位图优先、慢任务等空档」的规则独立出来，便于单测。
+#[derive(Default)]
+struct Backlog {
+    slow: VecDeque<Command>,
+}
+
+impl Backlog {
+    /// 收下一条命令；要立刻执行就把命令还回去。
+    ///
+    /// 换文档时顺带丢掉旧文档排着的慢任务——那些页在新文档里没有意义。
+    fn accept(&mut self, command: Command) -> Option<Command> {
         match command {
-            Command::Open(path) => {
-                if pdfium.is_none() {
-                    match bind_pdfium() {
-                        Ok(instance) => pdfium = Some(instance),
-                        Err(error) => {
-                            let _ = events.unbounded_send(Event::Error(format!(
-                                "加载 PDFium 失败: {error:#}"
-                            )));
-                            continue;
-                        }
-                    }
-                }
-                let instance = pdfium.expect("pdfium bound above");
-                match open_document(instance, &path) {
-                    Ok((opened, pages, outline, metadata)) => {
-                        document = Some(opened);
-                        page_text.clear();
-                        page_elements.clear();
-                        let _ = events.unbounded_send(Event::Opened {
-                            path,
-                            pages,
-                            outline,
-                            metadata,
-                        });
-                    }
-                    Err(error) => {
-                        let _ = events
-                            .unbounded_send(Event::Error(format!("打开 PDF 失败: {error:#}")));
-                    }
-                }
+            Command::RenderTile { .. } => Some(command),
+            Command::Open(_) => {
+                self.slow.clear();
+                Some(command)
             }
+            _ => {
+                self.slow.push_back(command);
+                None
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.slow.is_empty()
+    }
+
+    fn next_slow(&mut self) -> Option<Command> {
+        self.slow.pop_front()
+    }
+}
+
+/// 工作线程的全部私有状态：PDFium 与文档都只活在这里。
+struct Worker {
+    pdfium: Option<&'static Pdfium>,
+    document: Option<PdfDocument<'static>>,
+    /// 每页的纯文本，全文搜索用；换文档时清空。
+    page_text: Vec<Option<String>>,
+    /// 每页的文字/链接覆盖层，与缩放无关；换文档时清空。
+    page_elements: Vec<Option<(Vec<CharBox>, Vec<LinkBox>)>>,
+    /// UI 发布的可视范围。
+    wanted: Visibility,
+    events: UnboundedSender<Event>,
+}
+
+impl Worker {
+    fn new(wanted: Visibility, events: UnboundedSender<Event>) -> Self {
+        Self {
+            pdfium: None,
+            document: None,
+            page_text: Vec::new(),
+            page_elements: Vec::new(),
+            wanted,
+            events,
+        }
+    }
+
+    fn run(&mut self, command: Command) {
+        match command {
+            Command::Open(path) => self.run_open(&path),
             Command::RenderTile {
                 page,
                 scale,
@@ -147,58 +266,174 @@ fn worker_loop(commands: Receiver<Command>, events: UnboundedSender<Event>) {
                 width,
                 height,
                 request,
-            } => {
-                let Some(document) = document.as_ref() else {
-                    continue;
-                };
-                match render_tile(
-                    document, page, scale, origin_x, origin_y, width, height, request,
-                ) {
-                    Ok(event) => {
-                        let _ = events.unbounded_send(event);
-                    }
-                    Err(error) => {
-                        let _ =
-                            events.unbounded_send(Event::Error(format!("渲染页面失败: {error:#}")));
-                    }
+            } => self.run_tile(page, scale, origin_x, origin_y, width, height, request),
+            Command::PageElements { page, request } => self.run_elements(page, request),
+            Command::Search { query, request } => self.run_search(&query, request),
+        }
+    }
+
+    fn report(&self, message: String) {
+        let _ = self.events.unbounded_send(Event::Error(message));
+    }
+
+    fn run_open(&mut self, path: &Path) {
+        if self.pdfium.is_none() {
+            match bind_pdfium() {
+                Ok(instance) => self.pdfium = Some(instance),
+                Err(error) => {
+                    self.report(format!("加载 PDFium 失败: {error:#}"));
+                    return;
                 }
             }
-            Command::PageElements { page, request } => {
-                let Some(document) = document.as_ref() else {
-                    continue;
-                };
-                if page_elements.len() <= page {
-                    page_elements.resize_with(page + 1, || None);
-                }
-                let elements = match &page_elements[page] {
-                    Some(elements) => elements.clone(),
-                    None => match extract_elements(document, page) {
-                        Ok(elements) => {
-                            page_elements[page] = Some(elements.clone());
-                            elements
-                        }
-                        Err(error) => {
-                            let _ = events.unbounded_send(Event::Error(format!(
-                                "提取页面内容失败: {error:#}"
-                            )));
-                            continue;
-                        }
-                    },
-                };
-                let _ = events.unbounded_send(Event::PageElements {
-                    page,
-                    request,
-                    chars: elements.0,
-                    links: elements.1,
+        }
+        let instance = self.pdfium.expect("pdfium bound above");
+        match open_document(instance, path) {
+            Ok((opened, pages, outline, metadata)) => {
+                self.document = Some(opened);
+                self.page_text.clear();
+                self.page_elements.clear();
+                let _ = self.events.unbounded_send(Event::Opened {
+                    path: path.to_path_buf(),
+                    pages,
+                    outline,
+                    metadata,
                 });
             }
-            Command::Search { query, request } => {
-                let Some(document) = document.as_ref() else {
-                    continue;
-                };
-                let result = search_document(document, &mut page_text, &query, request, &events);
-                let _ = events.unbounded_send(result);
+            Err(error) => self.report(format!("打开 PDF 失败: {error:#}")),
+        }
+    }
+
+    /// 渲染一个瓦片；已经不在可视快照里的请求直接作废。
+    fn run_tile(
+        &mut self,
+        page: usize,
+        scale: f32,
+        origin_x: i32,
+        origin_y: i32,
+        width: u32,
+        height: u32,
+        request: u64,
+    ) {
+        if !self.wanted.wants_tile(page, origin_x, origin_y) {
+            log::debug!("丢弃过期瓦片 p{page} ({origin_x},{origin_y})");
+            let _ = self.events.unbounded_send(Event::TileSkipped {
+                page,
+                request,
+                origin_x,
+                origin_y,
+            });
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        match render_tile(
+            document, page, scale, origin_x, origin_y, width, height, request,
+        ) {
+            Ok(event) => {
+                let _ = self.events.unbounded_send(event);
             }
+            Err(error) => self.report(format!("渲染页面失败: {error:#}")),
+        }
+    }
+
+    /// 提取一页的文字/链接；页已经滚出可视范围就作废，别让过期提取拖住当前页。
+    fn run_elements(&mut self, page: usize, request: u64) {
+        if !self.wanted.wants_page(page) {
+            log::debug!("丢弃过期覆盖层 p{page}");
+            let _ = self
+                .events
+                .unbounded_send(Event::ElementsSkipped { page, request });
+            return;
+        }
+        let elements = match self.page_elements.get(page).cloned().flatten() {
+            Some(elements) => elements,
+            None => {
+                let Some(document) = self.document.as_ref() else {
+                    return;
+                };
+                match extract_elements(document, page) {
+                    Ok(elements) => {
+                        if self.page_elements.len() <= page {
+                            self.page_elements.resize_with(page + 1, || None);
+                        }
+                        self.page_elements[page] = Some(elements.clone());
+                        elements
+                    }
+                    Err(error) => {
+                        self.report(format!("提取页面内容失败: {error:#}"));
+                        return;
+                    }
+                }
+            }
+        };
+        let _ = self.events.unbounded_send(Event::PageElements {
+            page,
+            request,
+            chars: elements.0,
+            links: elements.1,
+        });
+    }
+
+    fn run_search(&mut self, query: &str, request: u64) {
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let event = search_document(document, &mut self.page_text, query, request, &self.events);
+        let _ = self.events.unbounded_send(event);
+    }
+}
+
+fn worker_loop(
+    commands: Receiver<Command>,
+    visibility: Visibility,
+    events: UnboundedSender<Event>,
+) {
+    let mut worker = Worker::new(visibility, events);
+    let mut backlog = Backlog::default();
+
+    loop {
+        // 先把槽里排着的一口气收下来：位图和「打开文档」当场做，慢任务进待办。
+        // 待办只在下面「安静窗口」那一步被取走，所以排着的位图永远先于慢任务。
+        loop {
+            match commands.try_recv() {
+                Ok(command) => {
+                    if let Some(command) = backlog.accept(command) {
+                        worker.run(command);
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+
+        if backlog.is_empty() {
+            // 没有慢任务：阻塞等下一条命令，空闲时不空转。
+            match commands.recv() {
+                Ok(command) => {
+                    if let Some(command) = backlog.accept(command) {
+                        worker.run(command);
+                    }
+                }
+                Err(_) => return,
+            }
+            continue;
+        }
+
+        // 有慢任务：只等一个短窗口。位图还在来就继续渲位图（读者还在翻页），
+        // 安静够久才开工，而且一条一条来——每条之前都会重新看一眼有没有新位图。
+        match commands.recv_timeout(SLOW_JOB_SETTLE) {
+            Ok(command) => {
+                if let Some(command) = backlog.accept(command) {
+                    worker.run(command);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if let Some(command) = backlog.next_slow() {
+                    worker.run(command);
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
         }
     }
 }
@@ -520,7 +755,157 @@ fn rect_from_pdfium(rect: PdfRect) -> RectPt {
 
 #[cfg(test)]
 mod tests {
-    use super::count_matches;
+    use futures::channel::mpsc::{TryRecvError, UnboundedReceiver};
+
+    use super::*;
+
+    fn tile_request(page: usize, origin_x: i32, origin_y: i32) -> Command {
+        Command::RenderTile {
+            page,
+            scale: 1.0,
+            origin_x,
+            origin_y,
+            width: 512,
+            height: 512,
+            request: page as u64,
+        }
+    }
+
+    fn element_request(page: usize) -> Command {
+        Command::PageElements {
+            page,
+            request: page as u64,
+        }
+    }
+
+    fn search_request() -> Command {
+        Command::Search {
+            query: "笺释".into(),
+            request: 9,
+        }
+    }
+
+    /// 等一条引擎事件。事件在毫秒级回来；2 秒还没到就是调度坏了，直接失败而不是挂住测试。
+    fn next_event(rx: &mut UnboundedReceiver<Event>) -> Event {
+        for _ in 0..2000 {
+            match rx.try_recv() {
+                Ok(event) => return event,
+                Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(1)),
+                Err(TryRecvError::Closed) => break,
+            }
+        }
+        panic!("等待引擎事件超时");
+    }
+
+    #[test]
+    fn visibility_snapshot_replaces_the_previous_frame() {
+        let visibility = Visibility::default();
+        assert!(!visibility.wants_tile(0, 0, 0), "还没发布时什么都不需要");
+        assert!(!visibility.wants_page(0));
+
+        visibility.publish([(0, 0, 0), (0, 512, 0)], [0, 1]);
+        assert!(visibility.wants_tile(0, 0, 0));
+        assert!(visibility.wants_tile(0, 512, 0));
+        assert!(!visibility.wants_tile(0, 1024, 0), "没发布的瓦片不要");
+        assert!(visibility.wants_page(1));
+
+        // 翻到下一页：上一帧的瓦片整批作废，页范围也跟着换。
+        visibility.publish([(1, 0, 0)], [1]);
+        assert!(!visibility.wants_tile(0, 0, 0));
+        assert!(visibility.wants_tile(1, 0, 0));
+        assert!(!visibility.wants_page(0));
+        assert!(visibility.wants_page(1));
+    }
+
+    #[test]
+    fn empty_snapshot_wants_nothing() {
+        let visibility = Visibility::default();
+        visibility.publish([], []);
+        assert!(!visibility.wants_tile(0, 0, 0));
+        assert!(!visibility.wants_page(0));
+    }
+
+    #[test]
+    fn tiles_and_opens_run_immediately() {
+        let mut backlog = Backlog::default();
+        assert!(backlog.accept(tile_request(0, 0, 0)).is_some());
+        assert!(backlog.is_empty(), "位图不该进待办");
+        assert!(backlog.accept(Command::Open(PathBuf::from("a.pdf"))).is_some());
+    }
+
+    #[test]
+    fn slow_jobs_wait_for_a_gap_and_keep_their_order() {
+        let mut backlog = Backlog::default();
+        assert!(backlog.accept(element_request(0)).is_none(), "慢任务该先进待办");
+        assert!(backlog.accept(search_request()).is_none());
+        assert!(!backlog.is_empty());
+
+        // 先进先出：元素提取排在搜索前面，和 UI 发出请求的顺序一致。
+        assert!(matches!(
+            backlog.next_slow(),
+            Some(Command::PageElements { page: 0, .. })
+        ));
+        assert!(matches!(backlog.next_slow(), Some(Command::Search { .. })));
+        assert!(backlog.next_slow().is_none());
+    }
+
+    #[test]
+    fn opening_a_document_drops_stale_slow_jobs() {
+        let mut backlog = Backlog::default();
+        backlog.accept(element_request(3));
+        backlog.accept(search_request());
+
+        assert!(backlog.accept(Command::Open(PathBuf::from("b.pdf"))).is_some());
+        assert!(backlog.is_empty(), "换文档后旧文档的慢任务都该作废");
+    }
+
+    #[test]
+    fn tiles_outside_the_snapshot_come_back_as_skipped() {
+        let (events, mut rx) = futures::channel::mpsc::unbounded();
+        let engine = PdfEngine::spawn(events);
+        engine.visibility.publish([(0, 0, 0)], [0]);
+
+        // 还在视口里的瓦片：没有文档可渲，但也不该被当成过期请求回执。
+        engine.send(tile_request(0, 0, 0)).unwrap();
+        // 已经滚出视口（快照里没有它）：立即作废。
+        engine.send(tile_request(0, 512, 0)).unwrap();
+
+        let event = next_event(&mut rx);
+        assert!(
+            matches!(
+                event,
+                Event::TileSkipped {
+                    page: 0,
+                    origin_x: 512,
+                    origin_y: 0,
+                    ..
+                }
+            ),
+            "只有快照外的瓦片该被作废"
+        );
+    }
+
+    #[test]
+    fn elements_outside_the_visible_pages_come_back_as_skipped() {
+        let (events, mut rx) = futures::channel::mpsc::unbounded();
+        let engine = PdfEngine::spawn(events);
+        engine.visibility.publish([], [2]);
+
+        engine.send(Command::PageElements {
+            page: 5,
+            request: 11,
+        })
+        .unwrap();
+
+        let event = next_event(&mut rx);
+        assert!(matches!(
+            event,
+            Event::ElementsSkipped {
+                page: 5,
+                request: 11
+            }
+        ));
+    }
 
     #[test]
     fn counts_every_non_overlapping_hit() {

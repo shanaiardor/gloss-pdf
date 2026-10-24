@@ -27,7 +27,7 @@ use futures::StreamExt;
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, Focusable, Render, Size, Window, div, prelude::*, px,
 };
-use pdf_core::{Command, PageSize, PdfEngine};
+use pdf_core::{PageSize, PdfEngine};
 
 use crate::chrome_visibility::ChromeVisibility;
 use crate::dict_history::DictHistory;
@@ -55,7 +55,7 @@ pub(crate) enum FocusTarget {
 pub struct AppState {
     pub(crate) theme: Theme,
     pub(crate) focus_handle: FocusHandle,
-    pub(crate) engine: std::sync::mpsc::Sender<Command>,
+    pub(crate) engine: PdfEngine,
     pub(crate) viewer: Viewer,
     pub(crate) home: HomeState,
     pub(crate) search_input: Entity<TextInput>,
@@ -121,7 +121,7 @@ impl AppState {
     /// 两处各读一遍磁盘会不一致，也会白读一次。
     pub fn with_settings(cx: &mut Context<Self>, settings: SettingsStore) -> Self {
         let (event_tx, mut event_rx) = futures::channel::mpsc::unbounded();
-        let engine = PdfEngine::spawn(event_tx).commands;
+        let engine = PdfEngine::spawn(event_tx);
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = event_rx.next().await {

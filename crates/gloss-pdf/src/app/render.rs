@@ -12,8 +12,7 @@ use gpui::{Context, Point, RenderImage, px};
 use pdf_core::{Command, LinkBox};
 
 use crate::layout::{DocumentLayout, FitArea, FitMode, PREFETCH_PAGES};
-use crate::tiles::TileGrid;
-use crate::viewer::TileKey;
+use crate::tiles::{TileGrid, TileRect};
 
 /// PageDown/PageUp 一次滚过视口高度的比例，留一点重叠方便接续阅读。
 const PAGE_SCROLL_OVERLAP: f32 = 0.9;
@@ -129,23 +128,22 @@ impl super::AppState {
         self.request_id = request;
         if let Err(error) = self.engine.send(Command::PageElements { page, request }) {
             log::warn!("页面元素请求发送失败: {error}");
+            // 引擎线程已经不在了：撤回标记，别让这一页永远等不到覆盖层。
+            self.viewer.take_element_request(page, request);
         }
     }
 
-    /// 只请求与视口相交的瓦片；同一瓦片同一缩放在跑或已缓存时跳过。
-    fn ensure_page_tiles(
-        &mut self,
-        page: usize,
-        layout: &DocumentLayout,
-        visible: &mut HashSet<TileKey>,
-    ) {
+    /// 这一页与视口相交、需要位图的瓦片；页面整个在视口外时为空。
+    ///
+    /// 纯计算：`ensure_visible_pages` 要先拿到整帧的瓦片集合发布给引擎，再按同一份
+    /// 集合发请求；顺序反过来会让同一帧刚发出的请求在引擎那边看到的还是上一帧的快照。
+    fn visible_tiles(&self, page: usize, layout: &DocumentLayout, scale: f32) -> Vec<TileRect> {
         let Some(geometry) = layout.page_box(page) else {
-            return;
+            return Vec::new();
         };
         let Some(page_size) = self.viewer.page_size_at(page) else {
-            return;
+            return Vec::new();
         };
-        let scale = self.render_scale();
         let grid = TileGrid::new(page_size, scale);
 
         // 视口在页面局部坐标里的可见矩形（逻辑像素）。
@@ -159,29 +157,68 @@ impl super::AppState {
         let top = (view_top - geometry.top).clamp(0.0, geometry.height);
         let bottom = (view_bottom - geometry.top).clamp(0.0, geometry.height);
         if right <= left || bottom <= top {
-            return;
+            return Vec::new();
         }
 
         // 逻辑像素 → 整页像素。二者之比就是 DPI 缩放因子。
         let to_pixels_x = grid.full_width as f32 / geometry.width.max(1.0);
         let to_pixels_y = grid.full_height as f32 / geometry.height.max(1.0);
-        let tiles = grid.tiles_for_rect(
+        grid.tiles_for_rect(
             left * to_pixels_x,
             top * to_pixels_y,
             right * to_pixels_x,
             bottom * to_pixels_y,
-        );
+        )
+    }
 
-        for tile in tiles {
-            visible.insert((page, tile.origin_x, tile.origin_y));
-            let request = self.request_id + 1;
-            if !self
-                .viewer
-                .begin_tile_request(page, tile.origin_x, tile.origin_y, request, scale)
-            {
-                continue;
+    /// 按可视范围补渲染，并淘汰离得远的页面位图。
+    ///
+    /// 每一帧都会调用，靠 `Viewer` 的请求去重，所以不会重复排队。
+    ///
+    /// 一帧内的顺序刻意分成三步：算清楚要哪些瓦片 → 发布给引擎 → 再发请求。引擎用
+    /// 这份快照把积压的过期请求整批作废（快速翻页时它们是主要的时间浪费），所以
+    /// 快照必须先于请求离开 UI 线程。
+    pub(super) fn ensure_visible_pages(&mut self) {
+        let Some(layout) = self.doc_layout() else {
+            return;
+        };
+        let range = layout.visible_range(
+            self.scroll_top(),
+            f32::from(self.viewport.height),
+            PREFETCH_PAGES,
+        );
+        let scale = self.render_scale();
+
+        let mut visible = HashSet::new();
+        let mut requests = Vec::new();
+        for page in range.clone() {
+            for tile in self.visible_tiles(page, &layout, scale) {
+                let key = (page, tile.origin_x, tile.origin_y);
+                if !visible.insert(key) {
+                    continue;
+                }
+                let request = self.request_id + 1;
+                if !self.viewer.begin_tile_request(
+                    page,
+                    tile.origin_x,
+                    tile.origin_y,
+                    request,
+                    scale,
+                ) {
+                    continue;
+                }
+                self.request_id = request;
+                requests.push((page, tile, request));
             }
-            self.request_id = request;
+        }
+
+        self.engine.visibility.publish(visible.iter().copied(), range.clone());
+
+        for page in range.clone() {
+            self.ensure_page_elements(page);
+        }
+
+        for (page, tile, request) in requests {
             if let Err(error) = self.engine.send(Command::RenderTile {
                 page,
                 scale,
@@ -192,27 +229,12 @@ impl super::AppState {
                 request,
             }) {
                 log::warn!("瓦片渲染请求发送失败: {error}");
+                // 引擎线程已经不在了：撤回标记，别让这一页永远停在占位上。
+                self.viewer
+                    .take_tile_request(page, tile.origin_x, tile.origin_y, request);
             }
         }
-    }
 
-    /// 按可视范围补渲染，并淘汰离得远的页面位图。
-    ///
-    /// 每一帧都会调用，靠 `Viewer` 的请求去重，所以不会重复排队。
-    pub(super) fn ensure_visible_pages(&mut self) {
-        let Some(layout) = self.doc_layout() else {
-            return;
-        };
-        let range = layout.visible_range(
-            self.scroll_top(),
-            f32::from(self.viewport.height),
-            PREFETCH_PAGES,
-        );
-        let mut visible = HashSet::new();
-        for page in range.clone() {
-            self.ensure_page_elements(page);
-            self.ensure_page_tiles(page, &layout, &mut visible);
-        }
         self.viewer.evict(range, &visible);
     }
 
@@ -294,6 +316,26 @@ impl super::AppState {
         self.viewer.store_elements(page, chars, links);
         self.refresh_matches(page);
         cx.notify();
+    }
+
+    /// 引擎按可视快照丢掉了一条积压的瓦片请求：清掉「在跑」标记。
+    ///
+    /// 不重绘：画面没有变化，只是少了一条还没回来的请求。这一瓦片再滚回视口时
+    /// `begin_tile_request` 会重新排队。
+    pub(super) fn on_tile_skipped(
+        &mut self,
+        page: usize,
+        origin_x: i32,
+        origin_y: i32,
+        request: u64,
+    ) {
+        self.viewer
+            .take_tile_request(page, origin_x, origin_y, request);
+    }
+
+    /// 同上，针对文字/链接提取：这一页已经滚出可视范围，等它回来再提。
+    pub(super) fn on_elements_skipped(&mut self, page: usize, request: u64) {
+        self.viewer.take_element_request(page, request);
     }
 
     /// 跳到某一页：滚到页顶，并立刻安排这一页的渲染。

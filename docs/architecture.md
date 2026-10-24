@@ -48,7 +48,7 @@
 
 | 模块 | 负责 | 不负责 |
 |---|---|---|
-| `pdf-core::engine` | PDFium 生命周期、线程、按 512×512 瓦片渲染成 BGRA、文本/链接/目录提取、全文搜索计数 | 布局、坐标换算、交互 |
+| `pdf-core::engine` | PDFium 生命周期、单 worker 线程、位图优先的调度与可视快照过滤、按 512×512 瓦片渲染成 BGRA、文本/链接/目录提取、全文搜索计数 | 布局、坐标换算、交互 |
 | `pdf-core::metadata` | 读取文件尾 `/ModDate` 等高层 API 读不到的值 | 常规元数据字段（`engine` 用 PDFium API） |
 | `pdf-core::model` | UI 无关的数据类型（含 `DocumentMetadata`） | 任何 GPUI 类型 |
 | `dict-core::engine` | MDX 线程、多词典配置与顺序、聚合查询、`@@@LINK` 跳转、前缀联想、读取同名/拆分 MDD、外置 CSS 和字体 | 渲染、设置读写 |
@@ -112,9 +112,14 @@
 9. 全文搜索：输入变化 → `Command::Search` → worker 逐页提取文本（按页缓存）并统计命中 →
    `Event::SearchResults` 回每页命中数。`Enter` 用全局序号换算出「页 + 页内序号」，
    跨页时先 `set_page`，等 `Event::PageElements` 带回字符数据后再定位页内第 N 个匹配。
-10. 渲染调度每帧用 `DocumentLayout` 求可视页范围，用 `TileGrid` 求与视口相交的瓦片，
-    只为这些瓦片发 `RenderTile`；`Viewer::evict` 在超过 256 MiB 或 12 页时按页距和瓦片到可视区的距离淘汰。
-    指针锚定缩放时用 `page_ratios` 记录指针下的页内比例，缩放后用 `scroll_for_ratios` 还原滚动位置。
+10. 渲染调度每帧用 `DocumentLayout` 求可视页范围，用 `TileGrid` 求与视口相交的瓦片；先把这一帧的
+    瓦片集合和页范围 `publish` 成引擎的 `Visibility` 快照，再发 `RenderTile` / `PageElements`。
+    引擎只有一条命令队列，但 worker 按优先级取活：位图与「打开文档」当场做，文字提取/搜索这类
+    慢任务等位图安静 30 ms 后才开工；动手之前再比一次快照，已经滚出视口的积压请求直接作废并回
+    `TileSkipped` / `ElementsSkipped`，UI 只清掉对应的「在跑」标记。快速翻页因此不会攒出一长串
+    陈旧渲染，当前页的位图始终排在它们前面。`Viewer::evict` 在超过 256 MiB 或 12 页时按页距和
+    瓦片到可视区的距离淘汰。指针锚定缩放时用 `page_ratios` 记录指针下的页内比例，缩放后用
+    `scroll_for_ratios` 还原滚动位置。
 
 约束：
 
@@ -122,6 +127,9 @@
 - **UI 不直接调 PDFium**，只读 Viewer。
 - **坐标换算只在一处**：`AppState::page_origin` / `to_pdf`，PDF pt（左下原点）↔ 屏幕 px（左上原点）。
 - **PDFium 非线程安全**：所有 PDFium 调用都在 worker 线程；UI 只拿结果。
+- **位图优先于一切慢任务**：PDFium 只有一个线程，翻页时的等待时间全花在「渲完旧页」还是「让当前页出图」上。
+  新增的渲染类命令都必须能被 `Visibility` 快照作废（用请求代号 + `TileSkipped` 一类回执清标记），
+  否则快速翻页会重新堆出迟滞。
 - **HTML/CSS 语法解析不自研**：`kuchiki`（html5ever + Servo selectors）负责 HTML 与选择器，`lightningcss` 负责 CSS；`dict-core` 只做层叠、继承和 GPUI 模型转换。
 
 ## 加功能的落点
@@ -155,6 +163,6 @@
   cargo test -p dict-core -- --ignored
   ```
 - `pdf-core` 可加用 `samples/` 下 PDF 的集成测试（需要 `pdfium.dll`）。
-- 当前基线：`gloss-pdf` 128 项通过（另 1 项联网测试忽略）、`dict-core` 50 项通过（另 1 项真实词典测试忽略）、`pdf-core` 15 项通过。
+- 当前基线：`gloss-pdf` 160 项通过（另 2 项忽略）、`dict-core` 65 项通过（另 2 项忽略）、`pdf-core` 23 项通过。
 - GPUI 层目前靠手动验证：`cargo run -p gloss-pdf -- samples/dummy.pdf`。
 - 词典样式支持范围与限制见 [dictionary.md](dictionary.md)。
