@@ -232,6 +232,8 @@ pub struct BlockStyle {
     pub align: Option<Align>,
     pub margin_top: Option<f32>,
     pub margin_bottom: Option<f32>,
+    pub margin_left: Option<f32>,
+    pub margin_right: Option<f32>,
     pub padding: Edges,
     /// 额外的左侧缩进（列表层级用）。
     pub indent: f32,
@@ -241,8 +243,13 @@ pub struct BlockStyle {
     pub border_bottom: Option<Border>,
     pub border_left: Option<Border>,
     pub width: Option<f32>,
+    pub height: Option<f32>,
     /// 列表项前缀，例如 `•` 或 `1.`。
     pub marker: Option<String>,
+    /// 左右浮动；当前只做块级对齐近似，不做文字环绕。
+    pub float: Option<FloatSide>,
+    /// 行内块的垂直对齐。
+    pub vertical_align: Option<AlignSelf>,
     /// flex 子项的伸缩比例；`None` 表示沿用默认。
     pub grow: Option<f32>,
     pub shrink: Option<f32>,
@@ -251,11 +258,25 @@ pub struct BlockStyle {
     pub align_self: Option<AlignSelf>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatSide {
+    Left,
+    Right,
+}
+
 /// 行内内容：文字或图片。
 #[derive(Clone, Debug, PartialEq)]
 pub enum Span {
     Text(TextSpan),
     Image(ImageSpan),
+    /// `display: inline-block`：行内原子盒子，内部可以再有块。
+    Box(InlineBox),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InlineBox {
+    pub style: BlockStyle,
+    pub blocks: Vec<Block>,
 }
 
 impl Span {
@@ -264,6 +285,13 @@ impl Span {
         match self {
             Span::Text(text) => text.text.clone(),
             Span::Image(image) => image.alt.clone(),
+            Span::Box(inline) => inline
+                .blocks
+                .iter()
+                .map(Block::text)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "),
         }
     }
 }

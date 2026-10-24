@@ -22,6 +22,8 @@ const MAX_DEFINITION_CHARS: usize = 60_000;
 const MAX_CSS_FILES: usize = 64;
 /// 预读样式表的总字节上限。
 const MAX_CSS_BYTES: usize = 4 * 1024 * 1024;
+/// `@import` 的最大递归深度。
+const MAX_CSS_DEPTH: usize = 8;
 /// 字体总字节上限。
 const MAX_FONT_BYTES: usize = 32 * 1024 * 1024;
 /// 图片 / 样式表缓存条目上限。
@@ -427,8 +429,31 @@ fn load_dictionary(path: &Path) -> Result<(Dictionary, Option<String>, u64)> {
     let entries = mdx.len();
     let base_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let mdd = open_mdds(path);
-    let (stylesheet, loaded_stylesheets) = load_stylesheet(&mdx, &base_dir, &mdd);
-    let fonts = load_fonts(&stylesheet, &base_dir, &mdd);
+    let (stylesheet, loaded_stylesheets) = load_stylesheet(&mdx, path, &base_dir, &mdd);
+    let mut font_faces = stylesheet.font_faces().to_vec();
+    let mut font_cache = HashMap::new();
+    let mut font_css_bytes = 0usize;
+    for href in discover_css_sources(&base_dir, &mdd) {
+        let Some(css) = load_css_graph(&base_dir, &mdd, &href, &mut font_cache, &mut Vec::new(), 0)
+        else {
+            continue;
+        };
+        font_css_bytes += css.len();
+        if font_css_bytes > MAX_CSS_BYTES {
+            log::warn!("字体扫描的 CSS 预算耗尽");
+            break;
+        }
+        font_faces.extend(Stylesheet::parse(&css).font_faces().iter().cloned());
+    }
+    let mut seen_faces = HashSet::new();
+    font_faces.retain(|face| {
+        seen_faces.insert(format!(
+            "{}|{}",
+            face.family.to_ascii_lowercase(),
+            face.sources.join("|")
+        ))
+    });
+    let fonts = load_fonts(&font_faces, &base_dir, &mdd);
 
     Ok((
         Dictionary {
@@ -508,56 +533,372 @@ fn mdd_order(name: &str, stem: &str) -> Option<u32> {
     Some(rest.parse().unwrap_or(u32::MAX))
 }
 
-/// 词典级样式：`.mdd` 里的 `.css`、外部 CSS 文件和 MDX 头部 `StyleSheet`。
-fn load_stylesheet(mdx: &MdxFile, base_dir: &Path, mdds: &[MddFile]) -> (Stylesheet, Vec<String>) {
+/// 词典级样式：优先加载文档实际引用的 CSS，只有完全没引用时才回退到扫描。
+fn load_stylesheet(
+    mdx: &MdxFile,
+    path: &Path,
+    base_dir: &Path,
+    mdds: &[MddFile],
+) -> (Stylesheet, Vec<String>) {
     let mut stylesheet = Stylesheet::default();
     let mut loaded = Vec::new();
-
-    let mut total = 0;
-    for mdd in mdds {
-        let mut files = Vec::new();
-        for key in mdd.keys().flatten() {
-            let name = key.key();
-            if name.to_ascii_lowercase().ends_with(".css") {
-                files.push((key.ordinal(), name.to_string()));
-                if files.len() >= MAX_CSS_FILES {
-                    break;
-                }
-            }
-        }
-        files.sort_by(|left, right| left.1.cmp(&right.1));
-        for (ordinal, name) in files {
-            let Ok(Some(resource)) = mdd.resource_at(ordinal) else {
-                continue;
-            };
-            if total + resource.bytes().len() > MAX_CSS_BYTES {
-                log::warn!("stylesheet budget exhausted at {name}");
-                break;
-            }
-            total += resource.bytes().len();
-            stylesheet.extend(Stylesheet::parse(&decode_text(resource.bytes())));
-        }
-    }
+    let mut cache = HashMap::new();
+    let mut seen = HashSet::new();
 
     let description = mdx.header().description().unwrap_or_default();
     for href in css_links(description) {
-        let css = read_external_css(base_dir, &href)
-            .or_else(|| lookup_mdd_resource(mdds, &href).map(|bytes| decode_text(&bytes)));
-        if let Some(css) = css {
-            stylesheet.extend(Stylesheet::parse(&css));
-            loaded.push(href);
-        } else {
-            log::warn!("找不到词典样式表 {href}");
+        if !seen.insert(normalize_key(&href)) {
+            continue;
+        }
+        match load_css_graph(base_dir, mdds, &href, &mut cache, &mut Vec::new(), 0) {
+            Some(css) => {
+                if css.len() > MAX_CSS_BYTES {
+                    log::warn!("样式表超过预算，跳过 {href}");
+                    continue;
+                }
+                stylesheet.extend(Stylesheet::parse(&css));
+                loaded.push(normalize_key(&href));
+            }
+            None => log::warn!("找不到词典样式表 {href}"),
         }
     }
 
     for (name, value) in mdx.header().attributes() {
         if name.eq_ignore_ascii_case("stylesheet") && !value.trim().is_empty() {
-            stylesheet.extend(Stylesheet::parse(value));
+            let css = rewrite_css_urls(value, "");
+            stylesheet.extend(Stylesheet::parse(&css));
         }
     }
 
+    if stylesheet.is_empty()
+        && let Some((href, css)) = fallback_stylesheet(path, base_dir, mdds, &mut cache)
+    {
+        stylesheet.extend(Stylesheet::parse(&css));
+        loaded.push(normalize_key(&href));
+    }
+
+    let stats = stylesheet.stats();
+    log::info!(
+        "stylesheet: {} rules ({} source), at-rules {:?}, unsupported declarations {}, unsupported selectors {}",
+        stats.compiled_rules,
+        stats.style_rules,
+        stats.at_rules,
+        stats.unsupported_declarations_total(),
+        stats.unsupported_selectors
+    );
+    if !stats.unsupported_declarations.is_empty() {
+        log::debug!(
+            "unsupported declarations: {:?}",
+            stats.unsupported_declarations
+        );
+    }
+
     (stylesheet, loaded)
+}
+
+fn fallback_stylesheet(
+    mdx_path: &Path,
+    base_dir: &Path,
+    mdds: &[MddFile],
+    cache: &mut HashMap<String, Option<String>>,
+) -> Option<(String, String)> {
+    let stem = mdx_path
+        .file_stem()
+        .map(|value| value.to_string_lossy().to_string())?;
+    let mut candidates = vec![
+        format!("{stem}.css"),
+        "style.css".to_string(),
+        "default.css".to_string(),
+    ];
+    let mut from_mdd = Vec::new();
+    for mdd in mdds {
+        for key in mdd.keys().flatten() {
+            let name = key.key().to_string();
+            if !name.to_ascii_lowercase().ends_with(".css") {
+                continue;
+            }
+            if let Some(normalized) = normalized_resource(&name)
+                && !from_mdd.contains(&normalized)
+            {
+                from_mdd.push(normalized);
+            }
+            if from_mdd.len() >= MAX_CSS_FILES {
+                break;
+            }
+        }
+    }
+    from_mdd.sort();
+    candidates.extend(from_mdd);
+
+    for href in candidates {
+        if let Some(css) = load_css_graph(base_dir, mdds, &href, cache, &mut Vec::new(), 0) {
+            return Some((href, css));
+        }
+    }
+    None
+}
+
+fn load_css_graph(
+    base_dir: &Path,
+    mdds: &[MddFile],
+    href: &str,
+    cache: &mut HashMap<String, Option<String>>,
+    stack: &mut Vec<String>,
+    depth: usize,
+) -> Option<String> {
+    if depth > MAX_CSS_DEPTH {
+        return None;
+    }
+    let key = normalize_key(href);
+    if key.is_empty() {
+        return None;
+    }
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    if stack.iter().any(|value| value == &key) {
+        log::warn!("CSS @import 循环: {href}");
+        return None;
+    }
+
+    stack.push(key.clone());
+    let result = read_css_source(base_dir, mdds, href).and_then(|(bytes, dir)| {
+        let css = decode_text(&bytes);
+        expand_css_imports(&css, &dir, base_dir, mdds, cache, stack, depth)
+    });
+    stack.pop();
+    cache.insert(key, result.clone());
+    result
+}
+
+fn read_css_source(base_dir: &Path, mdds: &[MddFile], href: &str) -> Option<(Vec<u8>, String)> {
+    let normalized = normalized_resource(href)?;
+    if let Some(path) = read_external(base_dir, href) {
+        let bytes = std::fs::read(path).ok()?;
+        return Some((bytes, parent_dir(&normalized)));
+    }
+
+    let (bytes, key) = lookup_mdd_resource_entry(mdds, href)?;
+    let key = normalized_resource(&key)?;
+    Some((bytes.to_vec(), parent_dir(&key)))
+}
+
+fn parent_dir(path: &str) -> String {
+    path.rsplit_once('/')
+        .map(|(dir, _)| dir.to_string())
+        .unwrap_or_default()
+}
+
+fn expand_css_imports(
+    css: &str,
+    dir: &str,
+    base_dir: &Path,
+    mdds: &[MddFile],
+    cache: &mut HashMap<String, Option<String>>,
+    stack: &mut Vec<String>,
+    depth: usize,
+) -> Option<String> {
+    let lower = css.to_ascii_lowercase();
+    let mut output = String::with_capacity(css.len());
+    let mut last = 0;
+    let mut search = 0;
+
+    while let Some(relative) = lower[search..].find("@import") {
+        let at = search + relative;
+        let Some(end) = find_statement_end(css, at) else {
+            break;
+        };
+        output.push_str(&rewrite_css_urls(&css[last..at], dir));
+
+        let statement = &css[at..end];
+        if let Some((href, supports, media)) = parse_import_statement(statement)
+            && let Some(target) = join_href(dir, &href)
+            && let Some(imported) = load_css_graph(base_dir, mdds, &target, cache, stack, depth + 1)
+        {
+            let mut wrapped = imported;
+            if let Some(supports) = supports
+                && !supports.is_empty()
+            {
+                wrapped = format!("@supports {supports} {{ {wrapped} }}");
+            }
+            if let Some(media) = media
+                && !media.is_empty()
+            {
+                wrapped = format!("@media {media} {{ {wrapped} }}");
+            }
+            output.push_str(&wrapped);
+        } else {
+            log::warn!("跳过无法加载的 @import: {statement}");
+        }
+
+        last = end + 1;
+        search = last;
+    }
+
+    output.push_str(&rewrite_css_urls(&css[last..], dir));
+    Some(output)
+}
+
+/// 从 `@import` 起找到语句结尾的 `;`（跳过字符串和括号）。
+fn find_statement_end(css: &str, start: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    for (offset, ch) in css[start..].char_indices() {
+        if let Some(current) = quote {
+            if ch == current {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ';' if depth == 0 => return Some(start + offset),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_import_statement(statement: &str) -> Option<(String, Option<String>, Option<String>)> {
+    let rest = statement.trim();
+    if rest.len() < 7 || !rest[..7].eq_ignore_ascii_case("@import") {
+        return None;
+    }
+    let rest = rest[7..].trim_start();
+
+    let (href, rest) = if let Some(rest) = rest.strip_prefix("url(") {
+        let end = rest.find(')')?;
+        (
+            rest[..end].trim().trim_matches(['"', '\'']).to_string(),
+            rest[end + 1..].trim(),
+        )
+    } else {
+        let quote = rest.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let rest = &rest[1..];
+        let end = rest.find(quote)?;
+        (rest[..end].to_string(), rest[end + 1..].trim())
+    };
+
+    let mut rest = rest.to_string();
+    let mut supports = None;
+    if let Some(index) = rest.find("supports(") {
+        let start = index + "supports(".len();
+        if let Some(end) = find_matching_paren(&rest, start) {
+            supports = Some(rest[start..end].trim().to_string());
+            rest.replace_range(index..=end, "");
+        }
+    }
+    if let Some(index) = rest.find("layer") {
+        let after = index + "layer".len();
+        if let Some(rest_after) = rest[after..].strip_prefix('(') {
+            if let Some(end) = rest_after.find(')') {
+                let end = after + 1 + end + 1;
+                rest.replace_range(index..end, "");
+            }
+        } else {
+            rest.replace_range(index..after, "");
+        }
+    }
+    let media = rest.trim();
+    let media = (!media.is_empty()).then(|| media.to_string());
+
+    Some((href, supports, media))
+}
+
+fn join_href(dir: &str, href: &str) -> Option<String> {
+    normalize_join(dir, href)
+}
+
+fn normalize_join(dir: &str, href: &str) -> Option<String> {
+    let href = href.trim();
+    if href.is_empty() {
+        return None;
+    }
+    let lower = href.to_ascii_lowercase();
+    if lower.starts_with("data:")
+        || lower.starts_with("http:")
+        || lower.starts_with("https:")
+        || lower.starts_with("//")
+        || lower.starts_with('#')
+        || lower.starts_with("javascript:")
+    {
+        return None;
+    }
+
+    let decoded = percent_decode(href);
+    let decoded = decoded.split(['?', '#']).next().unwrap_or(&decoded).trim();
+    let mut parts: Vec<&str> = if decoded.starts_with('/') {
+        Vec::new()
+    } else {
+        dir.split('/').filter(|part| !part.is_empty()).collect()
+    };
+    let normalized = decoded.replace('\\', "/");
+    for part in normalized.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    let joined = parts.join("/");
+    (!joined.is_empty()).then_some(joined)
+}
+
+fn rewrite_css_urls(css: &str, dir: &str) -> String {
+    let lower = css.to_ascii_lowercase();
+    let mut output = String::with_capacity(css.len());
+    let mut cursor = 0;
+
+    while let Some(relative) = lower[cursor..].find("url(") {
+        let start = cursor + relative;
+        output.push_str(&css[cursor..start]);
+        let inner_start = start + 4;
+        let Some(close) = find_matching_paren(css, inner_start) else {
+            output.push_str(&css[start..]);
+            return output;
+        };
+        let inner = css[inner_start..close].trim().trim_matches(['"', '\'']);
+        match normalize_join(dir, inner) {
+            Some(joined) => output.push_str(&format!("url(\"{joined}\")")),
+            None => output.push_str(&css[start..=close]),
+        }
+        cursor = close + 1;
+    }
+
+    output.push_str(&css[cursor..]);
+    output
+}
+
+fn find_matching_paren(value: &str, start: usize) -> Option<usize> {
+    let mut depth = 1i32;
+    let mut quote: Option<char> = None;
+    for (offset, ch) in value[start..].char_indices() {
+        if let Some(current) = quote {
+            if ch == current {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// 从头部描述里找 `<link href="...css">`。
@@ -593,10 +934,55 @@ fn css_links(text: &str) -> Vec<String> {
     output
 }
 
-fn load_fonts(stylesheet: &Stylesheet, base_dir: &Path, mdds: &[MddFile]) -> FontLibrary {
+/// 只用于字体发现：列出词典目录和 MDD 里的 CSS，不合并其中的规则。
+fn discover_css_sources(base_dir: &Path, mdds: &[MddFile]) -> Vec<String> {
+    let mut sources = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Ok(entries) = std::fs::read_dir(base_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("css"))
+                && let Some(name) = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                && seen.insert(name.to_ascii_lowercase())
+            {
+                sources.push(name);
+            }
+            if sources.len() >= MAX_CSS_FILES {
+                return sources;
+            }
+        }
+    }
+
+    for mdd in mdds {
+        for key in mdd.keys().flatten() {
+            let name = key.key();
+            if !name.to_ascii_lowercase().ends_with(".css") {
+                continue;
+            }
+            if let Some(normalized) = normalized_resource(name)
+                && seen.insert(normalized.to_ascii_lowercase())
+            {
+                sources.push(normalized);
+            }
+            if sources.len() >= MAX_CSS_FILES {
+                return sources;
+            }
+        }
+    }
+
+    sources
+}
+
+fn load_fonts(faces: &[crate::css::FontFace], base_dir: &Path, mdds: &[MddFile]) -> FontLibrary {
     let mut library = FontLibrary::new();
     let mut total = 0;
-    for face in stylesheet.font_faces() {
+    for face in faces {
         for source in &face.sources {
             if source.starts_with("data:") {
                 continue;
@@ -624,19 +1010,13 @@ fn load_fonts(stylesheet: &Stylesheet, base_dir: &Path, mdds: &[MddFile]) -> Fon
             }
         }
     }
-    if library.is_empty() && !stylesheet.font_faces().is_empty() {
+    if library.is_empty() && !faces.is_empty() {
         log::warn!(
             "词典声明了 {} 个 @font-face，但没有加载到可用字体",
-            stylesheet.font_faces().len()
+            faces.len()
         );
     }
     library
-}
-
-fn read_external_css(base_dir: &Path, href: &str) -> Option<String> {
-    let path = read_external(base_dir, href)?;
-    let bytes = std::fs::read(path).ok()?;
-    Some(decode_text(&bytes))
 }
 
 fn read_external(base_dir: &Path, href: &str) -> Option<PathBuf> {
@@ -662,6 +1042,10 @@ fn normalized_resource(value: &str) -> Option<String> {
 
 /// 在所有 MDD 里找资源，兼容 `/img/a.png`、`\img\a.png`、大小写不一致等写法。
 fn lookup_mdd_resource(mdds: &[MddFile], src: &str) -> Option<Arc<[u8]>> {
+    lookup_mdd_resource_entry(mdds, src).map(|(bytes, _)| bytes)
+}
+
+fn lookup_mdd_resource_entry(mdds: &[MddFile], src: &str) -> Option<(Arc<[u8]>, String)> {
     let path = normalized_resource(src)?;
     let backslash = path.replace('/', "\\");
     let candidates = [
@@ -678,7 +1062,10 @@ fn lookup_mdd_resource(mdds: &[MddFile], src: &str) -> Option<Arc<[u8]>> {
     for mdd in mdds {
         for candidate in &candidates {
             if let Ok(Some(resource)) = mdd.lookup(candidate) {
-                return Some(Arc::from(resource.bytes().to_vec()));
+                return Some((
+                    Arc::from(resource.bytes().to_vec()),
+                    resource.key().to_string(),
+                ));
             }
         }
     }
@@ -726,12 +1113,19 @@ impl ResourceResolver for MddResolver<'_> {
         if let Some(cached) = self.stylesheets.get(&key) {
             return cached.clone();
         }
-        let value = read_external_css(self.base_dir, href)
-            .or_else(|| lookup_mdd_resource(self.mdd, href).map(|bytes| decode_text(&bytes)));
         if self.stylesheets.len() >= MAX_CACHE_ENTRIES {
             self.stylesheets.clear();
         }
-        self.stylesheets.insert(key, value.clone());
+        let MddResolver {
+            base_dir,
+            mdd,
+            stylesheets,
+            ..
+        } = self;
+        let value = load_css_graph(base_dir, mdd, href, stylesheets, &mut Vec::new(), 0);
+        if let Some(css) = &value {
+            log::info!("entry stylesheet: {href} ({} bytes)", css.len());
+        }
         value
     }
 
@@ -755,7 +1149,7 @@ impl ResourceResolver for MddResolver<'_> {
     }
 }
 
-/// CSS 文件可能是 UTF-8（带/不带 BOM）或 UTF-16。
+/// CSS 文件可能是 UTF-8（带/不带 BOM）、UTF-16，或旧词典常见的 GBK/GB18030。
 fn decode_text(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]) {
         return String::from_utf8_lossy(rest).into_owned();
@@ -765,6 +1159,14 @@ fn decode_text(bytes: &[u8]) -> String {
     }
     if let Some(rest) = bytes.strip_prefix(&[0xfe, 0xff]) {
         return decode_utf16(rest, false);
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+
+    let (text, _, had_errors) = encoding_rs::GB18030.decode(bytes);
+    if !had_errors {
+        return text.into_owned();
     }
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -900,6 +1302,84 @@ mod tests {
     }
 
     #[test]
+    fn css_urls_are_rewritten_relative_to_their_stylesheet() {
+        let css = rewrite_css_urls(
+            r#".a { background: url("../img/a.png"); }
+               .b { background: url(data:image/png;base64,AAAA); }"#,
+            "css/sub",
+        );
+        assert!(css.contains(r#"url("css/img/a.png")"#), "{css}");
+        assert!(css.contains("url(data:image/png;base64,AAAA)"), "{css}");
+        assert_eq!(
+            normalize_join("css", "../fonts/a.woff").as_deref(),
+            Some("fonts/a.woff")
+        );
+        assert_eq!(
+            normalize_join("css", "/img/a.png").as_deref(),
+            Some("img/a.png")
+        );
+    }
+
+    #[test]
+    fn css_import_statements_keep_media_and_supports() {
+        let (href, supports, media) =
+            parse_import_statement("@import url(\"theme.css\") screen and (min-width: 400px)")
+                .unwrap();
+        assert_eq!(href, "theme.css");
+        assert!(supports.is_none());
+        assert_eq!(media.as_deref(), Some("screen and (min-width: 400px)"));
+
+        let (href, supports, media) =
+            parse_import_statement("@import 'print.css' supports(display: grid) print").unwrap();
+        assert_eq!(href, "print.css");
+        assert_eq!(supports.as_deref(), Some("display: grid"));
+        assert_eq!(media.as_deref(), Some("print"));
+    }
+
+    #[test]
+    fn external_import_graph_is_expanded() {
+        let directory = std::env::temp_dir().join(format!(
+            "gpui-pdf-css-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let css_dir = directory.join("css");
+        std::fs::create_dir_all(&css_dir).unwrap();
+        std::fs::write(
+            css_dir.join("main.css"),
+            r#"@import "theme.css";
+               .a { background-image: url(../img/a.png); }"#,
+        )
+        .unwrap();
+        std::fs::write(css_dir.join("theme.css"), "html { --brand: #123456; }").unwrap();
+
+        let mut cache = HashMap::new();
+        let css = load_css_graph(
+            &directory,
+            &[],
+            "css/main.css",
+            &mut cache,
+            &mut Vec::new(),
+            0,
+        )
+        .expect("css graph");
+        assert!(css.contains("--brand"), "{css}");
+        assert!(css.contains(r#"url("img/a.png")"#), "{css}");
+        assert!(!css.contains("@import"), "{css}");
+
+        std::fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn gb18030_css_is_decoded() {
+        // “你好”的 GBK 编码。
+        assert_eq!(decode_text(&[0xC4, 0xE3, 0xBA, 0xC3]), "你好");
+    }
+
+    #[test]
     fn worker_loads_and_queries_a_synthetic_dictionary() {
         let mut builder =
             MdxBuilder::with_options(WriteOptions::new().with_encoding(WriteEncoding::Utf8));
@@ -909,7 +1389,7 @@ mod tests {
         builder
             .add_entry(
                 "hello",
-                r#"<link rel="stylesheet" href="style.css">
+                r#"<link rel="stylesheet" href="css/main.css">
                    <div class="hwd">hello</div>
                    <div class="def">你好，<b>世界</b> <mark>标记</mark> <img src="img/dot.png" width="16"></div>"#,
             )
@@ -939,11 +1419,16 @@ mod tests {
 
         let mut mdd = MddBuilder::new();
         mdd.add_resource(
-            "/style.css",
-            r#".hwd { font-size: 20px; color: #0000ff; } .def { color: #333333; } mark::before { content: "※"; }"#
+            "/css/main.css",
+            r#"@import "theme.css";
+               .hwd { font-size: 20px; color: var(--brand); }
+               .def { color: #333333; background-image: url(../img/dot.png); }
+               mark::before { content: "※"; }"#
                 .as_bytes(),
         )
         .unwrap();
+        mdd.add_resource("/css/theme.css", r#"html { --brand: #0000ff; }"#.as_bytes())
+            .unwrap();
         mdd.add_resource("/img/dot.png", &png_bytes).unwrap();
         let mut mdd_file = std::fs::File::create(&mdd_path).unwrap();
         mdd.finish(&mut mdd_file).unwrap();
@@ -1326,6 +1811,52 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要 GPUI_PDF_TEST_DICT_ENTRY 指向一个把 CSS 放在词条 <link> 里的 MDX"]
+    fn entry_level_stylesheet_is_applied() {
+        let path = std::env::var("GPUI_PDF_TEST_DICT_ENTRY").expect("GPUI_PDF_TEST_DICT_ENTRY");
+        let (mut dictionary, _, _) =
+            load_dictionary(&PathBuf::from(path)).expect("load dictionary");
+        let key = dictionary
+            .mdx
+            .keys()
+            .flatten()
+            .next()
+            .expect("first key")
+            .key()
+            .to_string();
+        let (entry, _) = dictionary
+            .lookup(&key)
+            .expect("lookup")
+            .expect("entry body");
+
+        let styled = entry.blocks.iter().any(|block| match block {
+            Block::Paragraph(paragraph) => paragraph.spans.iter().any(|span| {
+                matches!(span, Span::Text(text) if text.style.size.is_some() || text.style.color.is_some())
+            }),
+            Block::Container(container) => container.style.size.is_some(),
+            Block::Table(table) => table.style.size.is_some(),
+        });
+        assert!(styled, "词条 {key:?} 没有应用词条内 <link> 的样式");
+        let has_inline_box = entry.blocks.iter().any(|block| match block {
+            Block::Paragraph(paragraph) => paragraph
+                .spans
+                .iter()
+                .any(|span| matches!(span, Span::Box(_))),
+            Block::Container(container) => container.items.iter().any(|item| {
+                item.blocks.iter().any(|block| match block {
+                    Block::Paragraph(paragraph) => paragraph
+                        .spans
+                        .iter()
+                        .any(|span| matches!(span, Span::Box(_))),
+                    _ => false,
+                })
+            }),
+            Block::Table(_) => false,
+        });
+        assert!(has_inline_box, "词条 {key:?} 没有生成 inline-block 盒子");
+    }
+
+    #[test]
     #[ignore = "需要设置 GPUI_PDF_TEST_DICT 指向《王力古漢語字典》的 .mdx"]
     fn wangli_dictionary_renders_styles_and_pseudo_content() {
         let path = std::env::var("GPUI_PDF_TEST_DICT").expect("GPUI_PDF_TEST_DICT");
@@ -1343,12 +1874,14 @@ mod tests {
         let Block::Paragraph(headword) = &entry.blocks[0] else {
             panic!("expected headword paragraph");
         };
-        assert!(
-            headword.spans.iter().any(
-                |span| matches!(span, Span::Text(text) if text.style.size.unwrap_or(0.0) > 20.0)
-            ),
-            "headword should use the 1.6em rule"
-        );
+        let headword_large = headword.style.size.unwrap_or(0.0) > 20.0
+            || headword.spans.iter().any(|span| match span {
+                Span::Text(text) => text.style.size.unwrap_or(0.0) > 20.0,
+                // `.hw` 是 inline-block，字号落在盒子样式上。
+                Span::Box(inline) => inline.style.size.unwrap_or(0.0) > 20.0,
+                Span::Image(_) => false,
+            });
+        assert!(headword_large, "headword should use the 1.6em rule");
 
         let text = entry.text();
         assert!(text.contains("～"), "missing w::before content: {text}");

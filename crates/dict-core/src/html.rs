@@ -12,8 +12,8 @@ use crate::css::{self, Computed, Display, PseudoElement, ROOT_SIZE, Stylesheet};
 use crate::fonts::FontLibrary;
 use crate::model::{
     Align, AlignItems, Block, BlockKind, BlockStyle, Container, FlexDirection, FlexItem, FlexStyle,
-    FlexWrap, ImageFormat, ImageSpan, Justify, LinkTarget, Paragraph, Span, SpanStyle, Table,
-    TableCell, TableRow, TextSpan,
+    FlexWrap, ImageFormat, ImageSpan, InlineBox, Justify, LinkTarget, Paragraph, Span, SpanStyle,
+    Table, TableCell, TableRow, TextSpan,
 };
 
 /// 单次释义最多接受多少个块，防止异常词条拖慢界面。
@@ -300,7 +300,7 @@ impl Converter<'_> {
         }
         let attrs = attributes(data);
         let computed = self.style_for(&tag, element, &attrs, inherited);
-        if matches!(computed.display, Some(Display::None)) {
+        if matches!(computed.display, Some(Display::None)) || computed.hidden {
             return;
         }
         let before = self.pseudo_style(element, &computed, PseudoElement::Before);
@@ -323,17 +323,25 @@ impl Converter<'_> {
             self.link = Some(target);
         }
 
-        let display = computed.display.unwrap_or_else(|| {
-            if is_block_tag(&tag) {
-                Display::Block
-            } else {
-                Display::Inline
-            }
-        });
+        let display = if computed.float.is_some() {
+            // CSS 的 float 会让元素块级化；这里不做文字环绕，只保留左右对齐。
+            Display::Block
+        } else {
+            computed.display.unwrap_or_else(|| {
+                if is_block_tag(&tag) {
+                    Display::Block
+                } else {
+                    Display::Inline
+                }
+            })
+        };
         match display {
             Display::Flex => self.visit_flex(node, &attrs, &computed),
             Display::Block => self.visit_block(node, &tag, &attrs, &computed, before, after),
             Display::None => {}
+            Display::InlineBlock => {
+                self.visit_inline_block(node, &attrs, &computed, before, after, ctx)
+            }
             Display::Inline => {
                 self.push_inline_gap(&computed, ctx, false);
                 self.push_pseudo(before.as_ref(), &attrs, ctx, false);
@@ -500,6 +508,23 @@ impl Converter<'_> {
         }
     }
 
+    fn visit_inline_block(
+        &mut self,
+        node: &NodeRef,
+        attrs: &[(String, String)],
+        computed: &Computed,
+        before: Option<Computed>,
+        after: Option<Computed>,
+        ctx: &ParaCtx,
+    ) {
+        let blocks = self.capture_cell(node, attrs, computed, before, after);
+        self.ensure_ctx(ctx);
+        self.spans.push(Span::Box(InlineBox {
+            style: block_style(computed, None),
+            blocks,
+        }));
+    }
+
     /// `display: flex` 容器：直接子元素各成一个 flex 子项，行内子元素并进匿名项。
     fn visit_flex(&mut self, node: &NodeRef, _attrs: &[(String, String)], computed: &Computed) {
         self.flush();
@@ -545,7 +570,7 @@ impl Converter<'_> {
                 continue;
             }
             let child_computed = self.style_for(&tag, &element, &child_attrs, computed);
-            if matches!(child_computed.display, Some(Display::None)) {
+            if matches!(child_computed.display, Some(Display::None)) || child_computed.hidden {
                 continue;
             }
             let child_display = child_computed.display.unwrap_or_else(|| {
@@ -807,7 +832,7 @@ impl Converter<'_> {
         let Some(computed) = computed else {
             return;
         };
-        if matches!(computed.display, Some(Display::None)) {
+        if matches!(computed.display, Some(Display::None)) || computed.hidden {
             return;
         }
         let Some(content) = &computed.content else {
@@ -983,6 +1008,7 @@ impl Converter<'_> {
         self.spans.retain(|span| match span {
             Span::Text(text) => !text.text.is_empty(),
             Span::Image(_) => true,
+            Span::Box(inline) => !inline.blocks.iter().all(Block::is_empty),
         });
         if self.spans.is_empty() {
             return;
@@ -1042,6 +1068,8 @@ fn block_style(computed: &Computed, marker: Option<String>) -> BlockStyle {
         align: computed.align,
         margin_top: computed.margin_top,
         margin_bottom: computed.margin_bottom,
+        margin_left: computed.margin_left,
+        margin_right: computed.margin_right,
         padding: computed.padding,
         indent: computed.indent.unwrap_or(0.0),
         background: computed.background,
@@ -1050,7 +1078,10 @@ fn block_style(computed: &Computed, marker: Option<String>) -> BlockStyle {
         border_bottom: computed.border_bottom,
         border_left: computed.border_left,
         width: computed.width,
+        height: computed.height,
         marker,
+        float: computed.float,
+        vertical_align: computed.vertical_align,
         grow: computed.flex_grow,
         shrink: computed.flex_shrink,
         basis: computed.flex_basis,
@@ -1258,7 +1289,7 @@ fn percent_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Color;
+    use crate::model::{AlignSelf, Color, FloatSide};
 
     struct MemoryResolver {
         files: std::collections::HashMap<String, Vec<u8>>,
@@ -1592,6 +1623,38 @@ mod tests {
             span.style.color,
             Some(crate::model::Color::rgb(17, 68, 136))
         );
+    }
+
+    #[test]
+    fn inline_block_becomes_an_atomic_box() {
+        let blocks = to_blocks(
+            r#"<div>a<span style="display:inline-block; width:20px; height:10px;
+                                  margin-left:3px; vertical-align:middle">b</span>c</div>"#,
+        );
+        let Block::Paragraph(paragraph) = &blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert_eq!(paragraph.spans.len(), 3);
+        let Span::Box(inline) = &paragraph.spans[1] else {
+            panic!("expected inline box: {:?}", paragraph.spans[1]);
+        };
+        assert_eq!(inline.style.width, Some(20.0));
+        assert_eq!(inline.style.height, Some(10.0));
+        assert_eq!(inline.style.margin_left, Some(3.0));
+        assert_eq!(inline.style.vertical_align, Some(AlignSelf::Center));
+        assert_eq!(inline.blocks[0].text(), "b");
+    }
+
+    #[test]
+    fn float_becomes_a_block_with_alignment_style() {
+        let blocks = to_blocks(r#"<div style="float:right">导航</div><div>正文</div>"#);
+        assert_eq!(blocks.len(), 2);
+        let Block::Paragraph(nav) = &blocks[0] else {
+            panic!("expected float paragraph");
+        };
+        assert_eq!(nav.style.float, Some(FloatSide::Right));
+        assert_eq!(nav.text(), "导航");
+        assert_eq!(blocks[1].text(), "正文");
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub use fonts::FontLibrary;
 pub use html::{NoResources, RenderContext, ResourceResolver, extract_phonetic, render, to_blocks};
 pub use model::{
     Align, AlignItems, AlignSelf, Block, BlockKind, BlockStyle, Border, Color, Container,
-    DictEntry, Edges, FlexDirection, FlexItem, FlexStyle, FlexWrap, ImageFormat, ImageSpan,
-    Justify, LinkTarget, Paragraph, Span, SpanStyle, Table, TableCell, TableRow, TextSpan,
+    DictEntry, Edges, FlexDirection, FlexItem, FlexStyle, FlexWrap, FloatSide, ImageFormat,
+    ImageSpan, InlineBox, Justify, LinkTarget, Paragraph, Span, SpanStyle, Table, TableCell,
+    TableRow, TextSpan,
 };

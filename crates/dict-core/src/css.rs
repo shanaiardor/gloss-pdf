@@ -3,6 +3,7 @@
 //! 语法解析交给 `lightningcss`，选择器匹配交给 `kuchiki`（Servo `selectors`），
 //! 这里只保留 MDX 释义需要的属性子集、层叠顺序和继承逻辑。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use kuchiki::{ElementData, NodeDataRef, Selectors, Specificity};
@@ -12,17 +13,55 @@ use lightningcss::stylesheet::{ParserOptions, PrinterOptions, StyleSheet};
 use lightningcss::traits::ToCss;
 
 use crate::model::{
-    Align, AlignItems, AlignSelf, Border, Color, Edges, FlexDirection, FlexWrap, Justify,
+    Align, AlignItems, AlignSelf, Border, Color, Edges, FlexDirection, FlexWrap, FloatSide, Justify,
 };
 
 /// CSS 的初始字号；用于 `rem` 以及没有 css 字号时的 `em`。
 pub(crate) const ROOT_SIZE: f32 = 16.0;
+
+/// 词典窗口的内容尺寸，用于求值 `@media` 与 `vw/vh`。
+const VIEWPORT_WIDTH: f32 = 420.0;
+const VIEWPORT_HEIGHT: f32 = 800.0;
+
+/// 一次样式表解析的覆盖率统计，用来定位“哪类规则还没支持”。
+#[derive(Clone, Debug, Default)]
+pub struct CssStats {
+    pub style_rules: usize,
+    pub compiled_rules: usize,
+    /// `@media` / `@supports` / `@layer` / `@import` 等出现次数。
+    pub at_rules: HashMap<String, usize>,
+    /// 无法映射到内部属性的声明名及次数。
+    pub unsupported_declarations: HashMap<String, usize>,
+    pub unsupported_selectors: usize,
+}
+
+impl CssStats {
+    fn merge(&mut self, other: &CssStats) {
+        self.style_rules += other.style_rules;
+        self.compiled_rules += other.compiled_rules;
+        self.unsupported_selectors += other.unsupported_selectors;
+        for (name, count) in &other.at_rules {
+            *self.at_rules.entry(name.clone()).or_default() += count;
+        }
+        for (name, count) in &other.unsupported_declarations {
+            *self
+                .unsupported_declarations
+                .entry(name.clone())
+                .or_default() += count;
+        }
+    }
+
+    pub fn unsupported_declarations_total(&self) -> usize {
+        self.unsupported_declarations.values().sum()
+    }
+}
 
 /// 一份样式表；`extend` 用于把词条内嵌样式接在全局样式后面。
 #[derive(Clone, Default)]
 pub struct Stylesheet {
     rules: Vec<CompiledRule>,
     font_faces: Vec<FontFace>,
+    stats: CssStats,
 }
 
 #[derive(Clone)]
@@ -30,6 +69,7 @@ struct CompiledRule {
     selectors: Vec<CompiledSelector>,
     declarations: Vec<Declaration>,
     order: u32,
+    media: Option<MediaCondition>,
 }
 
 #[derive(Clone)]
@@ -63,34 +103,15 @@ impl Stylesheet {
             }
         };
 
-        for rule in &parsed.rules.0 {
-            match rule {
-                CssRule::Style(style) => {
-                    let selectors = compile_selectors(&style.selectors);
-                    if selectors.is_empty() {
-                        continue;
-                    }
-                    let declarations = convert_declarations(&style.declarations);
-                    if declarations.is_empty() {
-                        continue;
-                    }
-                    stylesheet.rules.push(CompiledRule {
-                        selectors,
-                        declarations,
-                        order: stylesheet.rules.len() as u32,
-                    });
-                }
-                CssRule::FontFace(face) => {
-                    if let Ok(text) = face.to_css_string(PrinterOptions::default())
-                        && let Some(face) = parse_font_face(&text)
-                    {
-                        stylesheet.font_faces.push(face);
-                    }
-                }
-                _ => {}
-            }
-        }
-
+        let mut order = 0;
+        collect_rules(
+            &parsed.rules.0,
+            None,
+            &mut order,
+            &mut stylesheet.rules,
+            &mut stylesheet.font_faces,
+            &mut stylesheet.stats,
+        );
         stylesheet
     }
 
@@ -101,6 +122,7 @@ impl Stylesheet {
             rule
         }));
         self.font_faces.extend(other.font_faces);
+        self.stats.merge(&other.stats);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -113,6 +135,10 @@ impl Stylesheet {
 
     pub fn font_faces(&self) -> &[FontFace] {
         &self.font_faces
+    }
+
+    pub fn stats(&self) -> &CssStats {
+        &self.stats
     }
 
     /// 作用于普通元素（不含伪元素）的声明，按层叠顺序排好。
@@ -136,6 +162,13 @@ impl Stylesheet {
     ) -> Vec<Matched<'a>> {
         let mut output = Vec::new();
         for rule in &self.rules {
+            if rule
+                .media
+                .as_ref()
+                .is_some_and(|media| !media.matches(VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
+            {
+                continue;
+            }
             let specificity = rule
                 .selectors
                 .iter()
@@ -147,7 +180,7 @@ impl Stylesheet {
             };
             for declaration in &rule.declarations {
                 output.push(Matched {
-                    property: &declaration.property,
+                    declaration,
                     important: declaration.important,
                     specificity,
                     order: rule.order,
@@ -159,23 +192,511 @@ impl Stylesheet {
     }
 }
 
+fn collect_rules<'i, R>(
+    rules: &[CssRule<'i, R>],
+    media: Option<MediaCondition>,
+    order: &mut u32,
+    output: &mut Vec<CompiledRule>,
+    font_faces: &mut Vec<FontFace>,
+    stats: &mut CssStats,
+) {
+    fn walk<'i, R>(
+        rules: &[CssRule<'i, R>],
+        media: Option<MediaCondition>,
+        order: &mut u32,
+        output: &mut Vec<CompiledRule>,
+        font_faces: &mut Vec<FontFace>,
+        stats: &mut CssStats,
+    ) {
+        for rule in rules {
+            match rule {
+                CssRule::Style(style) => {
+                    stats.style_rules += 1;
+                    let selectors = compile_selectors(&style.selectors, stats);
+                    if selectors.is_empty() {
+                        continue;
+                    }
+                    let declarations = convert_declarations(&style.declarations, stats);
+                    if declarations.is_empty() {
+                        continue;
+                    }
+                    stats.compiled_rules += 1;
+                    output.push(CompiledRule {
+                        selectors,
+                        declarations,
+                        order: *order,
+                        media: media.clone(),
+                    });
+                    *order = order.saturating_add(1);
+                }
+                CssRule::Media(rule) => {
+                    *stats.at_rules.entry("media".into()).or_default() += 1;
+                    let query = rule
+                        .query
+                        .to_css_string(PrinterOptions::default())
+                        .unwrap_or_default();
+                    let condition = parse_media_condition(&query);
+                    let combined = match media.clone() {
+                        Some(parent) => Some(parent.and(condition)),
+                        None => Some(condition),
+                    };
+                    walk(&rule.rules.0, combined, order, output, font_faces, stats);
+                }
+                CssRule::Supports(rule) => {
+                    *stats.at_rules.entry("supports".into()).or_default() += 1;
+                    let condition = rule
+                        .condition
+                        .to_css_string(PrinterOptions::default())
+                        .unwrap_or_default();
+                    if supports_condition_matches(&condition) {
+                        walk(
+                            &rule.rules.0,
+                            media.clone(),
+                            order,
+                            output,
+                            font_faces,
+                            stats,
+                        );
+                    }
+                }
+                CssRule::LayerBlock(rule) => {
+                    *stats.at_rules.entry("layer".into()).or_default() += 1;
+                    walk(
+                        &rule.rules.0,
+                        media.clone(),
+                        order,
+                        output,
+                        font_faces,
+                        stats,
+                    );
+                }
+                CssRule::Import(_) => {
+                    *stats.at_rules.entry("import".into()).or_default() += 1;
+                }
+                CssRule::FontFace(face) => {
+                    if let Ok(text) = face.to_css_string(PrinterOptions::default())
+                        && let Some(face) = parse_font_face(&text)
+                    {
+                        font_faces.push(face);
+                    }
+                }
+                CssRule::Keyframes(_) => {
+                    *stats.at_rules.entry("keyframes".into()).or_default() += 1;
+                }
+                CssRule::LayerStatement(_) => {
+                    *stats.at_rules.entry("layer".into()).or_default() += 1;
+                }
+                CssRule::Nesting(rule) => {
+                    *stats.at_rules.entry("nesting".into()).or_default() += 1;
+                    stats.style_rules += 1;
+                    let selectors = compile_selectors(&rule.style.selectors, stats);
+                    if !selectors.is_empty() {
+                        let declarations = convert_declarations(&rule.style.declarations, stats);
+                        if !declarations.is_empty() {
+                            stats.compiled_rules += 1;
+                            output.push(CompiledRule {
+                                selectors,
+                                declarations,
+                                order: *order,
+                                media: media.clone(),
+                            });
+                            *order = order.saturating_add(1);
+                        }
+                    }
+                }
+                CssRule::Property(_) => {
+                    *stats.at_rules.entry("property".into()).or_default() += 1;
+                }
+                CssRule::Page(_) => {
+                    *stats.at_rules.entry("page".into()).or_default() += 1;
+                }
+                CssRule::Namespace(_) => {
+                    *stats.at_rules.entry("namespace".into()).or_default() += 1;
+                }
+                CssRule::CustomMedia(_) => {
+                    *stats.at_rules.entry("custom-media".into()).or_default() += 1;
+                }
+                CssRule::Scope(rule) => {
+                    *stats.at_rules.entry("scope".into()).or_default() += 1;
+                    walk(
+                        &rule.rules.0,
+                        media.clone(),
+                        order,
+                        output,
+                        font_faces,
+                        stats,
+                    );
+                }
+                CssRule::StartingStyle(rule) => {
+                    *stats.at_rules.entry("starting-style".into()).or_default() += 1;
+                    walk(
+                        &rule.rules.0,
+                        media.clone(),
+                        order,
+                        output,
+                        font_faces,
+                        stats,
+                    );
+                }
+                CssRule::ViewTransition(_) => {
+                    *stats.at_rules.entry("view-transition".into()).or_default() += 1;
+                }
+                CssRule::Unknown(rule) => {
+                    *stats.at_rules.entry(format!("@{}", rule.name)).or_default() += 1;
+                }
+                _ => {
+                    *stats.at_rules.entry("other".into()).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    walk(rules, media, order, output, font_faces, stats);
+}
+
+// ---------------------------------------------------------------------------
+// @media / @supports
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default)]
+struct MediaCondition {
+    queries: Vec<MediaQuery>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MediaQuery {
+    features: Vec<MediaFeature>,
+    negated: bool,
+    type_ok: bool,
+}
+
+#[derive(Clone, Debug)]
+struct MediaFeature {
+    name: String,
+    value: String,
+}
+
+impl MediaCondition {
+    fn matches(&self, width: f32, height: f32) -> bool {
+        if self.queries.is_empty() {
+            return true;
+        }
+        self.queries
+            .iter()
+            .any(|query| query.matches(width, height))
+    }
+
+    fn and(self, other: MediaCondition) -> MediaCondition {
+        if self.queries.is_empty() {
+            return other;
+        }
+        if other.queries.is_empty() {
+            return self;
+        }
+        let mut queries = Vec::new();
+        for left in &self.queries {
+            for right in &other.queries {
+                let mut merged = left.clone();
+                merged.features.extend(right.features.clone());
+                merged.negated |= right.negated;
+                merged.type_ok &= right.type_ok;
+                queries.push(merged);
+            }
+        }
+        MediaCondition { queries }
+    }
+}
+
+impl MediaQuery {
+    fn matches(&self, width: f32, height: f32) -> bool {
+        let matched = self.type_ok
+            && self
+                .features
+                .iter()
+                .all(|feature| feature.matches(width, height));
+        matched != self.negated
+    }
+}
+
+impl MediaFeature {
+    fn matches(&self, width: f32, height: f32) -> bool {
+        let value = self.value.trim();
+        match self.name.trim() {
+            "min-width" => length_px(value).is_some_and(|value| width >= value),
+            "max-width" => length_px(value).is_some_and(|value| width <= value),
+            "width" => length_px(value).is_some_and(|value| (width - value).abs() < 0.5),
+            "min-height" => length_px(value).is_some_and(|value| height >= value),
+            "max-height" => length_px(value).is_some_and(|value| height <= value),
+            "height" => length_px(value).is_some_and(|value| (height - value).abs() < 0.5),
+            "orientation" => match value {
+                "landscape" => width >= height,
+                "portrait" => width < height,
+                _ => true,
+            },
+            "prefers-color-scheme" => value != "dark",
+            "prefers-reduced-motion" | "prefers-contrast" | "forced-colors" => true,
+            // 分辨率、hover、指针类型等对静态排版影响小；不因为不认识就丢掉规则。
+            _ => true,
+        }
+    }
+}
+
+fn parse_media_condition(text: &str) -> MediaCondition {
+    let text = text.trim();
+    if text.is_empty() {
+        return MediaCondition::default();
+    }
+
+    let mut queries = Vec::new();
+    for part in split_top_level(text, ',') {
+        let mut query_text = part.trim().to_ascii_lowercase();
+        if query_text.is_empty() {
+            continue;
+        }
+
+        let mut negated = false;
+        if let Some(rest) = query_text.strip_prefix("not ") {
+            negated = true;
+            query_text = rest.trim().to_string();
+        }
+        if let Some(rest) = query_text.strip_prefix("only ") {
+            query_text = rest.trim().to_string();
+        }
+
+        let media_type = query_text
+            .split(|ch: char| ch.is_whitespace() || ch == '(')
+            .next()
+            .unwrap_or_default();
+        let type_ok = !matches!(
+            media_type,
+            "print"
+                | "speech"
+                | "aural"
+                | "braille"
+                | "embossed"
+                | "handheld"
+                | "projection"
+                | "tty"
+                | "tv"
+        );
+
+        let mut features = Vec::new();
+        let mut rest = query_text.as_str();
+        while let Some(start) = rest.find('(') {
+            let after = &rest[start + 1..];
+            let Some(end) = after.find(')') else {
+                break;
+            };
+            let expression = &after[..end];
+            if let Some((name, value)) = expression.split_once(':') {
+                features.push(MediaFeature {
+                    name: name.trim().to_string(),
+                    value: value.trim().to_string(),
+                });
+            } else {
+                features.extend(parse_media_range(expression));
+            }
+            rest = &after[end + 1..];
+        }
+
+        queries.push(MediaQuery {
+            features,
+            negated,
+            type_ok,
+        });
+    }
+
+    MediaCondition { queries }
+}
+
+fn parse_media_range(expression: &str) -> Vec<MediaFeature> {
+    let Some((left, op, right)) = split_comparison(expression) else {
+        return Vec::new();
+    };
+    let left = left.trim();
+    let right = right.trim();
+
+    if parse_length(left).is_some() {
+        // `400px <= width` 或 `400px <= width <= 1000px`
+        if let Some((name, next_op, value)) = split_comparison(right) {
+            let mut features = media_feature_for(name.trim(), &invert_comparison(op), left);
+            features.extend(media_feature_for(name.trim(), next_op, value.trim()));
+            return features;
+        }
+        return media_feature_for(right, &invert_comparison(op), left);
+    }
+
+    if parse_length(right).is_some() {
+        return media_feature_for(left, op, right);
+    }
+
+    Vec::new()
+}
+
+fn media_feature_for(name: &str, op: &str, value: &str) -> Vec<MediaFeature> {
+    let name = name.trim().to_ascii_lowercase();
+    if !matches!(name.as_str(), "width" | "height") {
+        return Vec::new();
+    }
+    let value = value.trim().to_string();
+    match op {
+        ">=" | ">" => vec![MediaFeature {
+            name: format!("min-{name}"),
+            value,
+        }],
+        "<=" | "<" => vec![MediaFeature {
+            name: format!("max-{name}"),
+            value,
+        }],
+        "=" => vec![MediaFeature { name, value }],
+        _ => Vec::new(),
+    }
+}
+
+fn invert_comparison(op: &str) -> String {
+    match op {
+        ">=" => "<=".to_string(),
+        "<=" => ">=".to_string(),
+        ">" => "<".to_string(),
+        "<" => ">".to_string(),
+        _ => op.to_string(),
+    }
+}
+
+fn split_comparison(value: &str) -> Option<(&str, &str, &str)> {
+    for operator in [">=", "<=", ">", "<", "="] {
+        if let Some(index) = value.find(operator) {
+            return Some((&value[..index], operator, &value[index + operator.len()..]));
+        }
+    }
+    None
+}
+
+fn length_px(value: &str) -> Option<f32> {
+    let value = value.trim();
+    parse_length(value).and_then(|length| length.fixed())
+}
+
+fn supports_condition_matches(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return true;
+    }
+    if let Some(rest) = strip_outer_parens(text) {
+        let inner = rest.trim();
+        if let Some(rest) = inner.strip_prefix("not ") {
+            return !supports_condition_matches(rest);
+        }
+        if let Some((name, value)) = inner.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            if name.starts_with("--") {
+                return true;
+            }
+            return !parse_property(&name, value.trim()).is_empty();
+        }
+        return supports_condition_matches(inner);
+    }
+    if let Some(parts) = split_top_level_keyword(text, " or ") {
+        return parts.into_iter().any(supports_condition_matches);
+    }
+    if let Some(parts) = split_top_level_keyword(text, " and ") {
+        return parts.into_iter().all(supports_condition_matches);
+    }
+    if let Some(rest) = text.strip_prefix("not ") {
+        return !supports_condition_matches(rest);
+    }
+    if let Some(rest) = text
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let Some((name, value)) = rest.split_once(':') else {
+            return false;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        if name.starts_with("--") {
+            return true;
+        }
+        return !parse_property(&name, value.trim()).is_empty();
+    }
+    false
+}
+
+fn strip_outer_parens(text: &str) -> Option<&str> {
+    let text = text.trim();
+    let inner = text.strip_prefix('(')?.strip_suffix(')')?;
+    let mut depth = 0i32;
+    for ch in inner.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if depth < 0 {
+            return None;
+        }
+    }
+    (depth == 0).then_some(inner)
+}
+
+fn split_top_level_keyword<'a>(text: &'a str, keyword: &str) -> Option<Vec<&'a str>> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut start = 0;
+    let mut index = 0;
+    let bytes = text.as_bytes();
+    while index < bytes.len() {
+        let ch = text[index..].chars().next()?;
+        if let Some(current) = quote {
+            if ch == current {
+                quote = None;
+            }
+            index += ch.len_utf8();
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ if depth == 0 && text[index..].starts_with(keyword) => {
+                parts.push(text[start..index].trim());
+                index += keyword.len();
+                start = index;
+                continue;
+            }
+            _ => {}
+        }
+        index += ch.len_utf8();
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    parts.push(text[start..].trim());
+    Some(parts)
+}
+
 fn compile_selectors(
     selectors: &lightningcss::selector::SelectorList<'_>,
+    stats: &mut CssStats,
 ) -> Vec<CompiledSelector> {
     let mut output = Vec::new();
     for selector in &selectors.0 {
         let Ok(text) = selector.to_css_string(PrinterOptions::default()) else {
+            stats.unsupported_selectors += 1;
             continue;
         };
         let (base, pseudo) = split_pseudo(&text);
         if base.contains("::") || base.contains(":first-letter") || base.contains(":first-line") {
+            stats.unsupported_selectors += 1;
             continue;
         }
         let Ok(matcher) = Selectors::compile(&base) else {
+            stats.unsupported_selectors += 1;
             log::debug!("跳过不支持的选择器: {text}");
             continue;
         };
         let Some(compiled) = matcher.0.first() else {
+            stats.unsupported_selectors += 1;
             continue;
         };
         output.push(CompiledSelector {
@@ -211,7 +732,7 @@ pub(crate) enum PseudoElement {
 
 /// 匹配时只需要元素、id 和 class 由 kuchiki/selectors 处理。
 pub(crate) struct Matched<'a> {
-    pub property: &'a Property,
+    pub declaration: &'a Declaration,
     pub important: bool,
     specificity: Specificity,
     order: u32,
@@ -219,8 +740,21 @@ pub(crate) struct Matched<'a> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Declaration {
-    pub property: Property,
+    pub name: String,
+    pub value: String,
     pub important: bool,
+    /// 不含 `var()` / `calc()` 时预先解析好的属性；动态值留空，apply 时再解析。
+    pub properties: Vec<Property>,
+}
+
+impl Declaration {
+    fn is_dynamic(&self) -> bool {
+        has_dynamic_value(&self.value)
+    }
+
+    fn is_custom(&self) -> bool {
+        self.name.starts_with("--")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +793,9 @@ pub(crate) enum Property {
     PreserveSpace(bool),
     Content(Content),
     BackgroundImage,
+    Visibility(bool),
+    Float(FloatSide),
+    VerticalAlign(AlignSelf),
     FlexDirection(FlexDirection),
     FlexWrap(FlexWrap),
     Justify(Justify),
@@ -274,6 +811,7 @@ pub(crate) enum Property {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Display {
     Inline,
+    InlineBlock,
     Block,
     Flex,
     None,
@@ -287,6 +825,17 @@ pub(crate) enum Length {
     Rem(f32),
     Ex(f32),
     Percent(f32),
+    Vw(f32),
+    Vh(f32),
+    Vmin(f32),
+    Vmax(f32),
+    Ch(f32),
+    Lh(f32),
+    /// `calc()` / `min()` / `max()` / `clamp()` 的结果：绝对部分 + 百分比部分。
+    Calc {
+        px: f32,
+        percent: f32,
+    },
 }
 
 impl Length {
@@ -298,14 +847,29 @@ impl Length {
             Length::Rem(value) => value * root,
             Length::Ex(value) => value * base * 0.5,
             Length::Percent(value) => value * base / 100.0,
+            Length::Vw(value) => value * VIEWPORT_WIDTH / 100.0,
+            Length::Vh(value) => value * VIEWPORT_HEIGHT / 100.0,
+            Length::Vmin(value) => value * VIEWPORT_WIDTH.min(VIEWPORT_HEIGHT) / 100.0,
+            Length::Vmax(value) => value * VIEWPORT_WIDTH.max(VIEWPORT_HEIGHT) / 100.0,
+            Length::Ch(value) => value * base * 0.5,
+            Length::Lh(value) => value * base * 1.2,
+            Length::Calc { px, percent } => px + percent * base / 100.0,
         }
     }
 
     pub(crate) fn fixed(self) -> Option<f32> {
-        if matches!(self, Length::Percent(_)) {
+        if self.has_percent() {
             None
         } else {
             Some(self.resolve(ROOT_SIZE, ROOT_SIZE))
+        }
+    }
+
+    pub(crate) fn has_percent(self) -> bool {
+        match self {
+            Length::Percent(_) => true,
+            Length::Calc { percent, .. } => percent.abs() > f32::EPSILON,
+            _ => false,
         }
     }
 }
@@ -399,6 +963,14 @@ pub(crate) struct Computed {
     /// CSS 是否显式声明过 `text-decoration`（包括 `none`）。
     /// 界面据此决定要不要给链接补默认下划线。
     pub decoration_explicit: bool,
+    /// CSS 自定义属性（`--x`），按规范参与继承。
+    pub custom: HashMap<String, String>,
+    /// `visibility: hidden`（占位但仍隐藏；这里直接不生成内容）。
+    pub hidden: bool,
+    /// `float`；只在块级布局里做左右对齐近似。
+    pub float: Option<FloatSide>,
+    /// `vertical-align`，用于 inline-block 的交叉轴对齐。
+    pub vertical_align: Option<AlignSelf>,
 }
 
 impl Computed {
@@ -416,6 +988,8 @@ impl Computed {
             align: parent.align,
             line_height: parent.line_height,
             preserve_space: parent.preserve_space,
+            custom: parent.custom.clone(),
+            hidden: parent.hidden,
             ..Default::default()
         }
     }
@@ -426,21 +1000,165 @@ impl Computed {
         inline: &[Declaration],
         root_size: f32,
     ) {
+        // `--x` 先按层叠顺序结算，后面的声明才能用 `var()` 引用。
+        self.apply_custom(
+            matched
+                .iter()
+                .filter(|item| !item.important)
+                .map(|item| item.declaration),
+        );
+        self.apply_custom(inline.iter().filter(|item| !item.important));
+        self.apply_custom(
+            matched
+                .iter()
+                .filter(|item| item.important)
+                .map(|item| item.declaration),
+        );
+        self.apply_custom(inline.iter().filter(|item| item.important));
+
         // 普通声明 → 行内普通声明 → !important 声明 → 行内 !important。
-        for item in matched.iter().filter(|item| !item.important) {
-            self.apply_property(item.property, root_size);
-        }
-        for declaration in inline.iter().filter(|item| !item.important) {
-            self.apply_property(&declaration.property, root_size);
-        }
-        for item in matched.iter().filter(|item| item.important) {
-            self.apply_property(item.property, root_size);
-        }
-        for declaration in inline.iter().filter(|item| item.important) {
-            self.apply_property(&declaration.property, root_size);
+        self.apply_declarations(
+            matched
+                .iter()
+                .filter(|item| !item.important)
+                .map(|item| item.declaration),
+            root_size,
+        );
+        self.apply_declarations(inline.iter().filter(|item| !item.important), root_size);
+        self.apply_declarations(
+            matched
+                .iter()
+                .filter(|item| item.important)
+                .map(|item| item.declaration),
+            root_size,
+        );
+        self.apply_declarations(inline.iter().filter(|item| item.important), root_size);
+    }
+
+    fn apply_custom<'a>(&mut self, declarations: impl Iterator<Item = &'a Declaration>) {
+        for declaration in declarations {
+            if !declaration.is_custom() {
+                continue;
+            }
+            if let Some(value) = substitute_vars(&declaration.value, &self.custom, 0) {
+                self.custom.insert(declaration.name.clone(), value);
+            }
         }
     }
 
+    fn apply_declarations<'a>(
+        &mut self,
+        declarations: impl Iterator<Item = &'a Declaration>,
+        root_size: f32,
+    ) {
+        for declaration in declarations {
+            if declaration.is_custom() {
+                continue;
+            }
+            if declaration.is_dynamic() {
+                let Some(value) = substitute_vars(&declaration.value, &self.custom, 0) else {
+                    continue;
+                };
+                let value = replace_current_color(&value, self.color);
+                let properties = parse_property(&declaration.name, &value);
+                for property in &properties {
+                    self.apply_property(property, root_size);
+                }
+            } else {
+                for property in &declaration.properties {
+                    self.apply_property(property, root_size);
+                }
+            }
+        }
+    }
+}
+
+fn substitute_vars(value: &str, custom: &HashMap<String, String>, depth: usize) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    let lower = value.to_ascii_lowercase();
+    let Some(first) = lower.find("var(") else {
+        return Some(value.to_string());
+    };
+
+    let mut output = String::with_capacity(value.len());
+    output.push_str(&value[..first]);
+    let mut rest_index = first;
+
+    loop {
+        let lower = value.to_ascii_lowercase();
+        let Some(start) = lower[rest_index..].find("var(") else {
+            output.push_str(&value[rest_index..]);
+            break;
+        };
+        let start = rest_index + start;
+        output.push_str(&value[rest_index..start]);
+        let inner_start = start + 4;
+        let Some(end) = find_matching_paren(value, inner_start) else {
+            return None;
+        };
+        let inner = &value[inner_start..end];
+        let parts = split_top_level(inner, ',');
+        let name = parts.first()?.trim();
+        let fallback = parts.get(1).map(|value| value.trim());
+
+        let resolved = custom
+            .get(name)
+            .and_then(|value| substitute_vars(value, custom, depth + 1))
+            .or_else(|| fallback.and_then(|value| substitute_vars(value, custom, depth + 1)))?;
+        output.push_str(&resolved);
+        rest_index = end + 1;
+    }
+
+    Some(output)
+}
+
+fn find_matching_paren(value: &str, start: usize) -> Option<usize> {
+    let mut depth = 1i32;
+    let mut quote: Option<char> = None;
+    for (offset, ch) in value[start..].char_indices() {
+        if let Some(current) = quote {
+            if ch == current {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn replace_current_color(value: &str, color: Option<Color>) -> String {
+    let lower = value.to_ascii_lowercase();
+    if !lower.contains("currentcolor") {
+        return value.to_string();
+    }
+    let color = color.unwrap_or(Color::rgb(0, 0, 0));
+    let replacement = format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b);
+
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(index) = rest.to_ascii_lowercase().find("currentcolor") {
+        output.push_str(&rest[..index]);
+        output.push_str(&replacement);
+        rest = &rest[index + "currentcolor".len()..];
+    }
+    output.push_str(rest);
+    output
+}
+
+impl Computed {
     fn apply_property(&mut self, property: &Property, root_size: f32) {
         let font_size = self.size.unwrap_or(root_size);
         match property {
@@ -491,17 +1209,19 @@ impl Computed {
             Property::PaddingLeft(length) => {
                 self.padding.left = length.resolve(font_size, root_size);
             }
-            Property::BorderTop(spec) => self.border_top = Some(border_from(*spec)),
-            Property::BorderRight(spec) => self.border_right = Some(border_from(*spec)),
-            Property::BorderBottom(spec) => self.border_bottom = Some(border_from(*spec)),
-            Property::BorderLeft(spec) => self.border_left = Some(border_from(*spec)),
+            Property::BorderTop(spec) => self.border_top = Some(border_from(*spec, self.color)),
+            Property::BorderRight(spec) => self.border_right = Some(border_from(*spec, self.color)),
+            Property::BorderBottom(spec) => {
+                self.border_bottom = Some(border_from(*spec, self.color))
+            }
+            Property::BorderLeft(spec) => self.border_left = Some(border_from(*spec, self.color)),
             Property::Width(length) => {
-                self.width = (!matches!(length, Length::Percent(_)))
-                    .then(|| length.resolve(font_size, root_size).max(0.0));
+                self.width =
+                    (!length.has_percent()).then(|| length.resolve(font_size, root_size).max(0.0));
             }
             Property::Height(length) => {
-                self.height = (!matches!(length, Length::Percent(_)))
-                    .then(|| length.resolve(font_size, root_size).max(0.0));
+                self.height =
+                    (!length.has_percent()).then(|| length.resolve(font_size, root_size).max(0.0));
             }
             Property::Underline(value) => {
                 self.underline = *value;
@@ -513,6 +1233,9 @@ impl Computed {
             }
             Property::PreserveSpace(value) => self.preserve_space = *value,
             Property::Content(content) => self.content = Some(content.clone()),
+            Property::Visibility(visible) => self.hidden = !visible,
+            Property::Float(side) => self.float = Some(*side),
+            Property::VerticalAlign(align) => self.vertical_align = Some(*align),
             Property::BackgroundImage => self.background_image = true,
             Property::FlexDirection(direction) => self.flex_direction = Some(*direction),
             Property::FlexWrap(wrap) => self.flex_wrap = Some(*wrap),
@@ -526,17 +1249,17 @@ impl Computed {
             Property::FlexShrink(shrink) => self.flex_shrink = Some(shrink.max(0.0)),
             Property::FlexBasis(length) => {
                 // 百分比基准要等布局宽度，这里退化成 `auto`。
-                self.flex_basis = (!matches!(length, Length::Percent(_)))
-                    .then(|| length.resolve(font_size, root_size).max(0.0));
+                self.flex_basis =
+                    (!length.has_percent()).then(|| length.resolve(font_size, root_size).max(0.0));
             }
         }
     }
 }
 
-fn border_from(spec: BorderSpec) -> Border {
+fn border_from(spec: BorderSpec, current_color: Option<Color>) -> Border {
     Border {
         width: spec.width,
-        color: spec.color,
+        color: spec.color.or(current_color),
     }
 }
 
@@ -544,13 +1267,13 @@ fn border_from(spec: BorderSpec) -> Border {
 // lightningcss 声明 → 本模块的简化属性
 // ---------------------------------------------------------------------------
 
-fn convert_declarations(block: &DeclarationBlock<'_>) -> Vec<Declaration> {
+fn convert_declarations(block: &DeclarationBlock<'_>, stats: &mut CssStats) -> Vec<Declaration> {
     let mut output = Vec::new();
     for property in &block.declarations {
-        push_serialized(&mut output, property, false);
+        push_serialized(&mut output, property, false, stats);
     }
     for property in &block.important_declarations {
-        push_serialized(&mut output, property, true);
+        push_serialized(&mut output, property, true, stats);
     }
     output
 }
@@ -559,6 +1282,7 @@ fn push_serialized(
     output: &mut Vec<Declaration>,
     property: &lightningcss::properties::Property<'_>,
     important: bool,
+    stats: &mut CssStats,
 ) {
     let Ok(text) = property.to_css_string(false, PrinterOptions::default()) else {
         return;
@@ -568,12 +1292,35 @@ fn push_serialized(
     };
     let name = name.trim().to_ascii_lowercase();
     let value = value.trim();
-    for property in parse_property(&name, value) {
-        output.push(Declaration {
-            property,
-            important,
-        });
+    let custom = name.starts_with("--");
+    let dynamic = has_dynamic_value(value);
+    let properties = if dynamic || custom {
+        Vec::new()
+    } else {
+        parse_property(&name, value)
+    };
+
+    if !custom && !dynamic && properties.is_empty() {
+        *stats
+            .unsupported_declarations
+            .entry(name.clone())
+            .or_default() += 1;
+        return;
     }
+
+    output.push(Declaration {
+        name,
+        value: value.to_string(),
+        important,
+        properties,
+    });
+}
+
+fn has_dynamic_value(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    ["var(", "calc(", "min(", "max(", "clamp(", "currentcolor"]
+        .iter()
+        .any(|needle| lower.contains(needle))
 }
 
 /// 解析行内 `style=""`。
@@ -585,7 +1332,10 @@ pub(crate) fn parse_inline_style(style: &str) -> Vec<Declaration> {
             ..Default::default()
         },
     ) {
-        Ok(block) => convert_declarations(&block),
+        Ok(block) => {
+            let mut stats = CssStats::default();
+            convert_declarations(&block, &mut stats)
+        }
         Err(error) => {
             log::debug!("行内样式解析失败: {error:?}");
             Vec::new()
@@ -694,6 +1444,20 @@ fn parse_property(name: &str, value: &str) -> Vec<Property> {
             "normal" | "nowrap" => vec![Property::PreserveSpace(false)],
             _ => Vec::new(),
         },
+        "visibility" => match value.to_ascii_lowercase().as_str() {
+            "hidden" | "collapse" => vec![Property::Visibility(false)],
+            "visible" => vec![Property::Visibility(true)],
+            _ => Vec::new(),
+        },
+        "float" => match value.to_ascii_lowercase().as_str() {
+            "left" => vec![Property::Float(FloatSide::Left)],
+            "right" => vec![Property::Float(FloatSide::Right)],
+            _ => Vec::new(),
+        },
+        "vertical-align" => parse_vertical_align(value)
+            .map(Property::VerticalAlign)
+            .into_iter()
+            .collect(),
         "content" => parse_content(value)
             .map(Property::Content)
             .into_iter()
@@ -799,6 +1563,16 @@ fn parse_align_self(value: &str) -> Option<AlignSelf> {
         "center" => AlignSelf::Center,
         "baseline" => AlignSelf::Baseline,
         "stretch" | "normal" => AlignSelf::Stretch,
+        _ => return None,
+    })
+}
+
+fn parse_vertical_align(value: &str) -> Option<AlignSelf> {
+    Some(match value.trim().to_ascii_lowercase().as_str() {
+        "top" | "text-top" | "super" => AlignSelf::Start,
+        "middle" => AlignSelf::Center,
+        "bottom" | "text-bottom" | "sub" => AlignSelf::End,
+        "baseline" => AlignSelf::Baseline,
         _ => return None,
     })
 }
@@ -956,10 +1730,8 @@ fn parse_line_height(value: &str) -> Option<LineHeight> {
 fn parse_display(value: &str) -> Option<Display> {
     match value.trim().to_ascii_lowercase().as_str() {
         "none" => Some(Display::None),
-        // 没有真正的行内块布局，按行内处理才能保持文字流。
-        "inline" | "inline-block" | "inline-flex" | "inline-grid" | "contents" => {
-            Some(Display::Inline)
-        }
+        "inline" | "inline-flex" | "inline-grid" | "contents" => Some(Display::Inline),
+        "inline-block" => Some(Display::InlineBlock),
         "flex" => Some(Display::Flex),
         "block" | "grid" | "list-item" | "table" | "table-row" | "table-cell" | "table-caption" => {
             Some(Display::Block)
@@ -1078,6 +1850,13 @@ pub(crate) fn parse_length(value: &str) -> Option<Length> {
     if value.is_empty() || value == "auto" || value == "initial" {
         return None;
     }
+    if value.starts_with("calc(")
+        || value.starts_with("min(")
+        || value.starts_with("max(")
+        || value.starts_with("clamp(")
+    {
+        return parse_math_length(&value);
+    }
     if value == "0" {
         return Some(Length::Px(0.0));
     }
@@ -1093,8 +1872,321 @@ pub(crate) fn parse_length(value: &str) -> Option<Length> {
         "in" => Length::Px(number * 96.0),
         "cm" => Length::Px(number * 96.0 / 2.54),
         "mm" => Length::Px(number * 96.0 / 25.4),
+        "q" => Length::Px(number * 96.0 / 101.6),
+        "vw" => Length::Vw(number),
+        "vh" => Length::Vh(number),
+        "vmin" => Length::Vmin(number),
+        "vmax" => Length::Vmax(number),
+        "ch" => Length::Ch(number),
+        "lh" => Length::Lh(number),
         _ => return None,
     })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MathValue {
+    px: f32,
+    percent: f32,
+    unitless: bool,
+}
+
+impl MathValue {
+    fn add(self, other: Self) -> Option<Self> {
+        if self.unitless && other.unitless {
+            return Some(Self {
+                px: self.px + other.px,
+                percent: 0.0,
+                unitless: true,
+            });
+        }
+        if self.unitless || other.unitless {
+            let scalar = if self.unitless { self.px } else { other.px };
+            if scalar.abs() > f32::EPSILON {
+                return None;
+            }
+        }
+        Some(Self {
+            px: self.px + other.px,
+            percent: self.percent + other.percent,
+            unitless: false,
+        })
+    }
+
+    fn sub(self, other: Self) -> Option<Self> {
+        self.add(Self {
+            px: -other.px,
+            percent: -other.percent,
+            unitless: other.unitless,
+        })
+    }
+
+    fn mul(self, other: Self) -> Option<Self> {
+        if self.unitless {
+            return Some(Self {
+                px: other.px * self.px,
+                percent: other.percent * self.px,
+                unitless: other.unitless,
+            });
+        }
+        if other.unitless {
+            return Some(Self {
+                px: self.px * other.px,
+                percent: self.percent * other.px,
+                unitless: self.unitless,
+            });
+        }
+        None
+    }
+
+    fn div(self, other: Self) -> Option<Self> {
+        if !other.unitless || other.px.abs() < f32::EPSILON {
+            return None;
+        }
+        Some(Self {
+            px: self.px / other.px,
+            percent: self.percent / other.px,
+            unitless: self.unitless,
+        })
+    }
+
+    fn length(self) -> Length {
+        if self.percent.abs() < f32::EPSILON {
+            Length::Px(self.px)
+        } else if self.px.abs() < f32::EPSILON {
+            Length::Percent(self.percent)
+        } else {
+            Length::Calc {
+                px: self.px,
+                percent: self.percent,
+            }
+        }
+    }
+}
+
+fn parse_math_length(value: &str) -> Option<Length> {
+    let mut parser = MathParser {
+        input: value.as_bytes(),
+        pos: 0,
+    };
+    let result = parser.expression()?;
+    parser.skip_space();
+    if parser.pos != parser.input.len() {
+        return None;
+    }
+    Some(result.length())
+}
+
+struct MathParser<'a> {
+    input: &'a [u8],
+    pos: usize,
+}
+
+impl MathParser<'_> {
+    fn skip_space(&mut self) {
+        while self
+            .input
+            .get(self.pos)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&mut self) -> Option<u8> {
+        self.skip_space();
+        self.input.get(self.pos).copied()
+    }
+
+    fn expression(&mut self) -> Option<MathValue> {
+        let mut value = self.term()?;
+        loop {
+            match self.peek() {
+                Some(b'+') => {
+                    self.pos += 1;
+                    value = value.add(self.term()?)?;
+                }
+                Some(b'-') => {
+                    self.pos += 1;
+                    value = value.sub(self.term()?)?;
+                }
+                _ => return Some(value),
+            }
+        }
+    }
+
+    fn term(&mut self) -> Option<MathValue> {
+        let mut value = self.factor()?;
+        loop {
+            match self.peek() {
+                Some(b'*') => {
+                    self.pos += 1;
+                    value = value.mul(self.factor()?)?;
+                }
+                Some(b'/') => {
+                    self.pos += 1;
+                    value = value.div(self.factor()?)?;
+                }
+                _ => return Some(value),
+            }
+        }
+    }
+
+    fn factor(&mut self) -> Option<MathValue> {
+        self.skip_space();
+        match self.peek()? {
+            b'+' => {
+                self.pos += 1;
+                self.factor()
+            }
+            b'-' => {
+                self.pos += 1;
+                self.factor().map(|value| MathValue {
+                    px: -value.px,
+                    percent: -value.percent,
+                    unitless: value.unitless,
+                })
+            }
+            b'(' => {
+                self.pos += 1;
+                let value = self.expression()?;
+                self.skip_space();
+                (self.peek()? == b')').then(|| {
+                    self.pos += 1;
+                    value
+                })
+            }
+            byte if byte.is_ascii_digit() || byte == b'.' => self.number(),
+            byte if byte.is_ascii_alphabetic() => self.function(),
+            _ => None,
+        }
+    }
+
+    fn number(&mut self) -> Option<MathValue> {
+        let start = self.pos;
+        while let Some(byte) = self.input.get(self.pos) {
+            if byte.is_ascii_alphanumeric() || *byte == b'.' || *byte == b'%' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        let token = std::str::from_utf8(&self.input[start..self.pos]).ok()?;
+        if let Ok(number) = token.parse::<f32>() {
+            return Some(MathValue {
+                px: number,
+                percent: 0.0,
+                unitless: true,
+            });
+        }
+        let length = parse_length(token)?;
+        Some(match length {
+            Length::Percent(value) => MathValue {
+                px: 0.0,
+                percent: value,
+                unitless: false,
+            },
+            Length::Vw(value) => MathValue {
+                px: value * VIEWPORT_WIDTH / 100.0,
+                percent: 0.0,
+                unitless: false,
+            },
+            Length::Vh(value) => MathValue {
+                px: value * VIEWPORT_HEIGHT / 100.0,
+                percent: 0.0,
+                unitless: false,
+            },
+            Length::Vmin(value) => MathValue {
+                px: value * VIEWPORT_WIDTH.min(VIEWPORT_HEIGHT) / 100.0,
+                percent: 0.0,
+                unitless: false,
+            },
+            Length::Vmax(value) => MathValue {
+                px: value * VIEWPORT_WIDTH.max(VIEWPORT_HEIGHT) / 100.0,
+                percent: 0.0,
+                unitless: false,
+            },
+            // calc() 里用相对单位需要真实父字号/行高，留到布局阶段；先不支持。
+            Length::Em(_) | Length::Rem(_) | Length::Ex(_) | Length::Ch(_) | Length::Lh(_) => {
+                return None;
+            }
+            other => MathValue {
+                px: other.resolve(ROOT_SIZE, ROOT_SIZE),
+                percent: 0.0,
+                unitless: false,
+            },
+        })
+    }
+
+    fn function(&mut self) -> Option<MathValue> {
+        let start = self.pos;
+        while self
+            .input
+            .get(self.pos)
+            .is_some_and(|byte| byte.is_ascii_alphabetic())
+        {
+            self.pos += 1;
+        }
+        let name = std::str::from_utf8(&self.input[start..self.pos]).ok()?;
+        self.skip_space();
+        if self.peek()? != b'(' {
+            return None;
+        }
+        self.pos += 1;
+
+        if name == "calc" {
+            let value = self.expression()?;
+            self.skip_space();
+            (self.peek()? == b')').then(|| {
+                self.pos += 1;
+                value
+            })
+        } else if name == "min" || name == "max" || name == "clamp" {
+            let mut values = Vec::new();
+            loop {
+                values.push(self.expression()?);
+                match self.peek()? {
+                    b',' => self.pos += 1,
+                    b')' => {
+                        self.pos += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            let mut result = *values.first()?;
+            let has_percent = values
+                .iter()
+                .any(|value| value.percent.abs() > f32::EPSILON);
+            let has_px = values.iter().any(|value| value.px.abs() > f32::EPSILON);
+            if has_percent && has_px {
+                return None;
+            }
+            if name == "clamp" && values.len() == 3 {
+                let min = values[0];
+                let preferred = values[1];
+                let max = values[2];
+                result = if preferred.px < min.px {
+                    min
+                } else {
+                    preferred
+                };
+                result = if result.px > max.px { max } else { result };
+                return Some(result);
+            }
+            for value in values.into_iter().skip(1) {
+                result = if name == "min" {
+                    if value.px < result.px { value } else { result }
+                } else if value.px > result.px {
+                    value
+                } else {
+                    result
+                };
+            }
+            Some(result)
+        } else {
+            None
+        }
+    }
 }
 
 fn split_number(value: &str) -> Option<(f32, &str)> {
@@ -1138,7 +2230,66 @@ pub(crate) fn parse_color(value: &str) -> Option<Color> {
     if lower.starts_with("rgb") {
         return parse_rgb(&lower);
     }
+    if lower.starts_with("hsl") {
+        return parse_hsl(&lower);
+    }
     named_color(&lower)
+}
+
+fn parse_hsl(value: &str) -> Option<Color> {
+    let open = value.find('(')?;
+    let close = value.rfind(')')?;
+    let parts: Vec<&str> = value[open + 1..close]
+        .split([',', '/'])
+        .flat_map(str::split_whitespace)
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.len() < 3 {
+        return None;
+    }
+
+    let hue = parts[0]
+        .trim_end_matches("deg")
+        .trim_end_matches("grad")
+        .parse::<f32>()
+        .ok()?;
+    let hue = ((hue % 360.0) + 360.0) % 360.0;
+    let saturation = percentage(parts[1])?;
+    let lightness = percentage(parts[2])?;
+    let alpha = match parts.get(3) {
+        Some(part) => (percentage(part)? * 255.0).round() as u8,
+        None => 255,
+    };
+
+    let (red, green, blue) = hsl_to_rgb(hue, saturation, lightness);
+    Some(Color::rgba(red, green, blue, alpha))
+}
+
+fn percentage(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if let Some(value) = value.strip_suffix('%') {
+        return Some(value.trim().parse::<f32>().ok()? / 100.0);
+    }
+    value.parse::<f32>().ok()
+}
+
+fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> (u8, u8, u8) {
+    let saturation = saturation.clamp(0.0, 1.0);
+    let lightness = lightness.clamp(0.0, 1.0);
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let segment = hue / 60.0;
+    let x = chroma * (1.0 - (segment % 2.0 - 1.0).abs());
+    let (red, green, blue) = match segment as u32 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+    let m = lightness - chroma / 2.0;
+    let channel = |value: f32| ((value + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    (channel(red), channel(green), channel(blue))
 }
 
 fn parse_hex_color(hex: &str) -> Option<Color> {
@@ -1239,14 +2390,119 @@ fn named_color(name: &str) -> Option<Color> {
         "darkgray" | "darkgrey" => Color::rgb(169, 169, 169),
         "lightgray" | "lightgrey" => Color::rgb(211, 211, 211),
         "dimgray" | "dimgrey" => Color::rgb(105, 105, 105),
-        "beige" => Color::rgb(245, 245, 220),
-        "ivory" => Color::rgb(255, 255, 240),
-        "darkolivegreen" => Color::rgb(85, 107, 47),
-        "linen" => Color::rgb(250, 240, 230),
+        "aliceblue" => Color::rgb(240, 248, 255),
         "antiquewhite" => Color::rgb(250, 235, 215),
-        "saddlebrown" => Color::rgb(139, 69, 19),
+        "aquamarine" => Color::rgb(127, 255, 212),
+        "azure" => Color::rgb(240, 255, 255),
+        "beige" => Color::rgb(245, 245, 220),
+        "bisque" => Color::rgb(255, 228, 196),
+        "blanchedalmond" => Color::rgb(255, 235, 205),
+        "blueviolet" => Color::rgb(138, 43, 226),
+        "burlywood" => Color::rgb(222, 184, 135),
+        "cadetblue" => Color::rgb(95, 158, 160),
+        "chartreuse" => Color::rgb(127, 255, 0),
+        "chocolate" => Color::rgb(210, 105, 30),
+        "coral" => Color::rgb(255, 127, 80),
+        "cornflowerblue" => Color::rgb(100, 149, 237),
+        "cornsilk" => Color::rgb(255, 248, 220),
+        "crimson" => Color::rgb(220, 20, 60),
+        "darkcyan" => Color::rgb(0, 139, 139),
+        "darkgoldenrod" => Color::rgb(184, 134, 11),
+        "darkkhaki" => Color::rgb(189, 183, 107),
+        "darkmagenta" => Color::rgb(139, 0, 139),
+        "darkolivegreen" => Color::rgb(85, 107, 47),
+        "darkorange" => Color::rgb(255, 140, 0),
+        "darkorchid" => Color::rgb(153, 50, 204),
+        "darksalmon" => Color::rgb(233, 150, 122),
+        "darkseagreen" => Color::rgb(143, 188, 143),
+        "darkslateblue" => Color::rgb(72, 61, 139),
+        "darkslategray" | "darkslategrey" => Color::rgb(47, 79, 79),
+        "darkturquoise" => Color::rgb(0, 206, 209),
+        "darkviolet" => Color::rgb(148, 0, 211),
+        "deeppink" => Color::rgb(255, 20, 147),
+        "deepskyblue" => Color::rgb(0, 191, 255),
+        "dodgerblue" => Color::rgb(30, 144, 255),
+        "firebrick" => Color::rgb(178, 34, 34),
+        "floralwhite" => Color::rgb(255, 250, 240),
+        "forestgreen" => Color::rgb(34, 139, 34),
+        "gainsboro" => Color::rgb(220, 220, 220),
+        "ghostwhite" => Color::rgb(248, 248, 255),
+        "goldenrod" => Color::rgb(218, 165, 32),
+        "greenyellow" => Color::rgb(173, 255, 47),
+        "honeydew" => Color::rgb(240, 255, 240),
+        "hotpink" => Color::rgb(255, 105, 180),
+        "indianred" => Color::rgb(205, 92, 92),
+        "indigo" => Color::rgb(75, 0, 130),
+        "ivory" => Color::rgb(255, 255, 240),
+        "khaki" => Color::rgb(240, 230, 140),
+        "lavender" => Color::rgb(230, 230, 250),
+        "lavenderblush" => Color::rgb(255, 240, 245),
+        "lawngreen" => Color::rgb(124, 252, 0),
+        "lemonchiffon" => Color::rgb(255, 250, 205),
+        "lightblue" => Color::rgb(173, 216, 230),
+        "lightcoral" => Color::rgb(240, 128, 128),
+        "lightcyan" => Color::rgb(224, 255, 255),
+        "lightgoldenrodyellow" => Color::rgb(250, 250, 210),
+        "lightgreen" => Color::rgb(144, 238, 144),
+        "lightpink" => Color::rgb(255, 182, 193),
+        "lightsalmon" => Color::rgb(255, 160, 122),
+        "lightseagreen" => Color::rgb(32, 178, 170),
+        "lightskyblue" => Color::rgb(135, 206, 250),
+        "lightslategray" | "lightslategrey" => Color::rgb(119, 136, 153),
+        "lightsteelblue" => Color::rgb(176, 196, 222),
+        "lightyellow" => Color::rgb(255, 255, 224),
+        "limegreen" => Color::rgb(50, 205, 50),
+        "linen" => Color::rgb(250, 240, 230),
+        "mediumaquamarine" => Color::rgb(102, 205, 170),
+        "mediumblue" => Color::rgb(0, 0, 205),
+        "mediumorchid" => Color::rgb(186, 85, 211),
+        "mediumpurple" => Color::rgb(147, 112, 219),
+        "mediumseagreen" => Color::rgb(60, 179, 113),
+        "mediumslateblue" => Color::rgb(123, 104, 238),
+        "mediumspringgreen" => Color::rgb(0, 250, 154),
+        "mediumturquoise" => Color::rgb(72, 209, 204),
+        "mediumvioletred" => Color::rgb(199, 21, 133),
+        "midnightblue" => Color::rgb(25, 25, 112),
+        "mintcream" => Color::rgb(245, 255, 250),
+        "mistyrose" => Color::rgb(255, 228, 225),
+        "moccasin" => Color::rgb(255, 228, 181),
+        "navajowhite" => Color::rgb(255, 222, 173),
         "oldlace" => Color::rgb(253, 245, 230),
+        "olivedrab" => Color::rgb(107, 142, 35),
+        "orangered" => Color::rgb(255, 69, 0),
+        "orchid" => Color::rgb(218, 112, 214),
+        "palegoldenrod" => Color::rgb(238, 232, 170),
+        "palegreen" => Color::rgb(152, 251, 152),
+        "paleturquoise" => Color::rgb(175, 238, 238),
+        "palevioletred" => Color::rgb(219, 112, 147),
+        "papayawhip" => Color::rgb(255, 239, 213),
+        "peachpuff" => Color::rgb(255, 218, 185),
+        "peru" => Color::rgb(205, 133, 63),
+        "plum" => Color::rgb(221, 160, 221),
+        "powderblue" => Color::rgb(176, 224, 230),
+        "rebeccapurple" => Color::rgb(102, 51, 153),
+        "rosybrown" => Color::rgb(188, 143, 143),
+        "royalblue" => Color::rgb(65, 105, 225),
+        "saddlebrown" => Color::rgb(139, 69, 19),
+        "salmon" => Color::rgb(250, 128, 114),
+        "sandybrown" => Color::rgb(244, 164, 96),
+        "seagreen" => Color::rgb(46, 139, 87),
+        "seashell" => Color::rgb(255, 245, 238),
         "sienna" => Color::rgb(160, 82, 45),
+        "skyblue" => Color::rgb(135, 206, 235),
+        "slateblue" => Color::rgb(106, 90, 205),
+        "slategray" | "slategrey" => Color::rgb(112, 128, 144),
+        "snow" => Color::rgb(255, 250, 250),
+        "springgreen" => Color::rgb(0, 255, 127),
+        "steelblue" => Color::rgb(70, 130, 180),
+        "tan" => Color::rgb(210, 180, 140),
+        "thistle" => Color::rgb(216, 191, 216),
+        "tomato" => Color::rgb(255, 99, 71),
+        "turquoise" => Color::rgb(64, 224, 208),
+        "violet" => Color::rgb(238, 130, 238),
+        "wheat" => Color::rgb(245, 222, 179),
+        "whitesmoke" => Color::rgb(245, 245, 245),
+        "yellowgreen" => Color::rgb(154, 205, 50),
         "currentcolor" => return None,
         _ => return None,
     })
@@ -1536,12 +2792,12 @@ mod tests {
     }
 
     #[test]
-    fn inline_block_stays_inline() {
+    fn inline_block_is_an_atomic_inline_box() {
         let sheet = Stylesheet::parse(".target { display: inline-block; }");
         let (_doc, element) = document(r#"<span class="target">x</span>"#);
         assert_eq!(
             computed_for(&sheet, &element, None).display,
-            Some(Display::Inline)
+            Some(Display::InlineBlock)
         );
     }
 
@@ -1677,5 +2933,146 @@ mod tests {
         );
         assert_eq!(parse_color("gray"), Some(Color::rgb(128, 128, 128)));
         assert_eq!(parse_color("teal"), Some(Color::rgb(0, 128, 128)));
+        assert_eq!(
+            parse_color("hsl(0, 100%, 50%)"),
+            Some(Color::rgb(255, 0, 0))
+        );
+        assert_eq!(
+            parse_color("hsl(120 100% 25%)"),
+            Some(Color::rgb(0, 128, 0))
+        );
+    }
+
+    #[test]
+    fn media_rules_use_the_dictionary_viewport() {
+        let sheet = Stylesheet::parse(
+            ".target { color: red; }
+             @media (min-width: 400px) { .target { color: blue; } }
+             @media (max-width: 100px) { .target { color: lime; } }",
+        );
+        let (_doc, element) = document(r#"<span class="target">x</span>"#);
+        assert_eq!(
+            computed_for(&sheet, &element, None).color,
+            Some(Color::rgb(0, 0, 255))
+        );
+    }
+
+    #[test]
+    fn supports_rules_are_evaluated() {
+        let sheet = Stylesheet::parse(
+            ".target { color: red; }
+             @supports (display: flex) { .target { color: blue; } }
+             @supports (grid-template-columns: 1fr) { .target { color: lime; } }",
+        );
+        let (_doc, element) = document(r#"<span class="target">x</span>"#);
+        assert_eq!(
+            computed_for(&sheet, &element, None).color,
+            Some(Color::rgb(0, 0, 255))
+        );
+    }
+
+    #[test]
+    fn layer_rules_are_flattened_in_order() {
+        let sheet = Stylesheet::parse(
+            ".target { color: red; }
+             @layer base { .target { color: blue; } }",
+        );
+        let (_doc, element) = document(r#"<span class="target">x</span>"#);
+        assert_eq!(
+            computed_for(&sheet, &element, None).color,
+            Some(Color::rgb(0, 0, 255))
+        );
+    }
+
+    #[test]
+    fn variables_inherit_and_support_fallbacks() {
+        let sheet = Stylesheet::parse(
+            "html { --brand: #123456; }
+             .target {
+                 color: var(--brand);
+                 font-size: var(--missing, 14px);
+                 border-bottom: 1px solid var(--brand);
+             }",
+        );
+        let document =
+            kuchiki::parse_html().one(r#"<html><body><span class="target">x</span></body></html>"#);
+        let root = document.select_first("html").unwrap();
+        let mut root_style = Computed::default();
+        root_style.apply(&sheet.matched(&root), &[], ROOT_SIZE);
+
+        let target = document.select_first(".target").unwrap();
+        let mut style = Computed::inherited(&root_style);
+        style.apply(&sheet.matched(&target), &[], ROOT_SIZE);
+
+        assert_eq!(style.color, Some(Color::rgb(0x12, 0x34, 0x56)));
+        assert_eq!(style.size, Some(14.0));
+        assert_eq!(
+            style.border_bottom.and_then(|border| border.color),
+            Some(Color::rgb(0x12, 0x34, 0x56))
+        );
+    }
+
+    #[test]
+    fn calc_min_max_and_clamp_are_evaluated() {
+        let sheet = Stylesheet::parse(
+            ".target {
+                 font-size: calc(10px + 2px);
+                 width: min(100px, 200px);
+                 height: clamp(10px, 50px, 30px);
+             }",
+        );
+        let (_doc, element) = document(r#"<span class="target">x</span>"#);
+        let style = computed_for(&sheet, &element, None);
+        assert_eq!(style.size, Some(12.0));
+        assert_eq!(style.width, Some(100.0));
+        assert_eq!(style.height, Some(30.0));
+    }
+
+    #[test]
+    fn current_color_resolves_against_the_computed_color() {
+        let sheet = Stylesheet::parse(
+            ".target { color: rgb(255, 0, 0); border-bottom: 2px solid currentColor; }",
+        );
+        let (_doc, element) = document(r#"<span class="target">x</span>"#);
+        let style = computed_for(&sheet, &element, None);
+        assert_eq!(
+            style.border_bottom.and_then(|border| border.color),
+            Some(Color::rgb(255, 0, 0))
+        );
+    }
+
+    #[test]
+    fn visibility_hidden_can_be_overridden() {
+        let sheet = Stylesheet::parse(
+            ".target { visibility: hidden; }
+             .target span { visibility: visible; }",
+        );
+        let document = kuchiki::parse_html()
+            .one(r#"<html><body><div class="target"><span>x</span></div></body></html>"#);
+        let target = document.select_first(".target").unwrap();
+        let parent = Computed::default();
+        let mut parent_style = Computed::inherited(&parent);
+        parent_style.apply(&sheet.matched(&target), &[], ROOT_SIZE);
+        assert!(parent_style.hidden);
+
+        let child = document.select_first(".target span").unwrap();
+        let mut child_style = Computed::inherited(&parent_style);
+        child_style.apply(&sheet.matched(&child), &[], ROOT_SIZE);
+        assert!(!child_style.hidden);
+    }
+
+    #[test]
+    fn stats_count_unsupported_properties_and_at_rules() {
+        let sheet = Stylesheet::parse(
+            "@media screen { .target { float: left; letter-spacing: 1px; color: var(--c); } }",
+        );
+        let stats = sheet.stats();
+        assert_eq!(stats.at_rules.get("media"), Some(&1));
+        assert!(!stats.unsupported_declarations.contains_key("float"));
+        assert_eq!(
+            stats.unsupported_declarations.get("letter-spacing"),
+            Some(&1)
+        );
+        assert!(!stats.unsupported_declarations.contains_key("color"));
     }
 }

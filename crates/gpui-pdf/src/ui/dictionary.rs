@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use dict_core::{
     Align, AlignItems, AlignSelf, Block, BlockKind, BlockStyle, Color as DictColor, Container,
-    DictEntry, FlexDirection, FlexWrap, ImageFormat as DictImageFormat, ImageSpan, Justify,
-    LinkTarget, Paragraph, Span, SpanStyle, Table, TableCell,
+    DictEntry, FlexDirection, FlexWrap, FloatSide, ImageFormat as DictImageFormat, ImageSpan,
+    InlineBox, Justify, LinkTarget, Paragraph, Span, SpanStyle, Table, TableCell,
 };
 use gpui::{
     AnyElement, Context, Div, ElementId, Entity, Font, FontFallbacks, FontFeatures, FontStyle,
@@ -306,8 +306,13 @@ impl Render for DictionaryWindow {
                 } else if view.entries.is_empty() {
                     body = body.child(muted("双击 PDF 中的单词或汉字开始查词", &theme));
                 } else {
-                    for entry in &view.entries {
-                        body = body.child(entry_element(entry, &theme, &self.lookup));
+                    for (entry_index, entry) in view.entries.iter().enumerate() {
+                        body = body.child(entry_element(
+                            entry,
+                            &theme,
+                            &self.lookup,
+                            mix_seed(0x9e37_79b9_7f4a_7c15, entry_index),
+                        ));
                     }
                 }
 
@@ -577,7 +582,7 @@ impl DictionaryWindow {
     }
 }
 
-fn entry_element(entry: &DictEntry, theme: &Theme, lookup: &LookupSender) -> Div {
+fn entry_element(entry: &DictEntry, theme: &Theme, lookup: &LookupSender, seed: u64) -> Div {
     let mut column = div().flex().flex_col().mb(px(12.)).min_w(px(0.)).w_full();
 
     if let Some(source) = &entry.source {
@@ -623,25 +628,35 @@ fn entry_element(entry: &DictEntry, theme: &Theme, lookup: &LookupSender) -> Div
     if entry.blocks.is_empty() {
         column = column.child(px_gap(4.)).child(muted("（无释义）", theme));
     } else {
-        for block in &entry.blocks {
-            column = column.child(block_element(block, theme, lookup));
+        for (block_index, block) in entry.blocks.iter().enumerate() {
+            column = column.child(block_element(
+                block,
+                theme,
+                lookup,
+                mix_seed(seed, block_index),
+            ));
         }
     }
 
     column
 }
 
-fn block_element(block: &Block, theme: &Theme, lookup: &LookupSender) -> AnyElement {
+fn block_element(block: &Block, theme: &Theme, lookup: &LookupSender, seed: u64) -> AnyElement {
     match block {
-        Block::Paragraph(paragraph) => paragraph_element(paragraph, theme, lookup),
-        Block::Table(table) => table_element(table, theme, lookup).into_any_element(),
+        Block::Paragraph(paragraph) => paragraph_element(paragraph, theme, lookup, seed),
+        Block::Table(table) => table_element(table, theme, lookup, seed).into_any_element(),
         Block::Container(container) => {
-            container_element(container, theme, lookup).into_any_element()
+            container_element(container, theme, lookup, seed).into_any_element()
         }
     }
 }
 
-fn paragraph_element(paragraph: &Paragraph, theme: &Theme, lookup: &LookupSender) -> AnyElement {
+fn paragraph_element(
+    paragraph: &Paragraph,
+    theme: &Theme,
+    lookup: &LookupSender,
+    seed: u64,
+) -> AnyElement {
     let style = &paragraph.style;
     if paragraph.kind == BlockKind::Rule {
         return div()
@@ -681,6 +696,10 @@ fn paragraph_element(paragraph: &Paragraph, theme: &Theme, lookup: &LookupSender
         .line_height(relative(style.line_height.unwrap_or(1.55)))
         .text_align(align);
 
+    if matches!(style.float, Some(FloatSide::Right)) {
+        element = element.justify_end();
+    }
+
     if paragraph.kind == BlockKind::Quote {
         element = element
             .pl(px(style.padding.left + style.indent + 8.0))
@@ -703,10 +722,10 @@ fn paragraph_element(paragraph: &Paragraph, theme: &Theme, lookup: &LookupSender
         .iter()
         .any(|span| matches!(span, Span::Image(_)));
     if has_image || needs_chunk_layout(paragraph) {
-        for span in &paragraph.spans {
+        for (span_index, span) in paragraph.spans.iter().enumerate() {
             match span {
                 Span::Text(text) => {
-                    for chunk in wrap_chunks(&text.text) {
+                    for (chunk_index, chunk) in wrap_chunks(&text.text).into_iter().enumerate() {
                         element = element.child(chunk_element(
                             chunk,
                             &text.style,
@@ -714,11 +733,21 @@ fn paragraph_element(paragraph: &Paragraph, theme: &Theme, lookup: &LookupSender
                             color,
                             &block_font,
                             theme,
+                            lookup,
+                            mix_seed(mix_seed(seed, span_index), chunk_index),
                         ));
                     }
                 }
                 Span::Image(image) => {
                     element = element.child(image_element(image));
+                }
+                Span::Box(inline) => {
+                    element = element.child(inline_box_element(
+                        inline,
+                        theme,
+                        lookup,
+                        mix_seed(seed, span_index),
+                    ));
                 }
             }
         }
@@ -751,7 +780,7 @@ fn paragraph_element(paragraph: &Paragraph, theme: &Theme, lookup: &LookupSender
             let content: AnyElement = if links.is_empty() {
                 styled.into_any_element()
             } else {
-                link_text(&text, styled, links, lookup)
+                link_text(&text, styled, links, lookup, seed)
             };
             element = element.child(div().flex_1().min_w(px(0.)).child(content));
         }
@@ -762,10 +791,11 @@ fn paragraph_element(paragraph: &Paragraph, theme: &Theme, lookup: &LookupSender
 
 /// 把带链接的文本包成 `InteractiveText`：悬停变手型，点击查词或开浏览器。
 fn link_text(
-    text: &str,
+    _text: &str,
     styled: StyledText,
     links: Vec<(std::ops::Range<usize>, &LinkTarget)>,
     lookup: &LookupSender,
+    seed: u64,
 ) -> AnyElement {
     let mut ranges = Vec::with_capacity(links.len());
     let mut targets = Vec::with_capacity(links.len());
@@ -774,46 +804,45 @@ fn link_text(
         targets.push(target.clone());
     }
     let lookup = lookup.clone();
-    InteractiveText::new(
-        ElementId::NamedInteger("dict-link".into(), hash_text(text)),
-        styled,
-    )
-    .on_click(ranges, move |index, _window, cx| {
-        let Some(target) = targets.get(index) else {
-            return;
-        };
-        match target {
-            LinkTarget::Entry(term) => {
-                if lookup
-                    .unbounded_send(DictRequest::Lookup(term.clone()))
-                    .is_err()
-                {
-                    log::warn!("dictionary lookup channel closed");
+    InteractiveText::new(ElementId::NamedInteger("dict-link".into(), seed), styled)
+        .on_click(ranges, move |index, _window, cx| {
+            let Some(target) = targets.get(index) else {
+                return;
+            };
+            match target {
+                LinkTarget::Entry(term) => {
+                    if lookup
+                        .unbounded_send(DictRequest::Lookup(term.clone()))
+                        .is_err()
+                    {
+                        log::warn!("dictionary lookup channel closed");
+                    }
                 }
+                LinkTarget::Uri(uri) => cx.open_url(uri),
             }
-            LinkTarget::Uri(uri) => cx.open_url(uri),
-        }
-    })
-    .into_any_element()
+        })
+        .into_any_element()
 }
 
-/// 元素 id 只需要在同一个窗口内唯一；用正文内容做哈希足够区分不同段落。
-fn hash_text(text: &str) -> u64 {
+/// 把父节点的稳定种子和子节点下标混成一个新种子，保证同一窗口内 id 唯一。
+fn mix_seed(seed: u64, index: usize) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut hasher);
+    seed.hash(&mut hasher);
+    index.hash(&mut hasher);
     hasher.finish()
 }
 
-fn table_element(table: &Table, theme: &Theme, lookup: &LookupSender) -> Div {
+fn table_element(table: &Table, theme: &Theme, lookup: &LookupSender, seed: u64) -> Div {
     let mut root = div().flex().flex_col().w_full().min_w(px(0.));
     root = root
         .mt(px(table.style.margin_top.unwrap_or(6.0)))
         .mb(px(table.style.margin_bottom.unwrap_or(0.0)));
     root = styled_box(root, &table.style, theme);
 
-    for row in &table.rows {
+    for (row_index, row) in table.rows.iter().enumerate() {
+        let row_seed = mix_seed(seed, row_index);
         let mut row_element = div()
             .flex()
             .flex_row()
@@ -823,8 +852,13 @@ fn table_element(table: &Table, theme: &Theme, lookup: &LookupSender) -> Div {
             .mt(px(row.style.margin_top.unwrap_or(0.0)))
             .mb(px(row.style.margin_bottom.unwrap_or(0.0)));
         row_element = styled_box(row_element, &row.style, theme);
-        for cell in &row.cells {
-            row_element = row_element.child(cell_element(cell, theme, lookup));
+        for (cell_index, cell) in row.cells.iter().enumerate() {
+            row_element = row_element.child(cell_element(
+                cell,
+                theme,
+                lookup,
+                mix_seed(row_seed, cell_index),
+            ));
         }
         root = root.child(row_element);
     }
@@ -832,7 +866,7 @@ fn table_element(table: &Table, theme: &Theme, lookup: &LookupSender) -> Div {
     root
 }
 
-fn cell_element(cell: &TableCell, theme: &Theme, lookup: &LookupSender) -> Div {
+fn cell_element(cell: &TableCell, theme: &Theme, lookup: &LookupSender, seed: u64) -> Div {
     let mut style = cell.style.clone();
     style.padding.top += 3.0;
     style.padding.bottom += 3.0;
@@ -862,14 +896,24 @@ fn cell_element(cell: &TableCell, theme: &Theme, lookup: &LookupSender) -> Div {
         element = element.text_align(text_align(align));
     }
 
-    for block in &cell.blocks {
-        element = element.child(block_element(block, theme, lookup));
+    for (block_index, block) in cell.blocks.iter().enumerate() {
+        element = element.child(block_element(
+            block,
+            theme,
+            lookup,
+            mix_seed(seed, block_index),
+        ));
     }
     element
 }
 
 /// `display: flex` 容器：直接映射到 GPUI 的 flex 布局。
-fn container_element(container: &Container, theme: &Theme, lookup: &LookupSender) -> Div {
+fn container_element(
+    container: &Container,
+    theme: &Theme,
+    lookup: &LookupSender,
+    seed: u64,
+) -> Div {
     let flex = container.flex;
     let is_row = flex.direction.is_row();
 
@@ -914,7 +958,8 @@ fn container_element(container: &Container, theme: &Theme, lookup: &LookupSender
         item.style.grow.is_some() || item.style.width.is_some() || item.style.basis.is_some()
     });
 
-    for item in &container.items {
+    for (item_index, item) in container.items.iter().enumerate() {
+        let item_seed = mix_seed(seed, item_index);
         let mut element = div().flex().flex_col().min_w(px(0.));
         if let Some(grow) = item.style.grow {
             element = element.flex_grow(grow);
@@ -948,8 +993,13 @@ fn container_element(container: &Container, theme: &Theme, lookup: &LookupSender
             .font(make_font(item.style.family.as_deref(), theme))
             .line_height(relative(item.style.line_height.unwrap_or(1.55)));
 
-        for block in &item.blocks {
-            element = element.child(block_element(block, theme, lookup));
+        for (block_index, block) in item.blocks.iter().enumerate() {
+            element = element.child(block_element(
+                block,
+                theme,
+                lookup,
+                mix_seed(item_seed, block_index),
+            ));
         }
         root = root.child(element);
     }
@@ -964,7 +1014,9 @@ fn chunk_element(
     block_color: Hsla,
     block_font: &Font,
     theme: &Theme,
-) -> Div {
+    lookup: &LookupSender,
+    seed: u64,
+) -> AnyElement {
     let size = style.size.unwrap_or(block_size);
     let color = span_color(style, block_color, theme);
     let font = span_font(style, block_font, theme);
@@ -986,7 +1038,32 @@ fn chunk_element(
     if let Some(background) = style.background {
         element = element.text_bg(hsla(background));
     }
-    element.child(chunk)
+    let element = element.child(chunk.clone());
+
+    match &style.link {
+        Some(target) => {
+            let lookup = lookup.clone();
+            let target = target.clone();
+            element
+                .id(ElementId::NamedInteger("dict-chunk-link".into(), seed))
+                .cursor_pointer()
+                .on_click(
+                    move |_event: &gpui::ClickEvent, _window, cx| match &target {
+                        LinkTarget::Entry(term) => {
+                            if lookup
+                                .unbounded_send(DictRequest::Lookup(term.clone()))
+                                .is_err()
+                            {
+                                log::warn!("dictionary lookup channel closed");
+                            }
+                        }
+                        LinkTarget::Uri(uri) => cx.open_url(uri),
+                    },
+                )
+                .into_any_element()
+        }
+        None => element.into_any_element(),
+    }
 }
 
 fn text_run(
@@ -1032,6 +1109,54 @@ fn image_element(image: &ImageSpan) -> AnyElement {
         .max_w_full()
         .object_fit(ObjectFit::Contain)
         .into_any_element()
+}
+
+/// `display:inline-block` 的原子盒子：保留宽高、内外边距、边框与垂直对齐。
+fn inline_box_element(
+    inline: &InlineBox,
+    theme: &Theme,
+    lookup: &LookupSender,
+    seed: u64,
+) -> AnyElement {
+    let style = &inline.style;
+    let mut element = div().flex().flex_col().flex_shrink_0().min_w(px(0.));
+    element = styled_box(element, style, theme);
+    if let Some(width) = style.width {
+        element = element.w(px(width));
+    }
+    if let Some(height) = style.height {
+        element = element.h(px(height));
+    }
+    if let Some(margin) = style.margin_left {
+        element = element.ml(px(margin));
+    }
+    if let Some(margin) = style.margin_right {
+        element = element.mr(px(margin));
+    }
+    if let Some(margin) = style.margin_top {
+        element = element.mt(px(margin));
+    }
+    if let Some(margin) = style.margin_bottom {
+        element = element.mb(px(margin));
+    }
+    if let Some(align) = style.vertical_align {
+        element = match align {
+            AlignSelf::Start => element.self_start(),
+            AlignSelf::Center => element.self_center(),
+            AlignSelf::End => element.self_end(),
+            AlignSelf::Baseline => element.self_baseline(),
+            AlignSelf::Stretch | AlignSelf::Auto => element,
+        };
+    }
+    for (block_index, block) in inline.blocks.iter().enumerate() {
+        element = element.child(block_element(
+            block,
+            theme,
+            lookup,
+            mix_seed(seed, block_index),
+        ));
+    }
+    element.into_any_element()
 }
 
 fn image_size(image: &ImageSpan) -> (f32, f32) {
@@ -1241,6 +1366,9 @@ fn needs_chunk_layout(paragraph: &Paragraph) -> bool {
         max = max.max(size);
     }
     for span in &paragraph.spans {
+        if matches!(span, Span::Box(_)) {
+            return true;
+        }
         let Span::Text(text) = span else {
             continue;
         };
