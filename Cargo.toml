@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/ai-core", "crates/dict-core", "crates/pdf-core", "crates/gloss-pdf"]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/shanaiardor/gloss-pdf"
