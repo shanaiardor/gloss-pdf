@@ -176,6 +176,61 @@ impl AppState {
             }
         }
 
+        // 拖选松手后的「词典 / AI」胶囊：贴在选区最后一个矩形的右下角。
+        if let Some(capsule) = &self.selection_capsule
+            && capsule.page == index
+            && let Some(last) = capsule.rects.last()
+        {
+            let is_word = self.capsule_is_word();
+            let left = (last.right * zoom)
+                .min((width - 130.0).max(0.0))
+                .max(0.0);
+            let top = ((page_size.height - last.bottom) * zoom + 6.0)
+                .min((height - 34.0).max(0.0))
+                .max(0.0);
+
+            let mut row = div()
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .p(px(4.))
+                .rounded_lg()
+                .occlude()
+                .bg(theme.surface)
+                .border_1()
+                .border_color(theme.border)
+                .shadow_md()
+                // 必须吞掉按下事件：页面的 on_mouse_down 会「按下即收起胶囊」，
+                // 冒泡过去就会在按钮的 on_click 之前把胶囊清空，点上去毫无反应。
+                .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                    cx.stop_propagation();
+                });
+            if is_word {
+                row = row.child(capsule_button(
+                    "capsule-dictionary",
+                    "词典",
+                    !is_word,
+                    theme,
+                    cx.listener(|this, _event: &gpui::ClickEvent, _window, cx| {
+                        this.capsule_lookup_dictionary(cx);
+                    }),
+                ));
+            }
+            row = row.child(capsule_button(
+                "capsule-ai",
+                "AI",
+                true,
+                theme,
+                cx.listener(|this, _event: &gpui::ClickEvent, _window, cx| {
+                    this.capsule_lookup_ai(cx);
+                }),
+            ));
+            overlays.push(row.into_any_element());
+        }
+
         for (link_index, link) in page.links.iter().enumerate() {
             let rect = link.rect;
             let target = link.target.clone();
@@ -274,4 +329,41 @@ fn gloss_rect_overlay(
     rect_overlay(rect, page_height, zoom, bg_color)
         .border_b_2()
         .border_color(underline_color)
+}
+
+/// 选区胶囊里的按钮；`primary` 用强调色（AI 永远是主动作）。
+fn capsule_button(
+    id: &'static str,
+    label: &'static str,
+    primary: bool,
+    theme: &Theme,
+    listener: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let mut button = div()
+        .id(id)
+        .px_2()
+        .py_0p5()
+        .rounded_md()
+        .cursor_pointer()
+        .text_size(px(11.))
+        .on_click(listener)
+        .child(label);
+    if primary {
+        button = button
+            .bg(theme.accent)
+            .text_color(theme.accent_text)
+            .hover({
+                let hover = theme.accent_hover;
+                move |style| style.bg(hover)
+            });
+    } else {
+        button = button
+            .bg(theme.surface_hover)
+            .text_color(theme.text)
+            .hover({
+                let hover = theme.border;
+                move |style| style.bg(hover)
+            });
+    }
+    button
 }

@@ -9,6 +9,7 @@ description = "笺释 (gloss-pdf) — A GPU-accelerated PDF reader with built-in
 [dependencies]
 pdf-core = { path = "../pdf-core" }
 dict-core = { path = "../dict-core" }
+ai-core.workspace = true
 
 gpui.workspace = true
 gpui_platform.workspace = true
@@ -19,8 +20,12 @@ image.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+pulldown-cmark.workspace = true
 unicode-segmentation.workspace = true
 self_update = { version = "1.3", default-features = false, features = ["github", "ureq", "rustls"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_platform = { workspace = true, features = ["runtime_shaders", "font-kit"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

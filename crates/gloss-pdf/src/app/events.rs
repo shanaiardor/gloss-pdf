@@ -69,6 +69,16 @@ impl super::AppState {
                 scanned,
                 total,
             } => self.on_search_progress(request, scanned, total),
+            Event::PageText {
+                page: _,
+                request,
+                text,
+            } => {
+                // AI 工具取页的回包：把文本交给等待中的工具 future 后即可返回，
+                // 界面没有任何变化，不必重绘。
+                self.complete_page_read(request, Ok(text));
+                return;
+            }
             Event::Error(message) => {
                 log::error!("{message}");
                 self.set_status(message, cx);
@@ -201,7 +211,12 @@ impl super::AppState {
                 self.dictionary.loading = false;
                 self.dictionary.entries.clear();
                 self.dictionary.not_found = true;
-                self.dictionary.word = term;
+                self.dictionary.word = term.clone();
+                // 词典没有的词正是 AI 的用武之地（人名、典故），自动发起一次；
+                // 命中缓存的词会瞬时出结果，不会真的发请求。
+                if self.settings.current.ai.is_ready() {
+                    self.start_ai_lookup(term, cx);
+                }
             }
             DictEvent::PrefixSuggestions {
                 request,
@@ -297,6 +312,8 @@ impl super::AppState {
         if self.page_input_open {
             self.close_page_input(cx);
         }
+        // 任意新的按下都收起上一次的胶囊，避免它停在旧选区上。
+        self.selection_capsule = None;
         let Some(index) = self.char_at_point(page, event.position) else {
             return;
         };
@@ -414,6 +431,7 @@ impl super::AppState {
         // 选择结束（拖选或双击选词）后打印选区，便于测试选中文字是否正确。
         if was_dragging {
             self.print_selection();
+            self.show_selection_capsule();
         }
         cx.notify();
     }
@@ -466,6 +484,55 @@ impl super::AppState {
     }
 
     /// 双击选词后直接在页边笺注栏锚定该词位置并查词。
+    /// 拖选松手：把选区拍成胶囊数据（文本 + 矩形），由页面覆盖层画出来。
+    fn show_selection_capsule(&mut self) {
+        let Some(page) = self.viewer.selection.page else {
+            self.selection_capsule = None;
+            return;
+        };
+        let chars = self.viewer.chars_of(page);
+        let Some(text) = self.viewer.selection.text(chars) else {
+            self.selection_capsule = None;
+            return;
+        };
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            self.selection_capsule = None;
+            return;
+        }
+        let rects = self.viewer.selection.rects(chars);
+        if rects.is_empty() {
+            self.selection_capsule = None;
+            return;
+        }
+        self.selection_capsule = Some(crate::selection::SelectionCapsule {
+            page,
+            text: trimmed.to_string(),
+            rects,
+        });
+    }
+
+    /// 胶囊「词典」：走原有查词链路（清洗文本、记锚点、查 mdx）。
+    pub(crate) fn capsule_lookup_dictionary(&mut self, cx: &mut Context<Self>) {
+        self.selection_capsule = None;
+        self.lookup_selection(cx);
+    }
+
+    /// 胶囊「AI」：把原始选区文本交给模型（保留标点与换行）。
+    pub(crate) fn capsule_lookup_ai(&mut self, cx: &mut Context<Self>) {
+        let Some(capsule) = self.selection_capsule.take() else {
+            return;
+        };
+        self.start_ai_lookup_text(capsule.text, cx);
+    }
+
+    /// 选区是否短到值得给「词典」按钮（长句 mdx 必定查不到）。
+    pub(crate) fn capsule_is_word(&self) -> bool {
+        self.selection_capsule
+            .as_ref()
+            .is_some_and(|capsule| ai_core::is_word_query(&capsule.text))
+    }
+
     fn lookup_selection(&mut self, cx: &mut Context<Self>) {
         let Some(page) = self.viewer.selection.page else {
             return;
@@ -553,6 +620,12 @@ impl super::AppState {
             }
         }
 
+        // 设置页里的 AI 输入框（供应商字段、模型名）同理：不在下面统一放行，
+        // 打字会被当成「聚焦主页搜索并把字符塞进去」。
+        if self.ai_input_has_focus(window, cx) && !control {
+            return;
+        }
+
         if control {
             match keystroke.key.as_str() {
                 "o" => self.open_pdf(window, cx),
@@ -627,6 +700,13 @@ impl super::AppState {
         let keystroke = &event.keystroke;
         let control = keystroke.modifiers.control || keystroke.modifiers.platform;
 
+        // 有胶囊时 Esc 先收胶囊，不惊动其他面板。
+        if keystroke.key == "escape" && self.selection_capsule.is_some() {
+            self.selection_capsule = None;
+            cx.notify();
+            return;
+        }
+
         // 页码输入框有焦点时，数字、退格、Enter、Esc 归 TextInput；否则
         // PageDown / H 之类的快捷键会把正在输入的数字当成翻页指令。
         if self.page_input_open
@@ -641,6 +721,12 @@ impl super::AppState {
             && self.dict_input.read(cx).focus_handle(cx).is_focused(window)
             && !control
         {
+            return;
+        }
+
+        // 阅读器里的设置浮层同样有 AI 输入框：焦点在任何一个上都放行字符输入，
+        // 否则「h」会被当成高亮、「f」会开搜索。
+        if self.settings_open && self.ai_input_has_focus(window, cx) && !control {
             return;
         }
 

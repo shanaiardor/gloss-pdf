@@ -12,6 +12,8 @@
 │  app/document.rs 打开/关闭、进度、高亮、检索、词典资源 │
 │  app/render.rs   布局、缩放、瓦片预取、内存淘汰         │
 │  app/window.rs   主窗口尺寸、视口度量、词典浮窗         │
+│  ai_context.rs   文档快照 + 工具取页通道（mpsc→oneshot） │
+│  ai_query.rs     AI 查词状态机、缓存、节流、任务生命周期 │
 │  home.rs     首页状态：最近阅读、搜索、侧栏       │
 │  settings.rs 用户设置：主题、多词典列表           │
 │  dictionary.rs 词典面板状态：多词典/历史/联想     │

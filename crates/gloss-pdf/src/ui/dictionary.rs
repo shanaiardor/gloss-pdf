@@ -57,23 +57,39 @@ impl AppState {
     ) -> Option<gpui::Div> {
         let geometry = layout.page_box(page)?;
         let active_here = self.dictionary.open && self.dictionary.anchor_page == page;
+        // AI 卡也住在笺注栏里：这一页有它时，即使词典卡没开，栏也要存在。
+        let ai_here = self.ai_card_visible() && self.ai.page == page;
         let active_word = self.dictionary.word.trim();
 
         // 若某个已钉住词条正好在当前页处于激活展开态，不重复渲染折叠态小卡，
         // 由激活态查词卡右上角的「已钉」徽章直接表达其钉住状态。
+        // AI 卡是同一个词时，让紧凑卡让位——否则一个词会出现两张卡，
+        // 且 AI 卡会被排版挤到下方，离用户点的地方很远。
+        let ai_word = if self.ai_card_visible() && self.ai.page == page {
+            Some(self.ai.term.trim().to_string())
+        } else {
+            None
+        };
+
         let pinned: Vec<&PinnedGloss> = self
             .viewer
             .highlights
             .glosses_for_page(page)
             .into_iter()
             .filter(|gloss| {
+                if let Some(word) = &ai_word
+                    && !word.is_empty()
+                    && gloss.word.trim().eq_ignore_ascii_case(word)
+                {
+                    return false;
+                }
                 !(active_here
                     && !active_word.is_empty()
                     && gloss.word.trim().eq_ignore_ascii_case(active_word))
             })
             .collect();
 
-        if pinned.is_empty() && !active_here {
+        if pinned.is_empty() && !active_here && !ai_here {
             return None;
         }
 
@@ -140,9 +156,11 @@ impl AppState {
             .overflow_hidden();
 
         let view = cx.entity().downgrade();
+        let mut active_bottom: Option<f32> = None;
 
-        for slot in slots {
+        for slot in &slots {
             if slot.id == ACTIVE_SLOT_ID {
+                active_bottom = Some(slot.top + slot.height);
                 if connected {
                     let anchor_y = (self.dictionary.anchor_top * zoom + 10.0)
                         .clamp(8.0, geometry.height - 8.0);
@@ -175,6 +193,30 @@ impl AppState {
                     self.pinned_gloss_card(gloss, theme, cx),
                 ));
             }
+        }
+
+        // AI 卡的位置：有词典卡就排它下面，否则贴选区锚点。
+        let anchor_top = self
+            .ai
+            .rects
+            .first()
+            .and_then(|rect| self.viewer.page_size_at(page).map(|size| size.height - rect.top))
+            .map(|anchor| (anchor * zoom).clamp(8.0, geometry.height));
+        // 期望位置：有词典卡就排在它下面，否则贴选区；只有当别的卡压在这个
+        // 位置附近（同一段纵向区间）时才往下挪，避免把它推到很远的地方。
+        let ai_desired = active_bottom.or(anchor_top).unwrap_or(0.0);
+        let blocking = slots
+            .iter()
+            .filter(|slot| slot.top + slot.height > ai_desired + 1.0)
+            .filter(|slot| slot.top < ai_desired + 120.0)
+            .map(|slot| slot.top + slot.height)
+            .fold(0.0f32, f32::max);
+        let top = ai_desired.max(blocking) + GLOSS_CARD_GAP;
+        let viewport_h = f32::from(self.viewport.height);
+        let max_height = (viewport_h * 0.55).min(420.0).max(160.0);
+        let available = (geometry.height - top - GLOSS_CARD_GAP).max(120.0);
+        if let Some(card) = self.ai_card(top, available.min(max_height), theme, cx) {
+            cards = cards.child(card);
         }
 
         Some(rail.child(cards))
@@ -215,7 +257,16 @@ impl AppState {
         let id = gloss.id;
         let word = gloss.word.clone();
         let phonetic = gloss.phonetic.clone();
-        let summary = gloss.summary.clone();
+        // AI 摘要里带 Markdown：紧凑卡当纯文本画会露出 `**`，这里先去标记。
+        let summary = if gloss.from_ai {
+            let preview: String = crate::ui::ai_markdown::plain_text(&gloss.summary)
+                .chars()
+                .take(120)
+                .collect();
+            preview
+        } else {
+            gloss.summary.clone()
+        };
         let hover_bg = theme.surface_hover;
 
         let mut header = div()
@@ -456,6 +507,30 @@ impl AppState {
                 .text_color(theme.text)
                 .child(word_label),
         );
+
+        // 「问 AI」必须留在顶栏：正文动辄十几屏，放底部等于逼用户滚到底才点得到。
+        if self.settings.current.ai.lookup.enabled && !self.dictionary.word.trim().is_empty() {
+            let term = self.dictionary.word.trim().to_string();
+            let busy = matches!(
+                self.ai.phase,
+                crate::ai_query::AiPhase::Thinking | crate::ai_query::AiPhase::Streaming { .. }
+            ) && self.ai.term == term;
+            let ai_btn = div()
+                .id("gloss-ai-trigger")
+                .flex_shrink_0()
+                .px(px(7.))
+                .py(px(2.))
+                .rounded_md()
+                .text_size(px(11.))
+                .cursor_pointer()
+                .text_color(if busy { theme.text_muted } else { theme.accent })
+                .hover(move |style| style.bg(hover_bg))
+                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    this.start_ai_lookup(term.clone(), cx);
+                }))
+                .child(if busy { "AI 生成中…" } else { "问 AI" });
+            header = header.child(ai_btn);
+        }
 
         if !self.dict_history.entries().is_empty() {
             let history_active = self.dictionary.show_history;

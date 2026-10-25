@@ -13,6 +13,7 @@ use dict_core::{Command as DictCommand, DictionaryConfig};
 use gpui::{Context, PathPromptOptions, Window};
 use pdf_core::{Command, DocumentMetadata, OutlineItem, PageHits, PageSize};
 
+use crate::ai_query::AiPhase;
 use crate::dict_suggest::{MAX_SUGGESTIONS, SUGGEST_DEBOUNCE};
 use crate::dictionary::{DictLoadState, normalize_term, summarize_entries};
 use crate::highlights::sidecar_path;
@@ -367,7 +368,16 @@ impl super::AppState {
         if self
             .viewer
             .highlights
-            .add_gloss(page, rects, anchor_top, word.clone(), phonetic, summary)
+            .add_gloss(
+                page,
+                rects,
+                anchor_top,
+                word.clone(),
+                phonetic,
+                summary,
+                false,
+                String::new(),
+            )
             .is_some()
         {
             if self.refit() || had_rail != self.has_gloss_rail() {
@@ -382,6 +392,63 @@ impl super::AppState {
         }
     }
 
+    /// 把当前 AI 答案钉成页边笺注。
+    ///
+    /// 长句也允许：高亮按选区矩形画（`PinnedGloss.rects` 本来就是矩形列表），
+    /// 摘要用 AI 正文的前 200 字，避免正文再查一次词典。
+    pub(crate) fn pin_current_ai(&mut self, cx: &mut Context<Self>) {
+        let text = match &self.ai.phase {
+            AiPhase::Done { text, .. } => text.clone(),
+            AiPhase::Streaming { text, .. } if !text.trim().is_empty() => text.clone(),
+            _ => return,
+        };
+        let word = self.ai.term.trim().to_string();
+        if word.is_empty() {
+            return;
+        }
+        let page = self.ai.page;
+        let rects = self.ai.rects.clone();
+        let anchor_top = rects
+            .first()
+            .and_then(|rect| {
+                self.viewer
+                    .page_size_at(page)
+                    .map(|size| (size.height - rect.top).max(0.0))
+            })
+            .unwrap_or(0.0);
+        let answer = text.trim().to_string();
+        let summary: String = answer.chars().take(200).collect();
+
+        // `add_gloss` 自己按「同页同词」原地更新，不会堆两条重复笺注。
+        let had_rail = self.has_gloss_rail();
+        if self
+            .viewer
+            .highlights
+            .add_gloss(
+                page,
+                rects,
+                anchor_top,
+                word.clone(),
+                None,
+                summary,
+                true,
+                answer,
+            )
+            .is_none()
+        {
+            return;
+        }
+        if self.refit() || had_rail != self.has_gloss_rail() {
+            self.ensure_visible_pages();
+            self.flush_progress();
+        }
+        match self.persist_highlights() {
+            Ok(()) => self.set_status(format!("已钉住「{word}」"), cx),
+            Err(error) => self.set_status(format!("笺注保存失败: {error}"), cx),
+        }
+        cx.notify();
+    }
+
     /// 点击已钉住的紧凑笺注卡（或正文下划线词条）：在原锚点位置展开为完整查词卡。
     pub(crate) fn open_pinned_gloss(&mut self, id: u64, cx: &mut Context<Self>) {
         let Some(gloss) = self
@@ -394,6 +461,25 @@ impl super::AppState {
         else {
             return;
         };
+
+        // AI 钉下来的笺注没有词典条目：直接复用存好的答案，
+        // 走词典链路只会「查不到 → 触发一次新的 AI 查询」，等于重复计费。
+        if gloss.from_ai {
+            self.close_dictionary(cx);
+            self.ai.term = gloss.word.clone();
+            self.ai.page = gloss.page;
+            self.ai.rects = gloss.rects.clone();
+            self.ai.phase = AiPhase::Done {
+                text: if gloss.answer.is_empty() {
+                    gloss.summary.clone()
+                } else {
+                    gloss.answer.clone()
+                },
+                model: String::new(),
+            };
+            cx.notify();
+            return;
+        }
 
         self.dictionary
             .set_anchor_for_word(gloss.page, gloss.rects, gloss.anchor_top, &gloss.word);

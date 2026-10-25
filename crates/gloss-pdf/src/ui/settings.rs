@@ -5,6 +5,7 @@
 
 use gpui::{ClickEvent, Context, FontWeight, div, prelude::*, px};
 
+use crate::ai_settings::ProviderField;
 use crate::app::{AppState, UpdatePhase};
 use crate::dictionary::DictLoadState;
 use crate::home::HomeNav;
@@ -282,6 +283,7 @@ impl AppState {
         }
         body = body
             .child(dictionary_section)
+            .child(self.ai_section(theme, cx))
             .child(self.update_section(theme, cx))
             .child(
                 div()
@@ -402,6 +404,356 @@ impl AppState {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// AI 区块：启用开关、供应商卡片列表、查词模型。
+    ///
+    /// 供应商是动态列表，卡片默认收起（只露名称 / 类型 / Key 状态）；
+    /// 一次只展开一张，展开时才创建字段输入框（见 `ai_settings.rs`）。
+    fn ai_section(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let ai = &self.settings.current.ai;
+        let ready = ai.is_ready();
+        let status = if !ai.lookup.enabled {
+            "已关闭".to_string()
+        } else if ready {
+            match ai.active_provider() {
+                Some(entry) => format!("已就绪 · {} / {}", entry.name, ai.lookup.model.trim()),
+                None => "已就绪".to_string(),
+            }
+        } else {
+            match ai.validate() {
+                Err(error) => error.to_string(),
+                Ok(()) => "待配置".to_string(),
+            }
+        };
+
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("AI"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(if ready {
+                                theme.text_muted
+                            } else {
+                                theme.text_muted
+                            })
+                            .child(status),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(theme.text_muted)
+                    .child("启用后，查询的词以及当前页 / 所需页的文本会发送到你配置的供应商。"),
+            );
+
+        // 总开关
+        let enabled = ai.lookup.enabled;
+        section = section.child(
+            div()
+                .id("ai-enabled")
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.toggle_ai_enabled(cx);
+                }))
+                .child(checkbox(enabled, theme))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.text_muted)
+                        .child("在查词时启用 AI 释义"),
+                ),
+        );
+
+        let providers = ai.providers.clone();
+        let active_id = ai.lookup.provider_id.clone();
+
+        if providers.is_empty() {
+            section = section.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_muted)
+                    .child("还没有供应商。添加后即可在查不到词时让 AI 补充解释。"),
+            );
+        }
+
+        for (index, entry) in providers.iter().enumerate() {
+            let id = entry.id.clone();
+            let expanded = self.ai_ui.expanded.as_deref() == Some(id.as_str());
+            let in_use = active_id.as_deref() == Some(id.as_str());
+
+            let mut card = div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .p_2()
+                .rounded_md()
+                .bg(theme.surface_hover)
+                .child(
+                    div()
+                        .id(("ai-provider-header", index))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                            this.toggle_provider_expanded(&id, cx);
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(theme.text)
+                                .child(if entry.name.trim().is_empty() {
+                                    entry.kind.label().to_string()
+                                } else {
+                                    entry.name.clone()
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(theme.text_muted)
+                                .child(entry.kind.label()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(if entry.api_key.trim().is_empty() {
+                                    theme.text_muted
+                                } else {
+                                    theme.text
+                                })
+                                .child(if entry.api_key.trim().is_empty() {
+                                    "未填 Key".to_string()
+                                } else {
+                                    entry.masked_key()
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(if in_use { theme.accent } else { theme.text_muted })
+                                .child(if in_use { "查词使用中" } else { "" }),
+                        ),
+                );
+
+            if expanded {
+                let id = entry.id.clone();
+                card = card.child(ai_field_row(
+                    "名称",
+                    self.ai_field_input(&id, ProviderField::Name),
+                    theme,
+                ));
+                card = card.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(ai_field_label("类型", theme))
+                        .child(
+                            div()
+                                .id(("ai-provider-kind", index))
+                                .px_2()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .bg(theme.surface)
+                                .text_size(px(11.))
+                                .text_color(theme.text)
+                                .hover({
+                                    let hover_bg = theme.border;
+                                    move |style| style.bg(hover_bg)
+                                })
+                                .on_click(cx.listener(
+                                    move |this, _event: &ClickEvent, _window, cx| {
+                                        this.cycle_provider_kind(&id, cx);
+                                    },
+                                ))
+                                .child(entry.kind.label()),
+                        ),
+                );
+
+                let revealed = self.ai_ui.revealed.contains(&entry.id);
+                card = card.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(ai_field_label("API Key", theme))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(ai_input_slot(
+                                    self.ai_field_input(&entry.id, ProviderField::ApiKey),
+                                    theme,
+                                )),
+                        )
+                        .child(mini_button(
+                            ("ai-key-reveal", index),
+                            if revealed { "隐藏" } else { "显示" },
+                            theme,
+                            cx.listener({
+                                let id = entry.id.clone();
+                                move |this, _event: &ClickEvent, _window, cx| {
+                                    this.toggle_key_reveal(&id, cx);
+                                }
+                            }),
+                        )),
+                );
+
+                if entry.kind.needs_base_url() {
+                    card = card.child(ai_field_row(
+                        "Base URL",
+                        self.ai_field_input(&entry.id, ProviderField::BaseUrl),
+                        theme,
+                    ));
+                }
+
+                card = card.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .mt(px(2.))
+                        .child(mini_button(
+                            ("ai-provider-use", index),
+                            if in_use { "查词使用中" } else { "用于查词" },
+                            theme,
+                            cx.listener({
+                                let id = entry.id.clone();
+                                move |this, _event: &ClickEvent, _window, cx| {
+                                    this.select_ai_provider(&id, cx);
+                                }
+                            }),
+                        ))
+                        .child(mini_button(
+                            ("ai-provider-remove", index),
+                            "移除",
+                            theme,
+                            cx.listener({
+                                let id = entry.id.clone();
+                                move |this, _event: &ClickEvent, _window, cx| {
+                                    this.remove_ai_provider(&id, cx);
+                                }
+                            }),
+                        )),
+                );
+            }
+
+            section = section.child(card);
+        }
+
+        if self.ai_ui.adding {
+            section = section.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(theme.text_muted)
+                            .child("供应商类型"),
+                    )
+                    .child(mini_button(
+                        "ai-add-openai",
+                        "OpenAI",
+                        theme,
+                        cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                            this.add_provider_of_kind(ai_core::ProviderKind::OpenAi, cx);
+                        }),
+                    ))
+                    .child(mini_button(
+                        "ai-add-compat",
+                        "兼容端点",
+                        theme,
+                        cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                            this.add_provider_of_kind(ai_core::ProviderKind::OpenAiCompat, cx);
+                        }),
+                    ))
+                    .child(mini_button(
+                        "ai-add-anthropic",
+                        "Anthropic",
+                        theme,
+                        cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                            this.add_provider_of_kind(ai_core::ProviderKind::Anthropic, cx);
+                        }),
+                    ))
+                    .child(mini_button(
+                        "ai-add-cancel",
+                        "取消",
+                        theme,
+                        cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                            this.cancel_add_provider(cx);
+                        }),
+                    )),
+            );
+        } else {
+            section = section.child(action_button(
+                "ai-add-provider",
+                "添加供应商",
+                theme,
+                cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.begin_add_provider(cx);
+                }),
+            ));
+        }
+
+        // 查词功能：模型名挂在功能层，不跟随供应商
+        section = match self.ai_ui.model_input.clone() {
+            Some(input) => section.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(ai_field_label("模型", theme))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(ai_input_slot(Some(input), theme)),
+                    ),
+            ),
+            None => section.child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(theme.text_muted)
+                    .child("展开任一供应商后即可填写查词用的模型名。"),
+            ),
+        };
+
+        section
+    }
+
+    /// 取某供应商某字段的输入框；还没创建时返回空盒子（展开动作里会先建好）。
+    fn ai_field_input(
+        &self,
+        provider_id: &str,
+        field: ProviderField,
+    ) -> Option<gpui::Entity<crate::ui::text_input::TextInput>> {
+        self.ai_ui
+            .provider_inputs
+            .get(&(provider_id.to_string(), field))
+            .cloned()
     }
 
     /// 更新区块：当前版本、检查/下载/安装按钮、自动检查开关。
@@ -543,8 +895,64 @@ impl AppState {
     }
 }
 
-fn status_line(text: impl Into<String>, theme: &Theme) -> gpui::Div {
+/// 复选框小方块：勾选时填强调色，与更新区块保持一致。
+fn checkbox(checked: bool, theme: &Theme) -> gpui::Div {
+    let mut box_ = div()
+        .w(px(12.))
+        .h(px(12.))
+        .rounded_sm()
+        .border_1()
+        .border_color(theme.border);
+    if checked {
+        box_ = box_.bg(theme.accent).border_color(theme.accent);
+    }
+    box_
+}
+
+fn ai_field_label(text: &'static str, theme: &Theme) -> gpui::Div {
     div()
+        .w(px(62.))
+        .flex_shrink_0()
+        .text_size(px(10.))
+        .text_color(theme.text_muted)
+        .child(text)
+}
+
+/// 输入框或「还没创建」占位；两者都是 `AnyElement`，调用处不必再分支。
+fn ai_input_slot(
+    input: Option<gpui::Entity<crate::ui::text_input::TextInput>>,
+    theme: &Theme,
+) -> gpui::AnyElement {
+    match input {
+        Some(input) => input.into_any_element(),
+        None => div()
+            .text_size(px(10.))
+            .text_color(theme.text_muted)
+            .child("…")
+            .into_any_element(),
+    }
+}
+
+/// 一行「标签 + 输入框」；输入框还没创建时给个占位提示，避免行高塌陷。
+fn ai_field_row(
+    label: &'static str,
+    input: Option<gpui::Entity<crate::ui::text_input::TextInput>>,
+    theme: &Theme,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(ai_field_label(label, theme))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .child(ai_input_slot(input, theme)),
+        )
+}
+
+fn status_line(text: impl Into<String>, theme: &Theme) -> gpui::Div {    div()
         .text_size(px(11.))
         .text_color(theme.text_muted)
         .child(text.into())

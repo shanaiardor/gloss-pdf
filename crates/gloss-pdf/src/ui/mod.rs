@@ -1,5 +1,7 @@
 //! UI 组件：全部是 `impl AppState` 的呈现方法，状态在 `crate::viewer`。
 
+pub(crate) mod ai_card;
+pub(crate) mod ai_markdown;
 pub(crate) mod annotations;
 pub(crate) mod chrome;
 pub(crate) mod dictionary;

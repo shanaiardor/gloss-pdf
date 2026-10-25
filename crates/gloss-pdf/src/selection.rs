@@ -9,6 +9,16 @@ use pdf_core::{CharBox, RectPt};
 
 use crate::geometry::merge_rects;
 
+/// 拖选松手后浮在选区旁的「词典 / AI」胶囊。
+///
+/// 松手不直接查询：拖选常常只是为了复制，自动发请求会打扰；点胶囊才算明确的意图。
+pub struct SelectionCapsule {
+    pub page: usize,
+    /// 原始选区文本（保留标点、换行、词间空格）；AI 用这一份，词典另行清洗。
+    pub text: String,
+    pub rects: Vec<RectPt>,
+}
+
 #[derive(Default)]
 pub struct Selection {
     /// 选区所在页；选区为空时为 `None`。

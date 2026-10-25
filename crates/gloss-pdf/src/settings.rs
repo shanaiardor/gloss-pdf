@@ -1,7 +1,8 @@
-//! 用户设置：主题与词典路径，持久化在用户数据目录的 `settings.json`。
+//! 用户设置：主题、词典路径与 AI 配置，持久化在用户数据目录的 `settings.json`。
 
 use std::path::PathBuf;
 
+use ai_core::AiSettings;
 use serde::{Deserialize, Serialize};
 
 use crate::home::user_data_dir;
@@ -51,6 +52,9 @@ pub struct Settings {
     /// 启动后自动检查 GitHub 更新；默认开启。
     #[serde(default = "default_true")]
     pub auto_check_updates: bool,
+    /// AI 供应商与查词功能配置；旧配置没有这段时按空配置处理。
+    #[serde(default)]
+    pub ai: AiSettings,
     /// 上次使用的窗口尺寸与位置；`None` 表示首次启动，按默认尺寸居中。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<WindowState>,
@@ -63,6 +67,7 @@ impl Default for Settings {
             dictionary_path: None,
             dictionaries: Vec::new(),
             auto_check_updates: true,
+            ai: AiSettings::default(),
             window: None,
         }
     }
@@ -170,6 +175,7 @@ mod tests {
                 enabled: true,
             }],
             auto_check_updates: false,
+            ai: AiSettings::default(),
             window: Some(WindowState {
                 x: 120.0,
                 y: 80.0,
@@ -355,6 +361,7 @@ mod tests {
                     enabled: true,
                 }],
                 auto_check_updates: false,
+                ai: AiSettings::default(),
                 window: None,
             },
             storage: Some(path.clone()),
@@ -367,5 +374,34 @@ mod tests {
         assert_eq!(parsed, store.current);
 
         std::fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn ai_block_survives_a_round_trip() {
+        let mut ai = AiSettings::default();
+        let id = ai.add_provider(ai_core::ProviderKind::Anthropic);
+        ai.providers[0].api_key = "test-key-1234567890".to_string();
+        ai.lookup.provider_id = Some(id);
+        ai.lookup.model = "claude-sonnet-4-6".to_string();
+
+        let settings = Settings {
+            ai,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let parsed: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, settings);
+        assert!(parsed.ai.is_ready(), "合法的 AI 配置读回来应仍可用");
+    }
+
+    #[test]
+    fn legacy_settings_without_ai_block_default_to_empty_ai() {
+        let parsed = parse_settings(r#"{"dark":true,"auto_check_updates":false}"#);
+        assert!(parsed.ai.providers.is_empty());
+        assert!(parsed.ai.lookup.provider_id.is_none());
+        assert!(
+            !parsed.ai.is_ready(),
+            "没有 AI 配置时不能显示成已就绪"
+        );
     }
 }

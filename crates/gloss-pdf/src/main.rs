@@ -5,6 +5,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod ai_context;
+mod ai_query;
+mod ai_settings;
 mod assets;
 mod chrome_visibility;
 mod dict_history;

@@ -142,6 +142,11 @@ pub enum Command {
         query: String,
         request: u64,
     },
+    /// 取某一页的纯文本（AI 工具用）；与搜索共用同一份文本缓存。
+    PageText {
+        page: usize,
+        request: u64,
+    },
 }
 
 /// 工作线程回传给 UI 的事件。
@@ -194,6 +199,12 @@ pub enum Event {
         request: u64,
         scanned: usize,
         total: usize,
+    },
+    /// 某一页的纯文本；`page` 越界或没有文本层时 `text` 为空串。
+    PageText {
+        page: usize,
+        request: u64,
+        text: String,
     },
     Error(String),
 }
@@ -314,6 +325,7 @@ impl Worker {
             } => self.run_tile(page, scale, origin_x, origin_y, width, height, request),
             Command::PageElements { page, request } => self.run_elements(page, request),
             Command::Search { query, request } => self.run_search(&query, request),
+            Command::PageText { page, request } => self.run_page_text(page, request),
         }
     }
 
@@ -435,6 +447,43 @@ impl Worker {
             request,
             chars: elements.0,
             links: elements.1,
+        });
+    }
+
+    /// 取一页纯文本给 AI 工具用：命中搜索缓存就直接返回，否则现提取并写回缓存。
+    ///
+    /// 不复用 `run_elements`：那条路受可视范围限制（滚出视口就丢弃），
+    /// 而工具完全可能读一页当前不在屏幕上的内容。
+    fn run_page_text(&mut self, page: usize, request: u64) {
+        if let Some(cached) = self.page_text.get(page).and_then(|entry| entry.as_ref()) {
+            let text = cached.clone();
+            let _ = self.events.unbounded_send(Event::PageText {
+                page,
+                request,
+                text,
+            });
+            return;
+        }
+
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let text = match document.pages().get(page as PdfPageIndex) {
+            Ok(pdf_page) => pdf_page
+                .text()
+                .map(|text| text.all())
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+
+        if self.page_text.len() <= page {
+            self.page_text.resize_with(page + 1, || None);
+        }
+        self.page_text[page] = Some(text.clone());
+        let _ = self.events.unbounded_send(Event::PageText {
+            page,
+            request,
+            text,
         });
     }
 

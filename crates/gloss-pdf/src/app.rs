@@ -43,6 +43,9 @@ use crate::viewer::Viewer;
 
 pub(crate) use update::UpdatePhase;
 
+/// 设置改动的去抖窗口：和窗口几何的 400ms 对齐，用户停手后基本感觉不到延迟。
+const SETTINGS_SAVE_DELAY: Duration = Duration::from_millis(500);
+
 /// 输入框需要焦点时，交给下一次 `render` 去设置（事件回调里拿不到 `Window`）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FocusTarget {
@@ -116,11 +119,28 @@ pub struct AppState {
     pending_window_state: Option<WindowState>,
     /// 是否已经安排了一次窗口几何写盘。
     window_state_save_scheduled: bool,
+    /// 是否已经安排了一次设置写盘；AI 输入框逐字符改动，不能每键落盘。
+    settings_save_scheduled: bool,
     /// 更新检查/下载的 worker 与界面状态。
     pub(crate) update_engine: UpdateEngine,
     pub(crate) update_phase: UpdatePhase,
     /// 已注册到 GPUI 的词典字体签名，避免反复配置时重复注册。
     registered_dict_fonts: HashSet<(usize, u64)>,
+    /// AI 设置页的瞬时状态（展开哪张卡、输入框句柄），不落盘。
+    pub(crate) ai_ui: crate::ai_settings::AiUiState,
+    /// AI 工具取页的请求入口：工具侧拿到它，向引擎要页文本。
+    pub(crate) page_text_requests: futures::channel::mpsc::UnboundedSender<
+        crate::ai_context::PageTextRequest,
+    >,
+    /// 已发出、还没回来的取页请求，事件到达时用它回包。
+    pub(crate) pending_page_reads:
+        HashMap<u64, futures::channel::oneshot::Sender<Result<String, String>>>,
+    /// 取页请求代号，避免回包串台。
+    pub(crate) page_text_request_id: u64,
+    /// 当前 AI 查词的运行态（状态机 + 缓存 + 任务）。
+    pub(crate) ai: crate::ai_query::AiQueryState,
+    /// 拖选松手后的「词典 / AI」胶囊；点它才查询。
+    pub(crate) selection_capsule: Option<crate::selection::SelectionCapsule>,
 }
 
 impl AppState {
@@ -153,6 +173,21 @@ impl AppState {
             while let Some(event) = thumbnail_rx.next().await {
                 if this
                     .update(cx, |this, cx| this.handle_thumbnail_event(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        // AI 工具取页：工具侧发请求，这里转成引擎命令并把回包接到 oneshot 上。
+        let (page_text_tx, mut page_text_rx) =
+            futures::channel::mpsc::unbounded::<crate::ai_context::PageTextRequest>();
+        cx.spawn(async move |this, cx| {
+            while let Some(request) = page_text_rx.next().await {
+                if this
+                    .update(cx, |this, _cx| this.begin_page_read(request))
                     .is_err()
                 {
                     break;
@@ -278,6 +313,7 @@ impl AppState {
         cx.on_release(|this, _cx| {
             this.flush_progress();
             this.flush_window_state();
+            this.flush_settings_save();
         })
         .detach();
 
@@ -395,13 +431,48 @@ impl AppState {
             reader_window_size: None,
             pending_window_state: None,
             window_state_save_scheduled: false,
+            settings_save_scheduled: false,
             update_engine,
             update_phase: UpdatePhase::default(),
             registered_dict_fonts: HashSet::new(),
+            ai_ui: crate::ai_settings::AiUiState::default(),
+            page_text_requests: page_text_tx,
+            pending_page_reads: HashMap::new(),
+            page_text_request_id: 0,
+            ai: crate::ai_query::AiQueryState::default(),
+            selection_capsule: None,
         }
     }
 
     // ---------- 应用级状态 ----------
+
+    /// 设置改动后延迟落盘。
+    ///
+    /// AI 配置里的 key / 模型名是逐字符输入的：每键写一次 `settings.json`
+    /// 既浪费也容易在断电时留下半截文件，所以合并成一次写。
+    pub(crate) fn schedule_settings_save(&mut self, cx: &mut Context<Self>) {
+        if self.settings_save_scheduled {
+            return;
+        }
+        self.settings_save_scheduled = true;
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SETTINGS_SAVE_DELAY).await;
+            let _ = this.update(cx, |this, _cx| {
+                this.settings_save_scheduled = false;
+                this.settings.save();
+            });
+        })
+        .detach();
+    }
+
+    /// 立即落盘（退出兜底，不等去抖计时器）。
+    pub(crate) fn flush_settings_save(&mut self) {
+        if self.settings_save_scheduled {
+            self.settings_save_scheduled = false;
+        }
+        self.settings.save();
+    }
 
     /// 左下角浮动提示，4 秒后自动消失。
     pub(crate) fn set_status(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
@@ -446,6 +517,7 @@ impl AppState {
             self.home.nav = HomeNav::Settings;
             self.home.menu_open = None;
             self.home.search_focused = false;
+            self.enter_ai_settings(cx);
             cx.notify();
             return;
         }
@@ -454,6 +526,7 @@ impl AppState {
         if self.settings_open {
             self.home.menu_open = None;
             self.home.search_focused = false;
+            self.enter_ai_settings(cx);
         }
         cx.notify();
     }

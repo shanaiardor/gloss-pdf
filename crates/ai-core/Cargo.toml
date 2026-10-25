@@ -1,0 +1,16 @@
+[package]
+name = "ai-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AI 配置与模型构造：供应商条目、功能级配置，以及 rig 模型的唯一入口"
+
+[dependencies]
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rig.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

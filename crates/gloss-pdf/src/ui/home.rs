@@ -336,6 +336,9 @@ impl AppState {
                 this.home.search_focused = false;
                 this.settings_open = false;
                 this.home.nav = item;
+                if item == HomeNav::Settings {
+                    this.enter_ai_settings(cx);
+                }
                 if item == HomeNav::Home {
                     this.home.query.clear();
                 } else if item == HomeNav::About {

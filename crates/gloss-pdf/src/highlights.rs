@@ -38,6 +38,19 @@ pub struct PinnedGloss {
     /// 精简释义摘要，供页边笺注卡常驻展示与离线回看。
     #[serde(default)]
     pub summary: String,
+    /// 这条笺注是 AI 回答钉下来的（没有词典条目）。
+    ///
+    /// 点开时必须走 AI 卡、直接显示已存的答案，而不是再查一遍词典
+    /// —— 词典查不到会再触发一次 AI 查询，等于重复计费。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub from_ai: bool,
+    /// AI 回答的完整正文；`summary` 只保留前 200 字给紧凑卡。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub answer: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Serialize, Deserialize)]
@@ -103,6 +116,8 @@ impl HighlightStore {
         word: String,
         phonetic: Option<String>,
         summary: String,
+        from_ai: bool,
+        answer: String,
     ) -> Option<u64> {
         let word = word.trim().to_string();
         if word.is_empty() {
@@ -124,6 +139,8 @@ impl HighlightStore {
             }
             existing.phonetic = phonetic;
             existing.summary = summary;
+            existing.from_ai = from_ai;
+            existing.answer = answer;
             return Some(existing.id);
         }
 
@@ -136,6 +153,8 @@ impl HighlightStore {
             word,
             phonetic,
             summary,
+            from_ai,
+            answer,
         });
         Some(id)
     }
@@ -353,6 +372,38 @@ mod tests {
     }
 
     #[test]
+    fn ai_gloss_keeps_the_full_answer_and_its_source_flag() {
+        let mut store = HighlightStore::default();
+        let answer = "这是一段很长的 AI 解释。".repeat(20);
+        let summary: String = answer.chars().take(200).collect();
+        store
+            .add_gloss(
+                3,
+                one_rect(),
+                60.0,
+                "伯牙".into(),
+                None,
+                summary.clone(),
+                true,
+                answer.clone(),
+            )
+            .unwrap();
+
+        let gloss = store.find_gloss(3, "伯牙").expect("应能找到");
+        assert!(gloss.from_ai, "点开时要靠这个标记走 AI 卡，而不是重查词典");
+        assert_eq!(gloss.answer, answer, "完整正文要留下来供再次打开");
+        assert_eq!(gloss.summary, summary, "紧凑卡仍用截断后的摘要");
+
+        // 旧 sidecar 没有这两个字段，读回来应是「非 AI 来源、无正文」。
+        let legacy: PinnedGloss = serde_json::from_str(
+            r#"{"id":1,"page":0,"anchor_top":0.0,"word":"舊","summary":"旧摘要"}"#,
+        )
+        .unwrap();
+        assert!(!legacy.from_ai);
+        assert!(legacy.answer.is_empty());
+    }
+
+    #[test]
     fn add_gloss_deduplicates_same_word_on_same_page_and_persists() {
         let mut store = HighlightStore::default();
         store.add(0, one_rect(), "原文高亮".into());
@@ -364,6 +415,8 @@ mod tests {
                 "Gloss".into(),
                 Some("/ɡlɒs/".into()),
                 "页边批注".into(),
+                false,
+                String::new(),
             )
             .unwrap();
         let id2 = store
@@ -374,6 +427,8 @@ mod tests {
                 "gloss".into(),
                 Some("/ɡlɑːs/".into()),
                 "更新后的释义".into(),
+                false,
+                String::new(),
             )
             .unwrap();
         assert_eq!(id1, id2);
