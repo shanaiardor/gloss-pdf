@@ -98,7 +98,7 @@ cargo run -p gloss-pdf -- samples/dummy.pdf
 ```bash
 # 1. 修改 Cargo.toml 中 [workspace.package] 的 version（CI 会校验 tag 与版本号一致）
 # 2. 提交并推送版本标签
-git tag v0.1.4
+git tag v0.1.5
 git push origin main --tags
 ```
 
