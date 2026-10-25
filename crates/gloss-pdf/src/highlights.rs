@@ -68,6 +68,7 @@ impl HighlightStore {
         self.items.len() + self.glosses.len()
     }
 
+    #[allow(dead_code)]
     pub fn has_glosses(&self) -> bool {
         !self.glosses.is_empty()
     }

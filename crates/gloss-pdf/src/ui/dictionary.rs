@@ -115,16 +115,13 @@ impl AppState {
 
         let slots = layout_gloss_slots(&slot_inputs, geometry.height);
 
-        // 视口放得下「纸张 + 栏」时栏在预留位；放不下时把整张卡夹回视口内，
-        // 临时浮在纸张右侧，既不要求横向滚动，也不改变纸张宽度和缩放。
+        // 视口放得下「纸张 + 栏」时栏在预留位；手动放大超出视口或视口太窄时，
+        // 把整张卡夹回当前可见视口右侧内，确保笺注栏始终可见、不跑出窗口外。
         let viewport_width = f32::from(self.viewport.width);
-        let rail_left = if layout.content_width <= viewport_width {
-            geometry
-                .rail_left()
-                .min((viewport_width - GLOSS_RAIL_WIDTH - PAGE_PAD).max(PAGE_PAD))
-        } else {
-            geometry.rail_left()
-        };
+        let scroll_left = (-f32::from(self.viewer.scroll.offset().x)).max(0.0);
+        let max_rail_left = (scroll_left + viewport_width - GLOSS_RAIL_WIDTH - PAGE_PAD)
+            .max(scroll_left + PAGE_PAD);
+        let rail_left = geometry.rail_left().min(max_rail_left);
         // 卡片被夹回纸张上方时，引线会横穿正文，这时不画引线。
         let connected = rail_left + 0.5 >= geometry.rail_left();
 
@@ -722,7 +719,7 @@ fn gloss_connector(anchor_y: f32, card_y: f32, color: Rgba) -> Div {
         .border_color(color)
 }
 
-fn entry_element(entry: &DictEntry, theme: &Theme, lookup: &LookupSender, seed: u64) -> Div {
+pub(crate) fn entry_element(entry: &DictEntry, theme: &Theme, lookup: &LookupSender, seed: u64) -> Div {
     let mut column = div().flex().flex_col().mb(px(12.)).min_w(px(0.)).w_full();
 
     if let Some(source) = &entry.source {

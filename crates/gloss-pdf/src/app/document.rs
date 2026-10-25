@@ -154,6 +154,7 @@ impl super::AppState {
         let area = self.fit_area();
         let _ = self.viewer.fit(self.viewer.fit_mode, area);
         let restored = saved.is_some_and(|progress| self.viewer.restore_progress(&progress, area));
+        self.refit();
         self.apply_pending_scroll();
 
         // 等 render 拿到当前显示器工作区后，按这张纸的比例调整窗口；
@@ -193,6 +194,8 @@ impl super::AppState {
     pub(crate) fn close_document(&mut self, cx: &mut Context<Self>) {
         self.flush_progress();
         self.viewer.close();
+        // 让 PDFium worker 释放文档；首页缩略图 worker 随即可以继续。
+        let _ = self.engine.commands.send(Command::Close);
         self.panning = None;
         self.page_input_open = false;
         self.search_input.update(cx, |input, cx| input.clear(cx));
@@ -209,6 +212,8 @@ impl super::AppState {
         self.home.menu_open = None;
         self.home.search_focused = false;
         self.home.query.clear();
+        // 回到首页时先看最近阅读，而不是上次停留的设置页。
+        self.home.nav = crate::home::HomeNav::Home;
         self.home_input.update(cx, |input, cx| input.clear(cx));
         self.pending_window_fit = None;
         self.pending_window_resize = self.reader_window_size.take();
@@ -365,9 +370,9 @@ impl super::AppState {
             .add_gloss(page, rects, anchor_top, word.clone(), phonetic, summary)
             .is_some()
         {
-            if had_rail != self.has_gloss_rail() {
-                self.refit();
+            if self.refit() || had_rail != self.has_gloss_rail() {
                 self.ensure_visible_pages();
+                self.flush_progress();
             }
             match self.persist_highlights() {
                 Ok(()) => self.set_status(format!("已钉住页边笺注「{word}」"), cx),
@@ -641,6 +646,9 @@ impl super::AppState {
                 .set_anchor(page, Vec::new(), MANUAL_ANCHOR_TOP);
         }
         self.dictionary.open = true;
+        if self.refit() {
+            self.ensure_visible_pages();
+        }
         self.pending_focus = Some(FocusTarget::Dictionary);
         cx.notify();
     }
@@ -716,6 +724,9 @@ impl super::AppState {
         self.dictionary.entries.clear();
         self.dictionary.pending_term = None;
         self.dictionary.open = true;
+        if self.refit() {
+            self.ensure_visible_pages();
+        }
 
         if let Err(error) = self
             .dict

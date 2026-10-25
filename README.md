@@ -21,6 +21,7 @@
 - **无边框设计**：Windows 自绘左上角控制按钮，macOS 原生集成系统红黄绿交通灯，顶部 46px 透明拖拽区（双击可最大化）。
 - **自动隐身胶囊**：阅读器顶部（功能栏）与底部（翻页与缩放栏）采用居中浮动胶囊设计。鼠标离开感应区 1.5 秒后自动隐身，不遮挡任何页面内容，也不拦截点击与滚轮；移回顶部/底部或改变阅读参数时立即唤醒。
 - **按纸张比例自适应窗口**：打开文档时根据纸张长宽比自动调整窗口尺寸，横版或竖版古籍都不会在两侧留下大片空白。
+- **最近阅读真实缩略图**：首页卡片直接显示上次读到的那一页，而不是示意图；缩略图按文件、页码与修改时间缓存到用户数据目录，第二次启动即可秒开。
 - **内置霞鹜文楷**：界面默认嵌入 **LXGW 文楷 TC**，开箱即享温润书卷气。
 
 ![首页](docs/home.png)
@@ -137,6 +138,7 @@ crates/gloss-pdf/assets/fonts/lxgw-wenkai-tc/OFL.txt   # 字体许可声明（SI
 | **最近阅读与进度** | `%APPDATA%\gloss-pdf\recent.json` | 记录路径、打开时间、页码、滚动比例与缩放模式 |
 | **应用设置** | `%APPDATA%\gloss-pdf\settings.json` | 主题、多词典路径与启用顺序、自动更新开关、窗口几何 |
 | **查词历史** | `%APPDATA%\gloss-pdf\dictionary_history.json` | 最近 50 条查询词（倒序去重） |
+| **缩略图缓存** | `%APPDATA%\gloss-pdf\thumbnails\` | 首页最近阅读卡片的页面预览，按文件、页码与修改时间缓存 |
 
 *(注：macOS 下用户数据目录为 `~/Library/Application Support/gloss-pdf`，Linux 下为 `~/.local/share/gloss-pdf`)*
 

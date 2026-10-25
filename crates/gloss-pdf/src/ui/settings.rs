@@ -1,23 +1,48 @@
-//! 设置面板：主题、MDX 词典路径与更新。从首页侧栏或阅读器顶部打开。
+//! 设置：主题、MDX 词典路径与更新。
+//!
+//! 首页侧栏的「设置」是文档区里的一页（[`AppState::settings_page`]），不是弹窗；
+//! 阅读器里没有可替换的页面，才用浮动面板（[`AppState::settings_panel`]）。
 
 use gpui::{ClickEvent, Context, FontWeight, div, prelude::*, px};
 
 use crate::app::{AppState, UpdatePhase};
 use crate::dictionary::DictLoadState;
+use crate::home::HomeNav;
 use crate::theme::Theme;
 use crate::update::CURRENT_VERSION;
 
 impl AppState {
+    /// 阅读器里的设置浮层。首页使用文档区里的 [`Self::settings_page`]，不走这里。
     pub(crate) fn settings_panel(
         &self,
         theme: &Theme,
         cx: &mut Context<Self>,
-    ) -> Option<gpui::Div> {
-        if !self.settings_open {
+    ) -> Option<gpui::AnyElement> {
+        if !self.settings_open || !self.viewer.has_document() {
             return None;
         }
+        self.settings_view(theme, cx, false)
+    }
 
-        let mut body = div().p_3().flex().flex_col().gap(px(16.));
+    /// 首页侧栏「设置」对应的整页视图，直接占据右侧内容区。
+    pub(crate) fn settings_page(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if self.home.nav != HomeNav::Settings {
+            return None;
+        }
+        self.settings_view(theme, cx, true)
+    }
+
+    fn settings_view(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+        page: bool,
+    ) -> Option<gpui::AnyElement> {
+        let mut body = div().flex().flex_col().gap(px(16.));
 
         // 外观
         body = body.child(
@@ -65,48 +90,40 @@ impl AppState {
         );
 
         // 文档信息：只读展示 PDF 元数据，缺失字段用「—」。
-        let mut metadata_section = div().flex().flex_col().gap(px(4.)).child(
-            div()
-                .text_size(px(13.))
-                .font_weight(FontWeight::MEDIUM)
-                .child("文档信息"),
-        );
-        match &self.viewer.doc {
-            Some(document) => {
-                for (label, value) in document.metadata.fields() {
-                    metadata_section = metadata_section.child(
-                        div()
-                            .flex()
-                            .items_start()
-                            .gap(px(8.))
-                            .text_size(px(11.))
-                            .child(
-                                div()
-                                    .w(px(56.))
-                                    .flex_shrink_0()
-                                    .text_color(theme.text_muted)
-                                    .child(label),
-                            )
-                            .child(
-                                div()
-                                    .min_w(px(0.))
-                                    .flex_1()
-                                    .truncate()
-                                    .text_color(theme.text)
-                                    .child(value.unwrap_or("—").to_string()),
-                            ),
-                    );
-                }
-            }
-            None => {
-                metadata_section = metadata_section.child(
+        // 首页的设置页没有打开文档，整段省略，避免出现一排「未打开文档」。
+        let metadata_section = self.viewer.doc.as_ref().map(|document| {
+            let mut section = div().flex().flex_col().gap(px(4.)).child(
+                div()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child("文档信息"),
+            );
+            for (label, value) in document.metadata.fields() {
+                section = section.child(
                     div()
+                        .flex()
+                        .items_start()
+                        .gap(px(8.))
                         .text_size(px(11.))
-                        .text_color(theme.text_muted)
-                        .child("未打开文档"),
+                        .child(
+                            div()
+                                .w(px(56.))
+                                .flex_shrink_0()
+                                .text_color(theme.text_muted)
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .flex_1()
+                                .truncate()
+                                .text_color(theme.text)
+                                .child(value.unwrap_or("—").to_string()),
+                        ),
                 );
             }
-        }
+            section
+        });
 
         // 词典
         let dictionaries = self.settings.current.dictionaries.clone();
@@ -260,16 +277,76 @@ impl AppState {
                 )),
         );
 
+        if let Some(metadata_section) = metadata_section {
+            body = body.child(metadata_section);
+        }
         body = body
-            .child(metadata_section)
             .child(dictionary_section)
             .child(self.update_section(theme, cx))
             .child(
                 div()
                     .text_size(px(11.))
                     .text_color(theme.text_muted)
-                    .child("提示：双击单词或汉字查词，Esc 关闭面板。"),
+                    .child(if page {
+                        "提示：设置修改后立即生效，Esc 返回首页。"
+                    } else {
+                        "提示：双击单词或汉字查词，Esc 关闭面板。"
+                    }),
             );
+
+        if page {
+            return Some(
+                div()
+                    .id("settings-page")
+                    .flex_1()
+                    .w_full()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .scrollbar_width(px(8.))
+                    .child(
+                        div().w_full().flex().justify_center().child(
+                            div()
+                                .w_full()
+                                .max_w(px(760.))
+                                .px(px(32.))
+                                .pt(px(34.))
+                                .pb(px(56.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(24.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.))
+                                        .child(
+                                            div()
+                                                .text_size(px(24.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(theme.text)
+                                                .child("设置"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(12.))
+                                                .text_color(theme.text_muted)
+                                                .child("主题、词典与更新"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .p(px(22.))
+                                        .rounded_lg()
+                                        .bg(theme.surface)
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .child(body),
+                                ),
+                        ),
+                    )
+                    .into_any_element(),
+            );
+        }
 
         Some(
             div()
@@ -321,8 +398,9 @@ impl AppState {
                                         .child("✕"),
                                 ),
                         )
-                        .child(body),
-                ),
+                        .child(div().p_3().child(body)),
+                )
+                .into_any_element(),
         )
     }
 
@@ -517,6 +595,7 @@ fn action_button(
     let label = label.into();
     div()
         .id(id)
+        .self_start()
         .px_3()
         .py_1()
         .rounded_md()

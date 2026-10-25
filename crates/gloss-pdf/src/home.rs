@@ -17,44 +17,20 @@ const MAX_RECENTS: usize = 18;
 pub enum HomeNav {
     #[default]
     Home,
-    Recent,
     Favorites,
-    Tools,
+    Bookmarks,
+    Dictionary,
+    Annotations,
     Settings,
+    About,
 }
 
-impl HomeNav {
-    pub fn label(self) -> &'static str {
-        match self {
-            HomeNav::Home => "主页",
-            HomeNav::Recent => "最近",
-            HomeNav::Favorites => "收藏",
-            HomeNav::Tools => "工具",
-            HomeNav::Settings => "设置",
-        }
-    }
-
-    pub fn icon(self) -> &'static str {
-        match self {
-            HomeNav::Home => "⌂",
-            HomeNav::Recent => "◷",
-            HomeNav::Favorites => "☆",
-            // 显式文本变体，避免 Windows 把扳手/齿轮渲染成彩色 emoji。
-            HomeNav::Tools => "\u{2692}\u{fe0e}",
-            HomeNav::Settings => "\u{2699}\u{fe0e}",
-        }
-    }
-
-    /// 尚未实现的页面在点击时的提示。
-    pub fn placeholder_message(self) -> Option<&'static str> {
-        match self {
-            HomeNav::Home => None,
-            HomeNav::Recent => Some("最近阅读已经在首页展示"),
-            HomeNav::Favorites => Some("收藏功能即将上线"),
-            HomeNav::Tools => Some("工具功能即将上线"),
-            HomeNav::Settings => None,
-        }
-    }
+/// 视图模式（网格 / 列表）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewMode {
+    #[default]
+    Grid,
+    List,
 }
 
 /// 一条最近阅读记录。
@@ -67,12 +43,16 @@ pub struct RecentDocument {
     /// 上次读到的位置；旧版本记录没有这个字段。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<ReadingProgress>,
+    /// 是否收藏；旧版本记录没有该字段时默认为 false。
+    #[serde(default)]
+    pub favorite: bool,
 }
 
 /// 首页控制器状态。
 #[derive(Default)]
 pub struct HomeState {
     pub nav: HomeNav,
+    pub view_mode: ViewMode,
     pub query: String,
     pub search_focused: bool,
     /// 当前展开的“...”菜单（最近阅读中的绝对下标）。
@@ -99,6 +79,7 @@ impl HomeState {
 
         Self {
             nav: HomeNav::Home,
+            view_mode: ViewMode::Grid,
             query: String::new(),
             search_focused: false,
             menu_open: None,
@@ -113,12 +94,13 @@ impl HomeState {
     }
 
     fn record_at(&mut self, path: PathBuf, title: String, now: u64) {
-        // 重新打开同一个文件时保留上次的阅读位置，等恢复成功后再覆盖。
-        let progress = self
+        // 重新打开同一个文件时保留上次的阅读位置和收藏状态，等恢复成功后再覆盖。
+        let (progress, favorite) = self
             .recents
             .iter()
             .find(|recent| same_path(&recent.path, &path))
-            .and_then(|recent| recent.progress);
+            .map(|recent| (recent.progress, recent.favorite))
+            .unwrap_or((None, false));
 
         self.recents
             .retain(|recent| !same_path(&recent.path, &path));
@@ -129,6 +111,7 @@ impl HomeState {
                 title,
                 opened_at: now,
                 progress,
+                favorite,
             },
         );
         self.recents.truncate(MAX_RECENTS);
@@ -166,13 +149,28 @@ impl HomeState {
         }
     }
 
-    /// 过滤后的条目下标（保持时间倒序）。
+    /// 切换某个条目的收藏状态。
+    pub fn toggle_favorite(&mut self, index: usize) {
+        if let Some(recent) = self.recents.get_mut(index) {
+            recent.favorite = !recent.favorite;
+            self.menu_open = None;
+            self.flush();
+        }
+    }
+
+    /// 过滤后的条目下标（保持时间倒序），支持搜索词与侧栏导航项（如收藏）。
     pub fn filtered(&self) -> Vec<usize> {
         let query = self.query.trim().to_lowercase();
         self.recents
             .iter()
             .enumerate()
-            .filter(|(_, recent)| query.is_empty() || recent.title.to_lowercase().contains(&query))
+            .filter(|(_, recent)| {
+                // 如果当前在收藏页，只展示收藏过的文档
+                if self.nav == HomeNav::Favorites && !recent.favorite {
+                    return false;
+                }
+                query.is_empty() || recent.title.to_lowercase().contains(&query)
+            })
             .map(|(index, _)| index)
             .collect()
     }
@@ -180,6 +178,11 @@ impl HomeState {
     /// 当前搜索是否真的在过滤。
     pub fn is_filtering(&self) -> bool {
         !self.query.trim().is_empty()
+    }
+
+    /// 最近阅读的第一份文档（用于 Hero "继续阅读" 区块）。
+    pub fn hero_document(&self) -> Option<&RecentDocument> {
+        self.recents.first()
     }
 
     /// 把最近阅读（含阅读进度）写回用户数据目录。
@@ -234,6 +237,23 @@ fn relative_time_at(opened_at: u64, now: u64) -> String {
 fn format_date(timestamp: u64) -> String {
     let (year, month, day) = civil_from_days((timestamp / 86_400) as i64);
     format!("{year}-{month:02}-{day:02}")
+}
+
+/// 格式化为设计稿中的自然日期眉标，例如「2026 年 10 月 25 日 · 周日」。
+pub fn format_today_header(timestamp: u64) -> String {
+    let days = (timestamp / 86_400) as i64;
+    let (year, month, day) = civil_from_days(days);
+    // 1970-01-01 是星期四 (weekday = 4)
+    let weekday = match (days + 4).rem_euclid(7) {
+        0 => "周日",
+        1 => "周一",
+        2 => "周二",
+        3 => "周三",
+        4 => "周四",
+        5 => "周五",
+        _ => "周六",
+    };
+    format!("{year} 年 {month} 月 {day} 日 · {weekday}")
 }
 
 /// Howard Hinnant 的 days → civil date 算法（UTC）。
@@ -384,6 +404,7 @@ mod tests {
             title: "a.pdf".into(),
             opened_at: 10,
             progress: Some(progress),
+            favorite: true,
         }];
         let json = serde_json::to_string(&recents).unwrap();
         let parsed: Vec<RecentDocument> = serde_json::from_str(&json).unwrap();
@@ -419,5 +440,34 @@ mod tests {
     fn date_format_handles_epoch() {
         assert_eq!(format_date(0), "1970-01-01");
         assert_eq!(format_date(1_700_000_000), "2023-11-14");
+    }
+
+    #[test]
+    fn format_today_header_correctness() {
+        // 2026-10-25 是周日
+        // 2026-10-25 00:00:00 UTC 对应的 Unix timestamp 大约为 1792886400
+        // 验证计算结果格式：
+        let header = format_today_header(1792886400);
+        assert!(header.contains("2026 年 10 月 25 日 · 周日"));
+    }
+
+    #[test]
+    fn favorites_filter_and_toggle() {
+        let mut home = home_without_storage();
+        home.record_at(PathBuf::from("C:/docs/a.pdf"), "A.pdf".into(), 10);
+        home.record_at(PathBuf::from("C:/docs/b.pdf"), "B.pdf".into(), 20);
+
+        assert!(!home.recents[0].favorite);
+        home.toggle_favorite(0);
+        assert!(home.recents[0].favorite);
+
+        // 普通主页返回全部
+        assert_eq!(home.filtered().len(), 2);
+
+        // 切换到收藏标签
+        home.nav = HomeNav::Favorites;
+        let favs = home.filtered();
+        assert_eq!(favs.len(), 1);
+        assert_eq!(favs[0], 0);
     }
 }

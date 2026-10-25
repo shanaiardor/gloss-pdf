@@ -15,8 +15,10 @@ mod engine;
 mod metadata;
 mod model;
 pub mod text_match;
+mod thumbnail;
 
-pub use engine::{Command, Event, PdfEngine, TileId, Visibility};
+pub use engine::{Command, Event, PdfEngine, PdfiumGate, TileId, Visibility};
 pub use model::{
     CharBox, DocumentMetadata, LinkBox, LinkTarget, OutlineItem, PageHits, PageSize, RectPt,
 };
+pub use thumbnail::{ThumbnailCommand, ThumbnailEngine, ThumbnailEvent};

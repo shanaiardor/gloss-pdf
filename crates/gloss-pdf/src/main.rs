@@ -20,6 +20,7 @@ mod search;
 mod selection;
 mod settings;
 mod theme;
+mod thumbnails;
 mod tiles;
 mod ui;
 mod update;

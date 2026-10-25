@@ -19,6 +19,7 @@
 │  dict_suggest.rs 联想限长/去重                   │
 │  progress.rs 阅读进度模型：页码/滚动比例/缩放     │
 │  viewer.rs   阅读器状态：文档/页/瓦片/内存预算    │
+│  thumbnails.rs 首页缩略图缓存与请求去重           │
 │  layout.rs   适宽/适页缩放、锚点与窗口尺寸        │
 │  tiles.rs    512×512 瓦片网格                    │
 │  selection.rs / search.rs / highlights.rs     │
@@ -30,6 +31,7 @@
 ┌───────────────▼─────────────────────────────┐
 │ crates/pdf-core（库，无 UI 依赖）              │
 │  engine.rs  PDFium worker：打开/瓦片/提取       │
+│  thumbnail.rs 首页缩略图 worker（独立线程）     │
 │  metadata.rs 文件尾元数据兜底（/ModDate）       │
 │  model.rs   RectPt / CharBox / Link / Outline │
 └─────────────────────────────────────────────┘
@@ -49,6 +51,7 @@
 | 模块 | 负责 | 不负责 |
 |---|---|---|
 | `pdf-core::engine` | PDFium 生命周期、单 worker 线程、位图优先的调度与可视快照过滤、按 512×512 瓦片渲染成 BGRA、文本/链接/目录提取、全文搜索计数 | 布局、坐标换算、交互 |
+| `pdf-core::thumbnail` | 首页缩略图专用线程：打开文件、按最大宽高渲染指定页成 BGRA | 缓存、去重、磁盘读写 |
 | `pdf-core::metadata` | 读取文件尾 `/ModDate` 等高层 API 读不到的值 | 常规元数据字段（`engine` 用 PDFium API） |
 | `pdf-core::model` | UI 无关的数据类型（含 `DocumentMetadata`） | 任何 GPUI 类型 |
 | `dict-core::engine` | MDX 线程、多词典配置与顺序、聚合查询、`@@@LINK` 跳转、前缀联想、读取同名/拆分 MDD、外置 CSS 和字体 | 渲染、设置读写 |
@@ -67,6 +70,7 @@
 | `dict_history::DictHistory` | 查词历史：倒序、去重、上限 50、JSON 落盘 | 词典查询 |
 | `dict_suggest` | 联想结果 trim、忽略大小写去重、最多 8 条，以及防抖常量 | 前缀查询（worker） |
 | `home::HomeState` | 最近阅读持久化（含阅读进度）、首页搜索过滤、侧栏选中项 | GPUI 控件 |
+| `thumbnails::Thumbnails` | 首页缩略图：按当前阅读页请求、去重、内存缓存、PNG 磁盘缓存 | PDF 渲染、窗口事件 |
 | `progress::ReadingProgress` | 页码/页内滚动比例/缩放/适应模式的数据模型与百分比换算 | 磁盘读写、视口换算 |
 | `layout` | 页边距、适宽/适页缩放、按纸张比例算窗口尺寸、指针/页内比例锚点换算 | 绘制、窗口 API |
 | `tiles::TileGrid` | 按缩放把页面切成 512×512 瓦片，求与视口相交的瓦片 | 请求调度、缓存 |
@@ -120,13 +124,21 @@
     陈旧渲染，当前页的位图始终排在它们前面。`Viewer::evict` 在超过 256 MiB 或 12 页时按页距和
     瓦片到可视区的距离淘汰。指针锚定缩放时用 `page_ratios` 记录指针下的页内比例，缩放后用
     `scroll_for_ratios` 还原滚动位置。
+11. 首页最近阅读卡片读 `recent.progress.page` 作为预览页；缺图时向独立的 `ThumbnailEngine`
+    发请求，worker 在自己的线程里用 PDFium 渲染整页（最大 360×640）并回 BGRA。UI 以
+    「文件 + 页码 + 修改时间」为键做内存与 PNG 磁盘缓存，新图到达后替换卡片；旧图先留在卡片上，
+    避免等待新图时闪回占位图。阅读器一打开文档，缩略图请求就回 `Cancelled` 并让出 `PdfiumGate`。
 
 约束：
 
 - **pdf-core / dict-core 不依赖 gpui**，可以直接写单元测试，也可以以后换渲染后端。
 - **UI 不直接调 PDFium**，只读 Viewer。
 - **坐标换算只在一处**：`AppState::page_origin` / `to_pdf`，PDF pt（左下原点）↔ 屏幕 px（左上原点）。
-- **PDFium 非线程安全**：所有 PDFium 调用都在 worker 线程；UI 只拿结果。
+- **PDFium 非线程安全**：所有 PDFium 调用都在 worker 线程；UI 只拿结果。阅读器与首页缩略图两个 worker
+  共用一把 `PdfiumGate`：阅读器 `Open` 前先标记 `reader_active` 并抢闸门，等当前缩略图退出临界区；
+  阅读器有文档时缩略图请求直接回 `Cancelled` 让路。否则两个实例同时解析同一个大文件，页面树和
+  /Outlines 会停在半初始化状态（8910 页的扫描件会读不到目录）。关闭文档时 UI 发 `Command::Close`
+  释放文档句柄，缩略图 worker 才能继续。
 - **位图优先于一切慢任务**：PDFium 只有一个线程，翻页时的等待时间全花在「渲完旧页」还是「让当前页出图」上。
   新增的渲染类命令都必须能被 `Visibility` 快照作废（用请求代号 + `TileSkipped` 一类回执清标记），
   否则快速翻页会重新堆出迟滞。

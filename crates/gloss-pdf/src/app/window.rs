@@ -159,8 +159,10 @@ impl super::AppState {
 
             let (room_width, room_height) = window_room(window, cx);
             let (mut width, height) = window_size_for_page(page, room_width, room_height);
-            // 只有文档里已有钉住的笺注、确实需要常驻栏位时才加宽；
-            // 「配置了词典」本身不该把没打开词典的窗口也撑宽。
+            if self.viewer.fit_mode == crate::layout::FitMode::Free {
+                let free_width = page.width * self.viewer.zoom + crate::layout::PAGE_PAD * 2.0;
+                width = width.max(free_width).min(room_width);
+            }
             if self.has_gloss_rail() {
                 width = (width + GLOSS_RAIL_EXTENT).min(room_width);
             }

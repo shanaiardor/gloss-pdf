@@ -355,36 +355,78 @@ impl AppState {
         }
     }
 
-    pub(crate) fn window_controls(&self, _theme: &Theme) -> gpui::Div {
-        // macOS 上使用系统原生的红黄绿三色交通灯，避免在左上角出现重复的自绘按钮
+    pub(crate) fn window_controls(&self, theme: &Theme) -> gpui::Div {
+        // macOS 上使用系统原生的红黄绿三色交通灯在左上角
         #[cfg(target_os = "macos")]
         {
             div()
         }
+        // Windows 上窗口控制按钮放在右上角，符合 Windows 原生操作习惯
         #[cfg(not(target_os = "macos"))]
         {
+            let hover_bg = theme.surface_hover;
             div()
                 .absolute()
-                .top(px(14.))
-                .left(px(16.))
+                .top_0()
+                .right_0()
+                .h(px(40.))
                 .flex()
                 .items_center()
-                .gap(px(8.))
-                .child(window_control_dot(
-                    "win-close",
-                    WindowControlArea::Close,
-                    rgb(0xff5f57),
-                ))
-                .child(window_control_dot(
-                    "win-min",
-                    WindowControlArea::Min,
-                    rgb(0xfebc2e),
-                ))
-                .child(window_control_dot(
-                    "win-max",
-                    WindowControlArea::Max,
-                    rgb(0x28c840),
-                ))
+                .occlude()
+                .child(
+                    div()
+                        .id("win-min")
+                        .w(px(46.))
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(hover_bg))
+                        .window_control_area(WindowControlArea::Min)
+                        .child(
+                            div()
+                                .w(px(10.))
+                                .h(px(1.))
+                                .bg(theme.text),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("win-max")
+                        .w(px(46.))
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(hover_bg))
+                        .window_control_area(WindowControlArea::Max)
+                        .child(
+                            div()
+                                .size(px(10.))
+                                .border_1()
+                                .border_color(theme.text),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("win-close")
+                        .w(px(46.))
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0xe81123)).text_color(rgb(0xffffff)))
+                        .window_control_area(WindowControlArea::Close)
+                        .child(
+                            div()
+                                .text_size(px(14.))
+                                .text_color(theme.text)
+                                .child("✕"),
+                        ),
+                )
         }
     }
 }
@@ -598,24 +640,6 @@ fn fit_button(
     } else {
         button
     }
-}
-
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-fn window_control_dot(
-    id: &'static str,
-    area: WindowControlArea,
-    color: gpui::Rgba,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .size(px(12.))
-        .rounded_full()
-        .bg(color)
-        .cursor_pointer()
-        .hover(|style| style.opacity(0.82))
-        // 首页顶部整条都可拖动，窗口按钮要挡住拖拽命中区。
-        .occlude()
-        .window_control_area(area)
 }
 
 #[cfg(test)]

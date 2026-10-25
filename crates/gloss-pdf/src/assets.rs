@@ -28,6 +28,9 @@ impl AssetSource for Assets {
 
 const ICON_PATHS: &[&str] = &[
     "icons/home.svg",
+    "icons/recent.svg",
+    "icons/favorite.svg",
+    "icons/bookmark.svg",
     "icons/open.svg",
     "icons/outline.svg",
     "icons/search.svg",
@@ -36,11 +39,15 @@ const ICON_PATHS: &[&str] = &[
     "icons/dictionary.svg",
     "icons/save.svg",
     "icons/settings.svg",
+    "icons/about.svg",
 ];
 
 fn icon(path: &str) -> Option<&'static [u8]> {
     Some(match path {
         "icons/home.svg" => include_bytes!("../assets/icons/home.svg"),
+        "icons/recent.svg" => include_bytes!("../assets/icons/recent.svg"),
+        "icons/favorite.svg" => include_bytes!("../assets/icons/favorite.svg"),
+        "icons/bookmark.svg" => include_bytes!("../assets/icons/bookmark.svg"),
         "icons/open.svg" => include_bytes!("../assets/icons/open.svg"),
         "icons/outline.svg" => include_bytes!("../assets/icons/outline.svg"),
         "icons/search.svg" => include_bytes!("../assets/icons/search.svg"),
@@ -49,6 +56,7 @@ fn icon(path: &str) -> Option<&'static [u8]> {
         "icons/dictionary.svg" => include_bytes!("../assets/icons/dictionary.svg"),
         "icons/save.svg" => include_bytes!("../assets/icons/save.svg"),
         "icons/settings.svg" => include_bytes!("../assets/icons/settings.svg"),
+        "icons/about.svg" => include_bytes!("../assets/icons/about.svg"),
         _ => return None,
     })
 }

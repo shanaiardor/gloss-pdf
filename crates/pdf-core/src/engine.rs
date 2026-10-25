@@ -15,8 +15,9 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use futures::channel::mpsc::UnboundedSender;
@@ -26,6 +27,39 @@ use crate::model::{
     CharBox, DocumentMetadata, LinkBox, LinkTarget, OutlineItem, PageHits, PageSize, RectPt,
 };
 use crate::text_match::count_matches;
+
+/// 阅读器与首页缩略图两个 PDFium worker 共用的串行闸门。
+///
+/// PDFium 不是线程安全的。两个 `Pdfium` 实例同时打开同一个大文件时，页面树和书签
+/// 可能停在半初始化状态（八千页的扫描件会读不到目录）。缩略图 worker 只在阅读器
+/// 没有打开文档时工作；两边用同一把锁串行化真正触达 PDFium 的临界区。
+#[derive(Clone, Default)]
+pub struct PdfiumGate {
+    lock: Arc<Mutex<()>>,
+    reader_active: Arc<AtomicBool>,
+}
+
+impl PdfiumGate {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
+        // 临界区里 panic 只会让 PDFium 状态不可信，调用方会结束进程；取回数据即可。
+        self.lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn reader_active(&self) -> bool {
+        self.reader_active.load(Ordering::SeqCst)
+    }
+
+    /// UI 用：阅读器正在打开/持有文档时，首页不该再排缩略图请求。
+    pub fn is_reader_active(&self) -> bool {
+        self.reader_active()
+    }
+
+    pub(crate) fn set_reader_active(&self, active: bool) {
+        self.reader_active.store(active, Ordering::SeqCst);
+    }
+}
 
 /// 一个瓦片在整个文档像素坐标系里的唯一标识：(页号, 整页像素坐标原点)。
 ///
@@ -85,6 +119,8 @@ impl Visibility {
 /// 发给 PDF 工作线程的命令。
 pub enum Command {
     Open(PathBuf),
+    /// 关闭当前文档，释放 PDFium 文档句柄；首页缩略图 worker 随后可以继续工作。
+    Close,
     /// 渲染一个页面瓦片。`origin_x`/`origin_y` 是瓦片左上角在整页像素坐标中的位置，
     /// 由调用方按固定瓦片尺寸切分；`width`/`height` 是瓦片位图尺寸。
     RenderTile {
@@ -171,13 +207,19 @@ pub struct PdfEngine {
 }
 
 impl PdfEngine {
+    /// 单独使用阅读器引擎时（测试/示例）使用一把私有闸门。
     pub fn spawn(events: UnboundedSender<Event>) -> Self {
+        Self::spawn_with_gate(events, PdfiumGate::default())
+    }
+
+    /// 阅读器与缩略图 worker 必须共用同一把 [`PdfiumGate`]。
+    pub fn spawn_with_gate(events: UnboundedSender<Event>, gate: PdfiumGate) -> Self {
         let (commands, receiver) = mpsc::channel();
         let visibility = Visibility::default();
         let worker_visibility = visibility.clone();
         std::thread::Builder::new()
             .name("pdfium-worker".into())
-            .spawn(move || worker_loop(receiver, worker_visibility, events))
+            .spawn(move || worker_loop(receiver, worker_visibility, events, gate))
             .expect("failed to spawn pdf worker");
         Self {
             commands,
@@ -210,7 +252,7 @@ impl Backlog {
     fn accept(&mut self, command: Command) -> Option<Command> {
         match command {
             Command::RenderTile { .. } => Some(command),
-            Command::Open(_) => {
+            Command::Open(_) | Command::Close => {
                 self.slow.clear();
                 Some(command)
             }
@@ -240,17 +282,19 @@ struct Worker {
     page_elements: Vec<Option<(Vec<CharBox>, Vec<LinkBox>)>>,
     /// UI 发布的可视范围。
     wanted: Visibility,
+    gate: PdfiumGate,
     events: UnboundedSender<Event>,
 }
 
 impl Worker {
-    fn new(wanted: Visibility, events: UnboundedSender<Event>) -> Self {
+    fn new(wanted: Visibility, events: UnboundedSender<Event>, gate: PdfiumGate) -> Self {
         Self {
             pdfium: None,
             document: None,
             page_text: Vec::new(),
             page_elements: Vec::new(),
             wanted,
+            gate,
             events,
         }
     }
@@ -258,6 +302,7 @@ impl Worker {
     fn run(&mut self, command: Command) {
         match command {
             Command::Open(path) => self.run_open(&path),
+            Command::Close => self.run_close(),
             Command::RenderTile {
                 page,
                 scale,
@@ -276,11 +321,26 @@ impl Worker {
         let _ = self.events.unbounded_send(Event::Error(message));
     }
 
+    /// 关闭文档，释放 PDFium 文档句柄；缩略图 worker 随后可以继续。
+    fn run_close(&mut self) {
+        let _guard = self.gate.lock();
+        self.document = None;
+        self.page_text.clear();
+        self.page_elements.clear();
+        self.gate.set_reader_active(false);
+        log::info!("document closed");
+    }
+
     fn run_open(&mut self, path: &Path) {
+        // 先标记「阅读器有文档」，再抢闸门：缩略图 worker 可能在渲染中途，
+        // 等它退出临界区后再打开，避免两个 PDFium 实例同时解析同一个大文件。
+        self.gate.set_reader_active(true);
+        let _guard = self.gate.lock();
         if self.pdfium.is_none() {
             match bind_pdfium() {
                 Ok(instance) => self.pdfium = Some(instance),
                 Err(error) => {
+                    self.gate.set_reader_active(false);
                     self.report(format!("加载 PDFium 失败: {error:#}"));
                     return;
                 }
@@ -299,7 +359,10 @@ impl Worker {
                     metadata,
                 });
             }
-            Err(error) => self.report(format!("打开 PDF 失败: {error:#}")),
+            Err(error) => {
+                self.gate.set_reader_active(false);
+                self.report(format!("打开 PDF 失败: {error:#}"));
+            }
         }
     }
 
@@ -388,8 +451,9 @@ fn worker_loop(
     commands: Receiver<Command>,
     visibility: Visibility,
     events: UnboundedSender<Event>,
+    gate: PdfiumGate,
 ) {
-    let mut worker = Worker::new(visibility, events);
+    let mut worker = Worker::new(visibility, events, gate);
     let mut backlog = Backlog::default();
 
     loop {
@@ -507,7 +571,7 @@ fn search_document(
     }
 }
 
-fn bind_pdfium() -> Result<&'static Pdfium> {
+pub(crate) fn bind_pdfium() -> Result<&'static Pdfium> {
     let mut directories = Vec::new();
     if let Ok(exe) = std::env::current_exe()
         && let Some(parent) = exe.parent()
@@ -579,23 +643,39 @@ fn open_document(
     Vec<OutlineItem>,
     DocumentMetadata,
 )> {
+    let opened_at = Instant::now();
     let document = pdfium
         .load_pdf_from_file(path, None)
         .map_err(|error| anyhow!(error))
         .with_context(|| format!("无法读取 {}", path.display()))?;
+    log::info!(
+        "pdfium opened {} in {:?}",
+        path.display(),
+        opened_at.elapsed()
+    );
 
-    let mut pages = Vec::new();
-    for page in document.pages().iter() {
-        pages.push(PageSize {
-            width: page.width().value,
-            height: page.height().value,
-        });
-    }
+    // `pages().iter()` 会为每一页调用 FPDF_LoadPage，八千页的文件光读尺寸就要好几秒。
+    // `page_size()` 走 FPDF_GetPageSizeByIndexF，不加载页面内容，只解析页面字典；
+    // 全书扫一遍约 1 秒，但能顺带把页面树初始化，后面的书签才能读到完整层级。
+    let sizes_at = Instant::now();
+    let page_collection = document.pages();
+    let pages = read_page_sizes(&page_collection);
+    log::info!(
+        "read {} page sizes in {:?}",
+        pages.len(),
+        sizes_at.elapsed()
+    );
 
+    let outline_at = Instant::now();
     let mut outline = Vec::new();
     for bookmark in document.bookmarks().iter() {
         collect_bookmark(&bookmark, 0, &mut outline);
     }
+    log::info!(
+        "read {} outline items in {:?}",
+        outline.len(),
+        outline_at.elapsed()
+    );
 
     let metadata = DocumentMetadata {
         title: metadata_value(&document, PdfDocumentMetadataTagType::Title),
@@ -612,6 +692,57 @@ fn open_document(
     };
 
     Ok((document, pages, outline, metadata))
+}
+
+/// 读取全书页尺寸。
+///
+/// 用 `FPDF_GetPageSizeByIndexF` 而不是 `pages().iter()`：不加载页面内容，
+/// 8910 页的扫描件约 1 秒读完；同时这次完整遍历会初始化页面树，后面的书签
+/// 才能读到全部子项。
+fn read_page_sizes(pages: &PdfPages<'_>) -> Vec<PageSize> {
+    let count = pages.len() as usize;
+    let mut result = Vec::with_capacity(count);
+    let mut fallback = PageSize {
+        width: 595.0,
+        height: 842.0,
+    };
+    let mut failed = 0usize;
+
+    for index in 0..count {
+        let size = match page_size_at(pages, index) {
+            Some(size) if valid_page_size(size) => size,
+            Some(_) | None => {
+                failed += 1;
+                fallback
+            }
+        };
+        if valid_page_size(size) {
+            fallback = size;
+        }
+        result.push(fallback);
+    }
+
+    if failed > 0 {
+        log::warn!("{failed} pages had no usable size; reused the previous page size");
+    }
+    result
+}
+
+fn page_size_at(pages: &PdfPages<'_>, index: usize) -> Option<PageSize> {
+    pages
+        .page_size(index as PdfPageIndex)
+        .ok()
+        .map(|rect| PageSize {
+            width: rect.width().value,
+            height: rect.height().value,
+        })
+}
+
+fn valid_page_size(size: PageSize) -> bool {
+    size.width.is_finite()
+        && size.height.is_finite()
+        && size.width > 0.0
+        && size.height > 0.0
 }
 
 /// 读取一个元数据标签，去掉首尾空白；空字符串按缺失处理。
@@ -650,6 +781,7 @@ fn render_tile(
     height: u32,
     request: u64,
 ) -> Result<Event> {
+    let started = Instant::now();
     let page = document
         .pages()
         .get(page_index as PdfPageIndex)
@@ -673,10 +805,11 @@ fn render_tile(
     page.render_into_bitmap_with_config(&mut bitmap, &config)
         .map_err(|error| anyhow!(error))?;
     log::debug!(
-        "page {} tile ({origin_x},{origin_y}) {}x{}",
+        "page {} tile ({origin_x},{origin_y}) {}x{} in {:?}",
         page_index,
         width,
-        height
+        height,
+        started.elapsed()
     );
 
     Ok(Event::RenderedTile {
@@ -919,5 +1052,14 @@ mod tests {
     #[test]
     fn counts_chinese_hits_across_spaces() {
         assert_eq!(count_matches("汉 字 与 汉 字", "汉字"), 2);
+    }
+
+    #[test]
+    fn invalid_page_sizes_are_rejected() {
+        assert!(!valid_page_size(PageSize::default()));
+        assert!(!valid_page_size(PageSize {
+            width: 595.0,
+            height: f32::NAN,
+        }));
     }
 }

@@ -16,6 +16,7 @@ use pdf_core::{CharBox, Event, LinkTarget};
 
 use super::FocusTarget;
 use crate::dictionary::{DictLoadState, normalize_term};
+use crate::home::HomeNav;
 
 impl super::AppState {
     // ---------- 引擎事件 ----------
@@ -562,6 +563,8 @@ impl super::AppState {
                     cx.quit();
                 }
                 "f" => {
+                    self.home.nav = HomeNav::Home;
+                    self.settings_open = false;
                     self.home.search_focused = true;
                     self.pending_focus = Some(FocusTarget::HomeSearch);
                     self.set_status("输入关键词筛选最近阅读，Esc 清空", cx);
@@ -574,7 +577,12 @@ impl super::AppState {
 
         match keystroke.key.as_str() {
             "escape" => {
-                if self.settings_open {
+                if self.home.nav == HomeNav::Settings {
+                    // 设置页没有「关闭」按钮，Esc 退回主页。
+                    self.home.nav = HomeNav::Home;
+                    self.pending_focus = Some(FocusTarget::Root);
+                    cx.notify();
+                } else if self.settings_open {
                     self.toggle_settings(cx);
                 } else {
                     self.clear_home_query(cx);
@@ -593,6 +601,8 @@ impl super::AppState {
                     && !key_char.chars().all(char::is_control)
                 {
                     let text = key_char.clone();
+                    self.home.nav = HomeNav::Home;
+                    self.settings_open = false;
                     self.home.search_focused = true;
                     self.home.menu_open = None;
                     self.home_input

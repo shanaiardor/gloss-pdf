@@ -22,10 +22,10 @@ impl super::AppState {
 
     /// 当前文档是否需要预留右侧页边笺注栏。
     ///
-    /// 只有**已钉住**的笺注会常驻页边、参与排版；激活态查词卡是临时浮层，
-    /// 不能因为开关词典就改变纸张宽度和适宽/适页缩放，否则页面会突然缩放、左移。
+    /// 阅读 PDF 时始终在右侧预留页边笺注空间（视口过窄时由 `rail_fits` 兜底），
+    /// 这样无论当前是否已有钉住的笺注，查词与钉住都不会遮挡正文或跳出视口。
     pub(crate) fn has_gloss_rail(&self) -> bool {
-        self.viewer.highlights.has_glosses()
+        true
     }
 
     /// 用当前视口把恢复出来的页内比例换算成滚动偏移。
@@ -482,17 +482,42 @@ impl super::AppState {
         )
     }
 
-    /// 视口或页边栏状态变化后按当前适宽/适页模式重算缩放，并把阅读位置留在原来的锚点上。
+    /// 视口或页边栏状态变化后按当前模式重算缩放，并把阅读位置留在原来的锚点上。
     ///
+    /// 即便处于自由缩放（`FitMode::Free`），当页面宽度侵占了右侧页边笺注栏空间时，
+    /// 也会将缩放收拢到可容纳右侧栏的上限，确保页边笺注始终有空间显示。
     /// 返回 `true` 表示缩放或模式变了，调用方需要重新检查可视页。
     pub(super) fn refit(&mut self) -> bool {
         let mode = self.viewer.fit_mode;
+        let area = self.fit_area();
         if mode == FitMode::Free {
-            return false;
+            if !self.has_gloss_rail()
+                || !crate::layout::rail_fits(f32::from(self.viewport.width))
+            {
+                return false;
+            }
+            let Some(page_size) = self.viewer.page_size() else {
+                return false;
+            };
+            if !page_size.width.is_finite() || page_size.width <= 0.0 {
+                return false;
+            }
+            if page_size.width * self.viewer.zoom <= area.width + 0.5 {
+                return false;
+            }
+            let Some(max_zoom) = crate::layout::zoom_for(page_size, area, FitMode::Width) else {
+                return false;
+            };
+            let anchor = self.doc_layout().map(|layout| self.reading_anchor(&layout));
+            self.viewer.set_zoom(max_zoom);
+            if let (Some(layout), Some((page, ratio))) = (self.doc_layout(), anchor) {
+                self.scroll_to_anchor(&layout, page, ratio);
+            }
+            return true;
         }
 
         let anchor = self.doc_layout().map(|layout| self.reading_anchor(&layout));
-        if !self.viewer.fit(mode, self.fit_area()) {
+        if !self.viewer.fit(mode, area) {
             return false;
         }
         if let (Some(layout), Some((page, ratio))) = (self.doc_layout(), anchor) {

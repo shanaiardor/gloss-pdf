@@ -27,7 +27,7 @@ use futures::StreamExt;
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, Focusable, Render, Size, Window, div, prelude::*, px,
 };
-use pdf_core::{PageSize, PdfEngine};
+use pdf_core::{PageSize, PdfEngine, PdfiumGate, ThumbnailEngine};
 
 use crate::chrome_visibility::ChromeVisibility;
 use crate::dict_history::DictHistory;
@@ -36,6 +36,7 @@ use crate::home::{HomeNav, HomeState};
 use crate::progress::ReadingProgress;
 use crate::settings::{SettingsStore, WindowState};
 use crate::theme::Theme;
+use crate::thumbnails::Thumbnails;
 use crate::ui::text_input::{TextInput, TextInputEvent};
 use crate::update::UpdateEngine;
 use crate::viewer::Viewer;
@@ -56,7 +57,12 @@ pub struct AppState {
     pub(crate) theme: Theme,
     pub(crate) focus_handle: FocusHandle,
     pub(crate) engine: PdfEngine,
+    /// 与缩略图 worker 共用的 PDFium 闸门；首页据此判断是否该暂停缩略图。
+    pub(crate) pdfium_gate: PdfiumGate,
+    /// 首页缩略图专用 worker；与阅读器引擎分开，避免互相拖慢。
+    pub(crate) thumbnail_engine: ThumbnailEngine,
     pub(crate) viewer: Viewer,
+    pub(crate) thumbnails: Thumbnails,
     pub(crate) home: HomeState,
     pub(crate) search_input: Entity<TextInput>,
     pub(crate) home_input: Entity<TextInput>,
@@ -124,12 +130,29 @@ impl AppState {
     /// 两处各读一遍磁盘会不一致，也会白读一次。
     pub fn with_settings(cx: &mut Context<Self>, settings: SettingsStore) -> Self {
         let (event_tx, mut event_rx) = futures::channel::mpsc::unbounded();
-        let engine = PdfEngine::spawn(event_tx);
+        let pdfium_gate = PdfiumGate::default();
+        let engine = PdfEngine::spawn_with_gate(event_tx, pdfium_gate.clone());
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = event_rx.next().await {
                 if this
                     .update(cx, |this, cx| this.handle_event(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        // 首页缩略图有自己的 worker：一次要补十几张图，不能和翻页渲染抢队列。
+        // 两者共用 PDFiumGate，打开文档时会等缩略图退出临界区，避免同时解析同一个大文件。
+        let (thumbnail_tx, mut thumbnail_rx) = futures::channel::mpsc::unbounded();
+        let thumbnail_engine = ThumbnailEngine::spawn_with_gate(thumbnail_tx, pdfium_gate.clone());
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = thumbnail_rx.next().await {
+                if this
+                    .update(cx, |this, cx| this.handle_thumbnail_event(event, cx))
                     .is_err()
                 {
                     break;
@@ -260,7 +283,7 @@ impl AppState {
 
         let search_input =
             cx.new(|cx| TextInput::new("输入关键词，Enter 下一个", theme.clone(), 13.0, cx));
-        let home_input = cx.new(|cx| TextInput::new("笺释", theme.clone(), 13.0, cx));
+        let home_input = cx.new(|cx| TextInput::new("搜索书名、作者或全文", theme.clone(), 13.0, cx));
         let page_input = cx.new(|cx| TextInput::new("页码", theme.clone(), 12.0, cx));
         let dict_input =
             cx.new(|cx| TextInput::new("输入字词，Enter 查词", theme.clone(), 12.0, cx));
@@ -283,6 +306,9 @@ impl AppState {
             |this, _input, event: &TextInputEvent, cx| match event {
                 TextInputEvent::Changed => {
                     this.home.query = this.home_input.read(cx).value().to_string();
+                    // 搜索只对最近阅读列表有意义，输入时自动离开设置页。
+                    this.home.nav = HomeNav::Home;
+                    this.settings_open = false;
                     this.home.search_focused = true;
                     this.home.menu_open = None;
                     cx.notify();
@@ -327,7 +353,10 @@ impl AppState {
             theme,
             focus_handle: cx.focus_handle(),
             engine,
+            pdfium_gate,
+            thumbnail_engine,
             viewer: Viewer::new(),
+            thumbnails: Thumbnails::default(),
             home: HomeState::load(),
             search_input,
             home_input,
@@ -411,12 +440,20 @@ impl AppState {
     }
 
     pub(crate) fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        // 首页的「设置」是内容区里的一页；阅读器里没有可替换的页面，才用浮层。
+        if !self.viewer.has_document() {
+            self.settings_open = false;
+            self.home.nav = HomeNav::Settings;
+            self.home.menu_open = None;
+            self.home.search_focused = false;
+            cx.notify();
+            return;
+        }
+
         self.settings_open = !self.settings_open;
         if self.settings_open {
             self.home.menu_open = None;
             self.home.search_focused = false;
-        } else if !self.viewer.has_document() {
-            self.home.nav = HomeNav::Home;
         }
         cx.notify();
     }
@@ -431,6 +468,7 @@ impl Focusable for AppState {
 impl Render for AppState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 窗口尺寸只能在拿到 Window 的地方改；改完等平台的 resize 事件再重算缩放。
+        let had_pending_fit = self.pending_window_fit.is_some();
         self.apply_pending_window_resize(window, &**cx);
         if self.window_title_dirty {
             window.set_window_title(&self.window_title);
@@ -438,7 +476,7 @@ impl Render for AppState {
         }
 
         let viewport_changed = self.sync_window_metrics(window, &**cx);
-        if viewport_changed && self.viewer.has_document() {
+        if (viewport_changed || had_pending_fit) && self.viewer.has_document() {
             // 适宽/适页在窗口变化后要重算缩放，阅读位置保持在同一个锚点上。
             self.refit();
         }
@@ -454,6 +492,11 @@ impl Render for AppState {
         }
 
         let theme = self.theme.clone();
+
+        // 首页缩略图：首帧读缓存，缺图时排队；设置页没有卡片，不必生成。
+        if !self.viewer.has_document() && self.home.nav == HomeNav::Home {
+            self.ensure_home_thumbnails();
+        }
 
         let content: gpui::AnyElement = if self.viewer.has_document() {
             self.page_content(&theme, cx).into_any_element()
