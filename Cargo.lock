@@ -1309,7 +1309,7 @@ dependencies = [
 
 [[package]]
 name = "dict-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "encoding_rs",
@@ -2010,7 +2010,7 @@ dependencies = [
 
 [[package]]
 name = "gloss-pdf"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "dict-core",
@@ -4168,7 +4168,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "futures",
