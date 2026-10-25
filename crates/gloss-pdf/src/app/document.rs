@@ -155,8 +155,8 @@ impl super::AppState {
         let area = self.fit_area();
         let _ = self.viewer.fit(self.viewer.fit_mode, area);
         let restored = saved.is_some_and(|progress| self.viewer.restore_progress(&progress, area));
-        self.refit();
         self.apply_pending_scroll();
+        self.refit();
 
         // 等 render 拿到当前显示器工作区后，按这张纸的比例调整窗口；
         // 随后视口变化会再按适宽/适页模式重算缩放。
