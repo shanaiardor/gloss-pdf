@@ -14,6 +14,7 @@
 mod engine;
 mod metadata;
 mod model;
+mod pdfium_setup;
 pub mod text_match;
 mod thumbnail;
 

@@ -199,6 +199,11 @@ impl AppState {
             ThumbnailEvent::Cancelled { request } => {
                 self.thumbnails.cancel(request);
             }
+            ThumbnailEvent::Status(message) => {
+                log::info!("{message}");
+                self.set_status(message, cx);
+                cx.notify();
+            }
         }
     }
 }

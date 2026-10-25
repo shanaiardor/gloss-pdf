@@ -206,6 +206,8 @@ pub enum Event {
         request: u64,
         text: String,
     },
+    /// 运行期进度提示（例如首次启动自动下载 PDFium），不是错误。
+    Status(String),
     Error(String),
 }
 
@@ -349,7 +351,11 @@ impl Worker {
         self.gate.set_reader_active(true);
         let _guard = self.gate.lock();
         if self.pdfium.is_none() {
-            match bind_pdfium() {
+            let events = self.events.clone();
+            let mut status = |message: &str| {
+                let _ = events.unbounded_send(Event::Status(message.to_string()));
+            };
+            match bind_pdfium(&mut status) {
                 Ok(instance) => self.pdfium = Some(instance),
                 Err(error) => {
                     self.gate.set_reader_active(false);
@@ -620,7 +626,7 @@ fn search_document(
     }
 }
 
-pub(crate) fn bind_pdfium() -> Result<&'static Pdfium> {
+pub(crate) fn bind_pdfium(report: &mut dyn FnMut(&str)) -> Result<&'static Pdfium> {
     let mut directories = Vec::new();
     if let Ok(exe) = std::env::current_exe()
         && let Some(parent) = exe.parent()
@@ -639,6 +645,12 @@ pub(crate) fn bind_pdfium() -> Result<&'static Pdfium> {
         directories.push(cwd);
     }
 
+    // 自动下载的库固定放在用户数据目录。
+    let managed = crate::pdfium_setup::managed_library_path();
+    if let Some(parent) = managed.as_deref().and_then(Path::parent) {
+        directories.push(parent.to_path_buf());
+    }
+
     // 常见包管理器或系统库路径（如 macOS Homebrew）
     #[cfg(target_os = "macos")]
     {
@@ -652,8 +664,8 @@ pub(crate) fn bind_pdfium() -> Result<&'static Pdfium> {
     }
 
     let mut last_error: Option<anyhow::Error> = None;
-    for directory in directories {
-        let library = Pdfium::pdfium_platform_library_name_at_path(&directory);
+    for directory in &directories {
+        let library = Pdfium::pdfium_platform_library_name_at_path(directory);
         if !library.exists() {
             continue;
         }
@@ -668,18 +680,39 @@ pub(crate) fn bind_pdfium() -> Result<&'static Pdfium> {
         }
     }
 
-    let lib_name = if cfg!(target_os = "windows") {
-        "pdfium.dll"
-    } else if cfg!(target_os = "macos") {
-        "libpdfium.dylib"
-    } else {
-        "libpdfium.so"
-    };
+    // 受管目录里已有文件却绑定失败时不再重新下载：说明文件本身有问题，
+    // 反复覆盖只会把故障藏起来。
+    if managed.as_ref().is_some_and(|path| !path.exists()) {
+        if crate::pdfium_setup::can_retry() {
+            match crate::pdfium_setup::install(report) {
+                Ok(library) => match Pdfium::bind_to_library(&library) {
+                    Ok(bindings) => {
+                        log::info!("pdfium bound from {}", library.display());
+                        return Ok(Box::leak(Box::new(Pdfium::new(bindings))));
+                    }
+                    Err(error) => last_error = Some(anyhow!(error)),
+                },
+                Err(error) => last_error = Some(error),
+            }
+        } else {
+            last_error = Some(anyhow!("PDFium 自动下载刚刚失败，已暂停重试"));
+        }
+    }
 
     match Pdfium::bind_to_system_library() {
         Ok(bindings) => Ok(Box::leak(Box::new(Pdfium::new(bindings)))),
-        Err(error) => Err(last_error.unwrap_or_else(|| anyhow!(error)))
-            .with_context(|| format!("找不到 {lib_name}（请放到可执行文件目录、项目根目录，或通过系统包管理器安装）")),
+        Err(error) => {
+            let managed = managed
+                .as_deref()
+                .map(|path| format!("或 {}", path.display()))
+                .unwrap_or_default();
+            Err(last_error.unwrap_or_else(|| anyhow!(error))).with_context(|| {
+                format!(
+                    "找不到可用的 {}；可手动放到可执行文件目录、项目根目录{managed}，或运行 scripts/setup-pdfium.sh",
+                    crate::pdfium_setup::LIBRARY_FILE_NAME
+                )
+            })
+        }
     }
 }
 

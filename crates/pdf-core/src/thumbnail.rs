@@ -48,6 +48,8 @@ pub enum ThumbnailEvent {
     Cancelled {
         request: u64,
     },
+    /// 运行期进度提示（例如自动下载 PDFium）。
+    Status(String),
 }
 
 pub struct ThumbnailEngine {
@@ -97,7 +99,10 @@ fn worker_loop(
         }
 
         if pdfium.is_none() {
-            match bind_pdfium() {
+            let mut status = |message: &str| {
+                let _ = events.unbounded_send(ThumbnailEvent::Status(message.to_string()));
+            };
+            match bind_pdfium(&mut status) {
                 Ok(instance) => pdfium = Some(instance),
                 Err(error) => {
                     let _ = events.unbounded_send(ThumbnailEvent::Failed {

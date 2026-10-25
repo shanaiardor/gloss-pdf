@@ -79,6 +79,10 @@ impl super::AppState {
                 self.complete_page_read(request, Ok(text));
                 return;
             }
+            Event::Status(message) => {
+                log::info!("{message}");
+                self.set_status(message, cx);
+            }
             Event::Error(message) => {
                 log::error!("{message}");
                 self.set_status(message, cx);

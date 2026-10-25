@@ -47,15 +47,17 @@
 
 ## 快速上手
 
-### 1. 准备 PDFium 动态库
+### 1. PDFium 动态库（通常无需手动准备）
 
-程序运行依赖 PDFium 动态链接库：
-- **Windows**：仓库根目录已内置 `pdfium.dll`，直接可用。
-- **macOS**：运行脚本一键下载匹配当前架构（Apple Silicon / Intel）的 `libpdfium.dylib`：
+程序运行依赖 PDFium 动态链接库，但**首次打开 PDF 时会自动下载当前平台的构建**，并保存到用户数据目录（macOS 为 `~/Library/Application Support/gloss-pdf/pdfium/`），之后直接复用：
+
+- **Windows**：仓库根目录已内置 `pdfium.dll`，直接可用；缺失时同样会自动补齐。
+- **macOS / Linux**：本地没有可用动态库时自动下载匹配当前架构的版本；下载失败会在提示里给出错误原因与手动放置位置。
+- 网络受限时，可提前运行脚本，或手动把动态库放到项目根目录 / 可执行文件目录：
   ```bash
   bash scripts/setup-pdfium.sh
   ```
-  *(也可通过 `brew install pdfium` 安装，或手动将 `libpdfium.dylib` 放到项目根目录)*
+- 需要走镜像或离线包时，可用 `GLOSS_PDF_PDFIUM_URL` 指定完整下载地址（应指向与官方发布包相同结构的 `.tgz`）。
 
 ### 2. 编译与运行
 
@@ -67,7 +69,7 @@ cargo run -p gloss-pdf
 cargo run -p gloss-pdf -- samples/dummy.pdf
 ```
 
-> **提示**：首次编译 GPUI 耗时较长。运行时程序按「可执行文件目录 → 当前工作目录 → macOS Frameworks 目录 → 系统/Homebrew 库目录」顺序查找 PDFium 动态库。
+> **提示**：首次编译 GPUI 耗时较长。运行时程序按「可执行文件目录 → macOS Frameworks 目录 → 当前工作目录 → 用户数据目录（自动下载位置） → 系统/Homebrew 库目录」顺序查找 PDFium 动态库，全部落空时才触发自动下载。
 >
 > 如需替换默认界面字体版本，可将环境变量 `GLOSS_PDF_FONT_DIR` 指向包含 `LXGWWenKaiTC-Regular.ttf` 与 `LXGWWenKaiMonoTC-Regular.ttf` 的目录（重启生效）。
 
@@ -149,6 +151,7 @@ crates/gloss-pdf/assets/fonts/lxgw-wenkai-tc/OFL.txt   # 字体许可声明（SI
 | **应用设置** | `%APPDATA%\gloss-pdf\settings.json` | 主题、多词典路径与启用顺序、自动更新开关、窗口几何 |
 | **查词历史** | `%APPDATA%\gloss-pdf\dictionary_history.json` | 最近 50 条查询词（倒序去重） |
 | **缩略图缓存** | `%APPDATA%\gloss-pdf\thumbnails\` | 首页最近阅读卡片的页面预览，按文件、页码与修改时间缓存 |
+| **PDFium 运行库** | `%APPDATA%\gloss-pdf\pdfium\` | 本地缺失时自动下载并缓存，删除后下次打开 PDF 会重新补齐 |
 
 *(注：macOS 下用户数据目录为 `~/Library/Application Support/gloss-pdf`，Linux 下为 `~/.local/share/gloss-pdf`)*
 
