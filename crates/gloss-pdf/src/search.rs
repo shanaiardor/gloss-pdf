@@ -1,4 +1,4 @@
-﻿//! 搜索状态：查询串、逐页匹配、全文命中与跨页跳转。
+//! 搜索状态：查询串、逐页匹配、全文命中与跨页跳转。
 //!
 //! 三个层次：
 //! - **逐页匹配**：`page_matches` 记录每一页的匹配区间，连续滚动时多页同时可见都能画高亮。
@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 
-use pdf_core::{CharBox, PageHits};
+use pdf_core::{CharBox, PageHits, RectPt};
 
 #[derive(Default)]
 pub struct SearchState {
@@ -33,6 +33,8 @@ pub struct SearchState {
     pub scanned_total: usize,
     /// 每页的匹配区间，连续滚动时逐页画高亮用。
     page_matches: HashMap<usize, Vec<RangeInclusive<usize>>>,
+    /// 每页每个匹配区间预先计算好的包围盒，避免每帧渲染重复内存分配与排序合并。
+    page_rects: HashMap<usize, Vec<Vec<RectPt>>>,
     /// `matches` / `current` 属于哪一页。
     active_page: usize,
     /// 等页面渲染完要选中的页内序号。
@@ -64,12 +66,14 @@ impl SearchState {
         self.scanned = 0;
         self.scanned_total = 0;
         self.page_matches.clear();
+        self.page_rects.clear();
         self.pending = None;
     }
 
     /// 只清逐页缓存（查询串变了，旧的匹配全部作废）。
     pub fn clear_page_matches(&mut self) {
         self.page_matches.clear();
+        self.page_rects.clear();
         self.matches.clear();
         self.current = 0;
     }
@@ -87,11 +91,17 @@ impl SearchState {
     }
 
     /// 某一页的匹配区间，画高亮用。
+    #[allow(dead_code)]
     pub fn matches_for(&self, page: usize) -> &[RangeInclusive<usize>] {
         self.page_matches
             .get(&page)
             .map(|matches| matches.as_slice())
             .unwrap_or_default()
+    }
+
+    /// 某一页预先合并好的命中矩形，画高亮时避免每帧重复排序合并。
+    pub fn match_rects_for(&self, page: usize) -> Option<&[Vec<RectPt>]> {
+        self.page_rects.get(&page).map(|rects| rects.as_slice())
     }
 
     /// 重新计算活动页的匹配，并把结果写进逐页缓存。
@@ -100,8 +110,10 @@ impl SearchState {
     /// 等这一页的字符数据到了再定位。
     pub fn recompute(&mut self, chars: &[CharBox], page: usize) {
         let matches = find_matches(&self.query, chars);
+        let rects = compute_match_rects(&matches, chars);
         self.active_page = page;
         self.page_matches.insert(page, matches.clone());
+        self.page_rects.insert(page, rects);
         self.matches = matches;
         self.current = 0;
 
@@ -118,13 +130,17 @@ impl SearchState {
     pub fn cache_page(&mut self, chars: &[CharBox], page: usize) {
         if !self.open || !self.has_query() {
             self.page_matches.remove(&page);
+            self.page_rects.remove(&page);
             return;
         }
         let matches = find_matches(&self.query, chars);
         if matches.is_empty() {
             self.page_matches.remove(&page);
+            self.page_rects.remove(&page);
         } else {
+            let rects = compute_match_rects(&matches, chars);
             self.page_matches.insert(page, matches);
+            self.page_rects.insert(page, rects);
         }
     }
 
@@ -235,6 +251,21 @@ impl SearchState {
 fn find_matches(query: &str, chars: &[CharBox]) -> Vec<RangeInclusive<usize>> {
     let plain: Vec<char> = chars.iter().map(|character| character.ch).collect();
     pdf_core::text_match::find_matches(query, &plain)
+}
+
+fn compute_match_rects(
+    matches: &[RangeInclusive<usize>],
+    chars: &[CharBox],
+) -> Vec<Vec<RectPt>> {
+    matches
+        .iter()
+        .map(|range| {
+            chars
+                .get(*range.start()..=*range.end())
+                .map(|slice| crate::geometry::merge_rects(slice.iter().map(|c| c.rect).collect()))
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 #[cfg(test)]

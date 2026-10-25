@@ -2,7 +2,7 @@
 
 use gpui::{
     App, ClickEvent, Context, MouseMoveEvent, Pixels, Point, Render, Window, WindowControlArea,
-    div, prelude::*, px, rgb, svg,
+    div, prelude::*, px, svg,
 };
 
 use crate::app::AppState;
@@ -355,7 +355,7 @@ impl AppState {
         }
     }
 
-    pub(crate) fn window_controls(&self, theme: &Theme) -> gpui::Div {
+    pub(crate) fn window_controls(&self, _theme: &Theme) -> gpui::Div {
         // macOS 上使用系统原生的红黄绿三色交通灯在左上角
         #[cfg(target_os = "macos")]
         {
@@ -364,6 +364,7 @@ impl AppState {
         // Windows 上窗口控制按钮放在右上角，符合 Windows 原生操作习惯
         #[cfg(not(target_os = "macos"))]
         {
+            let theme = _theme;
             let hover_bg = theme.surface_hover;
             div()
                 .absolute()

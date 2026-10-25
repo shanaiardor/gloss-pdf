@@ -10,16 +10,29 @@
 
 use std::ops::RangeInclusive;
 
+/// 将查询串预编译为标准化的字符序列（小写化并去除空白），供跨多页全文搜索复用。
+pub fn prepare_needle(query: &str) -> Vec<char> {
+    query
+        .to_lowercase()
+        .chars()
+        .filter(|ch| !is_ignorable_space(*ch))
+        .collect()
+}
+
 /// 在字符序列里找所有不重叠的命中，返回原序列的字符下标区间。
 ///
 /// 查询串与文本都先去掉空白再比对（见模块文档），返回的区间映射回原始序列，
 /// 因此覆盖命中内部的空白。
 pub fn find_matches(query: &str, chars: &[char]) -> Vec<RangeInclusive<usize>> {
-    let needle: Vec<char> = query
-        .to_lowercase()
-        .chars()
-        .filter(|ch| !is_ignorable_space(*ch))
-        .collect();
+    let needle = prepare_needle(query);
+    find_matches_with_needle(&needle, chars)
+}
+
+/// 使用预先准备好的 needle 查找所有命中。
+pub fn find_matches_with_needle(
+    needle: &[char],
+    chars: &[char],
+) -> Vec<RangeInclusive<usize>> {
     if needle.is_empty() {
         return Vec::new();
     }
@@ -35,7 +48,7 @@ pub fn find_matches(query: &str, chars: &[char]) -> Vec<RangeInclusive<usize>> {
         origins.push(index);
     }
 
-    scan(&needle, &compact)
+    scan(needle, &compact)
         .into_iter()
         .map(|range| origins[*range.start()]..=origins[*range.end()])
         .collect()
@@ -43,8 +56,46 @@ pub fn find_matches(query: &str, chars: &[char]) -> Vec<RangeInclusive<usize>> {
 
 /// 统计不重叠命中数；worker 全文计数用。
 pub fn count_matches(text: &str, query: &str) -> usize {
-    let chars: Vec<char> = text.chars().collect();
-    find_matches(query, &chars).len()
+    let needle = prepare_needle(query);
+    count_matches_prepared(text, &needle)
+}
+
+/// 使用预编译好的 needle 高性能统计不重叠命中数。
+///
+/// 相比 `find_matches`，无需分配 `origins: Vec<usize>` 映射表与区间向量，也不拷贝整篇文本。
+pub fn count_matches_prepared(text: &str, needle: &[char]) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+
+    let mut compact = Vec::with_capacity(text.len().min(4096));
+    for ch in text.chars() {
+        if is_ignorable_space(ch) {
+            continue;
+        }
+        compact.push(fold_char(ch));
+    }
+
+    count_scan(needle, &compact)
+}
+
+/// 不重叠扫描计数；命中后整段跳过。
+fn count_scan(needle: &[char], haystack: &[char]) -> usize {
+    if needle.len() > haystack.len() {
+        return 0;
+    }
+
+    let mut count = 0;
+    let mut start = 0;
+    while start + needle.len() <= haystack.len() {
+        if haystack[start..start + needle.len()] == needle[..] {
+            count += 1;
+            start += needle.len();
+        } else {
+            start += 1;
+        }
+    }
+    count
 }
 
 /// 单页逐字符折叠：小写化只取第一个字符，和原 UI 的规则保持一致。

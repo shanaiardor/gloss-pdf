@@ -257,16 +257,8 @@ impl AppState {
         let id = gloss.id;
         let word = gloss.word.clone();
         let phonetic = gloss.phonetic.clone();
-        // AI 摘要里带 Markdown：紧凑卡当纯文本画会露出 `**`，这里先去标记。
-        let summary = if gloss.from_ai {
-            let preview: String = crate::ui::ai_markdown::plain_text(&gloss.summary)
-                .chars()
-                .take(120)
-                .collect();
-            preview
-        } else {
-            gloss.summary.clone()
-        };
+        // 紧凑卡当纯文本画：使用已预处理好的预览，避免每帧重复 parse Markdown
+        let summary = gloss.preview_text().to_string();
         let hover_bg = theme.surface_hover;
 
         let mut header = div()

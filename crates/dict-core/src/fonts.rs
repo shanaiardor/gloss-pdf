@@ -4,11 +4,12 @@
 //! 字体覆盖的码位，渲染前把文本切成"每个字符用列表里第一个覆盖它的字体"。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// 已加载的字体集合。
 #[derive(Default)]
 pub struct FontLibrary {
-    faces: Vec<(String, Vec<u8>)>,
+    faces: Vec<(String, Arc<[u8]>)>,
     coverage: HashMap<String, Vec<(u32, u32)>>,
 }
 
@@ -30,7 +31,7 @@ impl FontLibrary {
         if let Some(ranges) = cmap_ranges(&sfnt) {
             self.coverage.insert(key, ranges);
         }
-        self.faces.push((family.to_string(), sfnt));
+        self.faces.push((family.to_string(), Arc::from(sfnt.into_boxed_slice())));
         true
     }
 
@@ -53,7 +54,7 @@ impl FontLibrary {
         Some(found)
     }
 
-    pub fn faces(&self) -> &[(String, Vec<u8>)] {
+    pub fn faces(&self) -> &[(String, Arc<[u8]>)] {
         &self.faces
     }
 
@@ -68,8 +69,8 @@ impl FontLibrary {
         self.faces.is_empty()
     }
 
-    /// 交给 UI 注册的字体字节。
-    pub fn bytes(&self) -> Vec<Vec<u8>> {
+    /// 交给 UI 注册的字体字节（以 Arc 共享，避免几十 MB 字体全量拷贝）。
+    pub fn bytes(&self) -> Vec<Arc<[u8]>> {
         self.faces.iter().map(|(_, bytes)| bytes.clone()).collect()
     }
 }

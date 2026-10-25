@@ -23,6 +23,7 @@ serde_json.workspace = true
 pulldown-cmark.workspace = true
 unicode-segmentation.workspace = true
 self_update = { version = "1.3", default-features = false, features = ["github", "ureq", "rustls"] }
+mimalloc = { version = "0.1", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_platform = { workspace = true, features = ["runtime_shaders", "font-kit"] }

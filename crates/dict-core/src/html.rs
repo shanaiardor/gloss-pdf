@@ -59,38 +59,46 @@ pub struct RenderContext<'a> {
 pub fn render(input: &str, context: &mut RenderContext<'_>) -> Vec<Block> {
     let document = kuchiki::parse_html().one(input);
 
-    let mut stylesheet = context.stylesheet.clone();
-    if let Ok(styles) = document.select("style") {
-        for style in styles {
-            let css = style.as_node().text_contents();
-            stylesheet.extend(Stylesheet::parse(&css));
-        }
-    }
-    if let Ok(links) = document.select("link") {
-        for link in links {
-            let attributes = link.attributes.borrow();
-            let Some(href) = attributes.get("href") else {
-                continue;
-            };
-            let rel = attributes
-                .get("rel")
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if (rel.contains("stylesheet") || href.to_ascii_lowercase().ends_with(".css"))
-                && context
-                    .loaded_stylesheets
-                    .iter()
-                    .any(|loaded| same_stylesheet(loaded, href))
-            {
-                continue;
-            }
-            if (rel.contains("stylesheet") || href.to_ascii_lowercase().ends_with(".css"))
-                && let Some(css) = context.resolver.stylesheet(href)
-            {
-                stylesheet.extend(Stylesheet::parse(&css));
+    let mut custom_stylesheet: Option<Stylesheet> = None;
+    if input.contains("<style") || input.contains("<link") {
+        if let Ok(styles) = document.select("style") {
+            for style in styles {
+                let css = style.as_node().text_contents();
+                custom_stylesheet
+                    .get_or_insert_with(|| context.stylesheet.clone())
+                    .extend(Stylesheet::parse(&css));
             }
         }
+        if let Ok(links) = document.select("link") {
+            for link in links {
+                let attributes = link.attributes.borrow();
+                let Some(href) = attributes.get("href") else {
+                    continue;
+                };
+                let rel = attributes
+                    .get("rel")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if (rel.contains("stylesheet") || href.to_ascii_lowercase().ends_with(".css"))
+                    && context
+                        .loaded_stylesheets
+                        .iter()
+                        .any(|loaded| same_stylesheet(loaded, href))
+                {
+                    continue;
+                }
+                if (rel.contains("stylesheet") || href.to_ascii_lowercase().ends_with(".css"))
+                    && let Some(css) = context.resolver.stylesheet(href)
+                {
+                    custom_stylesheet
+                        .get_or_insert_with(|| context.stylesheet.clone())
+                        .extend(Stylesheet::parse(&css));
+                }
+            }
+        }
     }
+
+    let stylesheet: &Stylesheet = custom_stylesheet.as_ref().unwrap_or(context.stylesheet);
 
     let mut converter = Converter {
         stylesheet: &stylesheet,

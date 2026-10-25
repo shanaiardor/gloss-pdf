@@ -350,15 +350,11 @@ impl Viewer {
     /// 瓦片都放不下，允许暂时超出预算，避免阅读时出现空白。
     pub fn evict(&mut self, keep: Range<usize>, visible: &HashSet<TileKey>) {
         let visible_rects = visible_page_rects(visible);
-        loop {
-            let over_pages = self.pages.len() > MAX_CACHED_PAGES;
-            let over_bytes = self.cached_bytes() > self.cache_budget;
-            if !over_pages && !over_bytes {
-                break;
-            }
+        let mut current_bytes = self.cached_bytes();
 
-            // 先挑单个瓦片：页号越远越优先，同页内离可见区域越远越优先。
-            let mut farthest_tile: Option<((usize, u64), TileKey)> = None;
+        // 1. 若超出字节预算，收集所有不在可视快照中的瓦片，按可视距离降序排序后批量淘汰
+        if current_bytes > self.cache_budget {
+            let mut candidates: Vec<((usize, u64), TileKey, usize)> = Vec::new();
             for (page, data) in &self.pages {
                 for tile in &data.tiles {
                     let key = (*page, tile.origin_x, tile.origin_y);
@@ -366,16 +362,22 @@ impl Viewer {
                         continue;
                     }
                     let distance = tile_distance(key, &keep, &visible_rects);
-                    if farthest_tile.is_none_or(|(best, _)| distance > best) {
-                        farthest_tile = Some((distance, key));
-                    }
+                    let bytes = tile.width as usize * tile.height as usize * 4;
+                    candidates.push((distance, key, bytes));
                 }
             }
 
-            if let Some((_, (page, origin_x, origin_y))) = farthest_tile {
+            // 距离最大的排在前面（优先淘汰离可视范围最远的瓦片）
+            candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+
+            for (_, (page, origin_x, origin_y), bytes) in candidates {
+                if current_bytes <= self.cache_budget {
+                    break;
+                }
                 if let Some(data) = self.pages.get_mut(&page) {
                     data.tiles
                         .retain(|tile| tile.origin_x != origin_x || tile.origin_y != origin_y);
+                    current_bytes = current_bytes.saturating_sub(bytes);
                 }
                 if self
                     .pages
@@ -384,24 +386,22 @@ impl Viewer {
                 {
                     self.pages.remove(&page);
                 }
-                continue;
             }
+        }
 
-            // 没有可淘汰的瓦片时，页数上限仍可淘汰整页（例如只存了元素数据）。
-            if over_pages {
-                let farthest_page = self
-                    .pages
-                    .keys()
-                    .filter(|page| !keep.contains(page))
-                    .max_by_key(|page| distance_outside(**page, &keep))
-                    .copied();
-                if let Some(page) = farthest_page {
-                    self.pages.remove(&page);
-                    continue;
-                }
+        // 2. 若页面数仍超出上限，按距离淘汰非保留页
+        while self.pages.len() > MAX_CACHED_PAGES {
+            let farthest_page = self
+                .pages
+                .keys()
+                .filter(|page| !keep.contains(page))
+                .max_by_key(|page| distance_outside(**page, &keep))
+                .copied();
+            if let Some(page) = farthest_page {
+                self.pages.remove(&page);
+            } else {
+                break;
             }
-
-            break;
         }
     }
 

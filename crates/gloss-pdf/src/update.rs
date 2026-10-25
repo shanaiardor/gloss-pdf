@@ -7,7 +7,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result};
+#[cfg(target_os = "windows")]
+use anyhow::anyhow;
 use futures::channel::mpsc::UnboundedSender;
 use self_update::backends::github::ReleaseList;
 
@@ -185,10 +187,12 @@ fn download(info: &UpdateInfo, events: &UnboundedSender<Event>) -> Result<PathBu
 }
 
 /// 防止把 GitHub API 的 JSON 错误页当成安装包启动。
-fn validate_installer(path: &Path) -> Result<()> {
+fn validate_installer(_path: &Path) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         use std::io::Read;
+
+        let path = _path;
 
         let mut file = std::fs::File::open(path)
             .with_context(|| format!("无法读取安装包 {}", path.display()))?;

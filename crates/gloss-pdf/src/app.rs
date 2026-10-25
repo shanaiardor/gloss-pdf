@@ -20,6 +20,7 @@ mod window;
 pub use window::initial_window_bounds;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use dict_core::{Command as DictCommand, DictEngine, DictionaryConfig};
@@ -145,6 +146,17 @@ pub struct AppState {
     pub(crate) selection_capsule_hovered: bool,
     /// 胶囊显示/悬停的代次；过期的自动收起任务据此退出。
     selection_capsule_version: u64,
+    /// 缓存的整篇排版几何：仅在 zoom / viewport.width / 文档改变时重算。
+    pub(crate) cached_layout: std::sync::Mutex<Option<(LayoutKey, Arc<crate::layout::DocumentLayout>)>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct LayoutKey {
+    pub(crate) doc_path: std::path::PathBuf,
+    pub(crate) page_count: usize,
+    pub(crate) zoom_bits: u32,
+    pub(crate) viewport_width_bits: u32,
+    pub(crate) has_rail: bool,
 }
 
 impl AppState {
@@ -447,6 +459,7 @@ impl AppState {
             selection_capsule: None,
             selection_capsule_hovered: false,
             selection_capsule_version: 0,
+            cached_layout: std::sync::Mutex::new(None),
         }
     }
 
@@ -572,9 +585,9 @@ impl Render for AppState {
 
         let theme = self.theme.clone();
 
-        // 首页缩略图：首帧读缓存，缺图时排队；设置页没有卡片，不必生成。
+        // 首页缩略图：首帧异步读缓存，缺图时排队；设置页没有卡片，不必生成。
         if !self.viewer.has_document() && self.home.nav == HomeNav::Home {
-            self.ensure_home_thumbnails();
+            self.ensure_home_thumbnails(cx);
         }
 
         let content: gpui::AnyElement = if self.viewer.has_document() {

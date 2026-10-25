@@ -47,6 +47,26 @@ pub struct PinnedGloss {
     /// AI 回答的完整正文；`summary` 只保留前 200 字给紧凑卡。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub answer: String,
+    /// 预处理好的纯文本预览，用于页边卡片快速展示，避免每帧重复 parse Markdown。
+    #[serde(skip)]
+    pub preview: Option<String>,
+}
+
+impl PinnedGloss {
+    pub fn init_preview(&mut self) {
+        if self.from_ai {
+            self.preview = Some(
+                crate::ui::ai_markdown::plain_text(&self.summary)
+                    .chars()
+                    .take(120)
+                    .collect(),
+            );
+        }
+    }
+
+    pub fn preview_text(&self) -> &str {
+        self.preview.as_deref().unwrap_or(&self.summary)
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -141,11 +161,12 @@ impl HighlightStore {
             existing.summary = summary;
             existing.from_ai = from_ai;
             existing.answer = answer;
+            existing.init_preview();
             return Some(existing.id);
         }
 
         let id = self.take_id();
-        self.glosses.push(PinnedGloss {
+        let mut gloss = PinnedGloss {
             id,
             page,
             rects,
@@ -155,7 +176,10 @@ impl HighlightStore {
             summary,
             from_ai,
             answer,
-        });
+            preview: None,
+        };
+        gloss.init_preview();
+        self.glosses.push(gloss);
         Some(id)
     }
 
@@ -245,6 +269,7 @@ impl HighlightStore {
                     next = next.max(item.id + 1);
                 }
                 for gloss in &mut glosses {
+                    gloss.init_preview();
                     if gloss.id == 0 || !seen.insert(gloss.id) {
                         gloss.id = next;
                     }

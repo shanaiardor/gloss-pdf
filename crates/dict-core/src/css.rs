@@ -62,6 +62,9 @@ pub struct Stylesheet {
     rules: Vec<CompiledRule>,
     font_faces: Vec<FontFace>,
     stats: CssStats,
+    normal_rules: Vec<usize>,
+    pseudo_before_rules: Vec<usize>,
+    pseudo_after_rules: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -112,6 +115,7 @@ impl Stylesheet {
             &mut stylesheet.font_faces,
             &mut stylesheet.stats,
         );
+        stylesheet.rebuild_indices();
         stylesheet
     }
 
@@ -123,6 +127,35 @@ impl Stylesheet {
         }));
         self.font_faces.extend(other.font_faces);
         self.stats.merge(&other.stats);
+        self.rebuild_indices();
+    }
+
+    fn rebuild_indices(&mut self) {
+        self.normal_rules.clear();
+        self.pseudo_before_rules.clear();
+        self.pseudo_after_rules.clear();
+
+        for (idx, rule) in self.rules.iter().enumerate() {
+            let mut has_normal = false;
+            let mut has_before = false;
+            let mut has_after = false;
+            for selector in &rule.selectors {
+                match selector.pseudo {
+                    None => has_normal = true,
+                    Some(PseudoElement::Before) => has_before = true,
+                    Some(PseudoElement::After) => has_after = true,
+                }
+            }
+            if has_normal {
+                self.normal_rules.push(idx);
+            }
+            if has_before {
+                self.pseudo_before_rules.push(idx);
+            }
+            if has_after {
+                self.pseudo_after_rules.push(idx);
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -160,8 +193,18 @@ impl Stylesheet {
         element: &NodeDataRef<ElementData>,
         pseudo: Option<PseudoElement>,
     ) -> Vec<Matched<'a>> {
+        let rule_indices = match pseudo {
+            None => &self.normal_rules,
+            Some(PseudoElement::Before) => &self.pseudo_before_rules,
+            Some(PseudoElement::After) => &self.pseudo_after_rules,
+        };
+        if rule_indices.is_empty() {
+            return Vec::new();
+        }
+
         let mut output = Vec::new();
-        for rule in &self.rules {
+        for &idx in rule_indices {
+            let rule = &self.rules[idx];
             if rule
                 .media
                 .as_ref()
@@ -187,7 +230,9 @@ impl Stylesheet {
                 });
             }
         }
-        output.sort_by_key(|matched| (matched.important, matched.specificity, matched.order));
+        if output.len() > 1 {
+            output.sort_by_key(|matched| (matched.important, matched.specificity, matched.order));
+        }
         output
     }
 }

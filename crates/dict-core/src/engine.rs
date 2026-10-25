@@ -47,7 +47,7 @@ pub struct DictionaryInfo {
     pub title: Option<String>,
     pub entries: u64,
     pub enabled: bool,
-    pub fonts: Vec<Vec<u8>>,
+    pub fonts: Vec<Arc<[u8]>>,
     pub error: Option<String>,
 }
 
@@ -116,7 +116,7 @@ struct LoadedDictionary {
     path: PathBuf,
     title: Option<String>,
     entries: u64,
-    fonts: Vec<Vec<u8>>,
+    fonts: Vec<Arc<[u8]>>,
     dictionary: Dictionary,
 }
 

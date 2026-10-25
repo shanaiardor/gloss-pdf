@@ -49,16 +49,44 @@ impl super::AppState {
 
     /// 当前缩放和视口下的整篇排版。
     ///
-    /// 每页只算几下浮点，一帧调用两三次（同步页码、补渲染、画页面）不构成瓶颈；
-    /// 不缓存是有意的：缩放、窗口宽度、文档任一变化都不必操心失效。
-    pub(crate) fn doc_layout(&self) -> Option<DocumentLayout> {
+    /// 仅在文档、缩放、视口宽度或页边栏状态改变时重新计算；
+    /// 连续滚动和鼠标移动时直接命中缓存，彻底消除几千页大文档的堆分配与遍历开销。
+    pub(crate) fn doc_layout(&self) -> Option<Arc<DocumentLayout>> {
         let doc = self.viewer.doc.as_ref()?;
-        Some(DocumentLayout::with_rail(
+        let zoom = self.viewer.zoom;
+        let viewport_width = f32::from(self.viewport.width);
+        let has_rail = self.has_gloss_rail();
+
+        let mut cache = self
+            .cached_layout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((key, layout)) = cache.as_ref() {
+            if key.doc_path == doc.path
+                && key.page_count == doc.pages.len()
+                && key.zoom_bits == zoom.to_bits()
+                && key.viewport_width_bits == viewport_width.to_bits()
+                && key.has_rail == has_rail
+            {
+                return Some(layout.clone());
+            }
+        }
+
+        let layout = Arc::new(DocumentLayout::with_rail(
             &doc.pages,
-            self.viewer.zoom,
-            f32::from(self.viewport.width),
-            self.has_gloss_rail(),
-        ))
+            zoom,
+            viewport_width,
+            has_rail,
+        ));
+        let key = super::LayoutKey {
+            doc_path: doc.path.clone(),
+            page_count: doc.pages.len(),
+            zoom_bits: zoom.to_bits(),
+            viewport_width_bits: viewport_width.to_bits(),
+            has_rail,
+        };
+        *cache = Some((key, layout.clone()));
+        Some(layout)
     }
 
     /// 滚动内容上边缘在内容坐标里的位置；0 表示贴顶。

@@ -150,7 +150,7 @@ impl super::AppState {
                     for font in &info.fonts {
                         let signature = font_signature(font);
                         if self.registered_dict_fonts.insert(signature) {
-                            fonts.push(Cow::Owned(font.clone()));
+                            fonts.push(Cow::Owned(font.to_vec()));
                         }
                     }
                 }
@@ -273,6 +273,8 @@ impl super::AppState {
 
     fn hit_char(&self, page: usize, x: f32, y: f32) -> Option<usize> {
         let mut best: Option<(f32, usize)> = None;
+        const MAX_DIST: f32 = 24.0;
+        const MAX_DIST_SQ: f32 = MAX_DIST * MAX_DIST;
 
         for (index, character) in self.viewer.chars_of(page).iter().enumerate() {
             let rect = character.rect;
@@ -280,13 +282,17 @@ impl super::AppState {
                 return Some(index);
             }
             let (cx, cy) = rect.center();
-            let distance = ((cx - x).powi(2) + (cy - y).powi(2)).sqrt();
-            if best.is_none_or(|(best_distance, _)| distance < best_distance) {
-                best = Some((distance, index));
+            // Y 轴粗筛：垂直距离超过阈值的行直接跳过，避免整页无效计算
+            if (cy - y).abs() > MAX_DIST {
+                continue;
+            }
+            let dist_sq = (cx - x).powi(2) + (cy - y).powi(2);
+            if best.is_none_or(|(best_dist_sq, _)| dist_sq < best_dist_sq) {
+                best = Some((dist_sq, index));
             }
         }
 
-        best.and_then(|(distance, index)| (distance < 24.0).then_some(index))
+        best.and_then(|(dist_sq, index)| (dist_sq < MAX_DIST_SQ).then_some(index))
     }
 
     /// 屏幕位置换算到某一页的 PDF 坐标（pt，原点在左下角，y 向上）。

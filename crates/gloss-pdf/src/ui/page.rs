@@ -7,7 +7,6 @@ use gpui::{Context, ElementId, MouseButton, div, img, prelude::*, px};
 use pdf_core::RectPt;
 
 use crate::app::AppState;
-use crate::geometry::merge_rects;
 use crate::layout::{DocumentLayout, PREFETCH_PAGES};
 use crate::theme::Theme;
 use crate::ui::empty::empty_state;
@@ -153,16 +152,16 @@ impl AppState {
 
         let search = &self.viewer.search;
         let active = search.active_page() == index;
-        for (match_index, range) in search.matches_for(index).iter().enumerate() {
-            let color = if active && match_index == search.current {
-                theme.search_current
-            } else {
-                theme.search_hit
-            };
-            if let Some(chars) = page.chars.get(*range.start()..=*range.end()) {
-                for rect in merge_rects(chars.iter().map(|character| character.rect).collect()) {
+        if let Some(rect_groups) = search.match_rects_for(index) {
+            for (match_index, rects) in rect_groups.iter().enumerate() {
+                let color = if active && match_index == search.current {
+                    theme.search_current
+                } else {
+                    theme.search_hit
+                };
+                for rect in rects {
                     overlays.push(
-                        rect_overlay(&rect, page_size.height, zoom, color).into_any_element(),
+                        rect_overlay(rect, page_size.height, zoom, color).into_any_element(),
                     );
                 }
             }

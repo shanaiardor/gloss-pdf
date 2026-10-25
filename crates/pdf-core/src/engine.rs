@@ -26,7 +26,6 @@ use pdfium_render::prelude::*;
 use crate::model::{
     CharBox, DocumentMetadata, LinkBox, LinkTarget, OutlineItem, PageHits, PageSize, RectPt,
 };
-use crate::text_match::count_matches;
 
 /// 阅读器与首页缩略图两个 PDFium worker 共用的串行闸门。
 ///
@@ -569,7 +568,7 @@ fn search_document(
     request: u64,
     events: &UnboundedSender<Event>,
 ) -> Event {
-    let needle = query.to_lowercase();
+    let needle = crate::text_match::prepare_needle(query);
     let mut pages = Vec::new();
     let mut total = 0;
 
@@ -586,22 +585,19 @@ fn search_document(
             if cache.len() <= index {
                 cache.resize(index + 1, None);
             }
-            let text = match &cache[index] {
-                Some(text) => text.clone(),
-                None => {
-                    let extracted = match document.pages().get(index as PdfPageIndex) {
-                        Ok(page) => match page.text() {
-                            Ok(text) => text.all(),
-                            Err(_) => String::new(),
-                        },
+            if cache[index].is_none() {
+                let extracted = match document.pages().get(index as PdfPageIndex) {
+                    Ok(page) => match page.text() {
+                        Ok(text) => text.all(),
                         Err(_) => String::new(),
-                    };
-                    cache[index] = Some(extracted.clone());
-                    extracted
-                }
-            };
+                    },
+                    Err(_) => String::new(),
+                };
+                cache[index] = Some(extracted);
+            }
+            let text_ref = cache[index].as_deref().unwrap_or("");
 
-            let count = count_matches(&text.to_lowercase(), &needle);
+            let count = crate::text_match::count_matches_prepared(text_ref, &needle);
             if count > 0 {
                 total += count;
                 pages.push(PageHits { page: index, count });
@@ -990,6 +986,7 @@ mod tests {
     use futures::channel::mpsc::{TryRecvError, UnboundedReceiver};
 
     use super::*;
+    use crate::text_match::count_matches;
 
     fn tile_request(page: usize, origin_x: i32, origin_y: i32) -> Command {
         Command::RenderTile {

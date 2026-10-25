@@ -4,6 +4,9 @@
 // Debug 构建保留控制台，方便看日志。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod app;
 mod ai_context;
 mod ai_query;

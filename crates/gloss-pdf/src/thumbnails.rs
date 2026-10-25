@@ -54,6 +54,7 @@ impl Thumbnails {
     }
 
     /// 补齐所有最近阅读的当前页缩略图；已有缓存或已排队的直接跳过。
+    #[allow(dead_code)]
     pub(crate) fn ensure(&mut self, recents: &[RecentDocument], engine: &ThumbnailEngine) {
         for recent in recents {
             let page = recent.progress.map_or(0, |progress| progress.page);
@@ -140,14 +141,88 @@ impl Thumbnails {
 
 impl AppState {
     /// 首页每帧调用：把还没有缩略图的条目排进 worker。已有图时是纯内存查表。
-    pub(crate) fn ensure_home_thumbnails(&mut self) {
+    pub(crate) fn ensure_home_thumbnails(&mut self, cx: &mut Context<Self>) {
         // 打开/阅读文档期间不要排缩略图：既避免和主 worker 抢 PDFium，
         // 也避免每帧请求 -> Cancelled -> 再请求的空转。
         if self.pdfium_gate.is_reader_active() {
             return;
         }
-        self.thumbnails
-            .ensure(&self.home.recents, &self.thumbnail_engine);
+
+        for recent in &self.home.recents {
+            let page = recent.progress.map_or(0, |progress| progress.page);
+            if self
+                .thumbnails
+                .entries
+                .get(&recent.path)
+                .is_some_and(|entry| entry.key.page == page)
+            {
+                continue;
+            }
+
+            // 只在缺图或页码变化时读 mtime，避免首页每帧对 18 个文件做 stat。
+            let Some(modified) = modified_secs(&recent.path) else {
+                continue;
+            };
+            let key = ThumbKey {
+                path: recent.path.clone(),
+                page,
+                modified,
+            };
+            if self.thumbnails.failed.contains(&key) || self.thumbnails.requested.contains(&key) {
+                continue;
+            }
+
+            self.thumbnails.requested.insert(key.clone());
+
+            // 若磁盘已有 PNG 缓存，丢到后台线程池异步解码，绝不在 UI 主线程同步读写阻塞渲染
+            if let Some(path) = cache_path(&key)
+                && path.exists()
+            {
+                let key_clone = key.clone();
+                cx.spawn(async move |this, cx| {
+                    let raw = cx
+                        .background_executor()
+                        .spawn(async move { load_cached_raw(&path) })
+                        .await;
+                    if let Some((width, height, bgra)) = raw {
+                        let _ = this.update(cx, |this, cx| {
+                            this.thumbnails.requested.remove(&key_clone);
+                            if let Some(buffer) = image::RgbaImage::from_raw(width, height, bgra) {
+                                let image = ThumbnailImage {
+                                    image: Arc::new(RenderImage::new([image::Frame::new(buffer)])),
+                                    width,
+                                    height,
+                                };
+                                this.thumbnails.put(key_clone, image);
+                                if !this.viewer.has_document() {
+                                    cx.notify();
+                                }
+                            }
+                        });
+                    } else {
+                        let _ = this.update(cx, |this, _cx| {
+                            this.thumbnails.requested.remove(&key_clone);
+                            this.thumbnails.failed.insert(key_clone);
+                        });
+                    }
+                })
+                .detach();
+                continue;
+            }
+
+            let request = self.thumbnails.next_request();
+            self.thumbnails.pending.insert(request, key.clone());
+            if let Err(error) = self.thumbnail_engine.commands.send(ThumbnailCommand::Render {
+                request,
+                path: recent.path.clone(),
+                page,
+            }) {
+                log::warn!("无法请求缩略图 {}: {error}", recent.path.display());
+                self.thumbnails.pending.remove(&request);
+                self.thumbnails.requested.remove(&key);
+                self.thumbnails.failed.insert(key);
+            }
+        }
     }
 
     pub(super) fn handle_thumbnail_event(&mut self, event: ThumbnailEvent, cx: &mut Context<Self>) {
@@ -168,10 +243,15 @@ impl AppState {
                     return;
                 };
 
-                // 磁盘缓存按正常 RGBA 存，查看缓存文件时颜色不会反。
+                // 磁盘缓存按正常 RGBA 存；将 PNG 编码与落盘移到后台线程池，绝不拖慢主线程绘制
+                let save_key = key.clone();
                 let mut rgba = bgra;
                 swap_red_blue(&mut rgba);
-                save_cached(&key, width, height, &rgba);
+                cx.background_executor()
+                    .spawn(async move {
+                        save_cached(&save_key, width, height, &rgba);
+                    })
+                    .detach();
 
                 let image = ThumbnailImage {
                     image: Arc::new(RenderImage::new([image::Frame::new(buffer)])),
@@ -245,12 +325,18 @@ fn cache_hash(key: &ThumbKey) -> u64 {
     hash
 }
 
-fn load_cached(key: &ThumbKey) -> Option<ThumbnailImage> {
-    let path = cache_path(key)?;
+fn load_cached_raw(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
     let decoded = image::open(path).ok()?.to_rgba8();
     let (width, height) = decoded.dimensions();
     let mut bgra = decoded.into_raw();
     swap_red_blue(&mut bgra);
+    Some((width, height, bgra))
+}
+
+#[allow(dead_code)]
+fn load_cached(key: &ThumbKey) -> Option<ThumbnailImage> {
+    let path = cache_path(key)?;
+    let (width, height, bgra) = load_cached_raw(&path)?;
     let buffer = image::RgbaImage::from_raw(width, height, bgra)?;
     Some(ThumbnailImage {
         image: Arc::new(RenderImage::new([image::Frame::new(buffer)])),
