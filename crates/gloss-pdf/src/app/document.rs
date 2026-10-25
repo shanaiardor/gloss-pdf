@@ -394,14 +394,18 @@ impl super::AppState {
 
     /// 把当前 AI 答案钉成页边笺注。
     ///
-    /// 长句也允许：高亮按选区矩形画（`PinnedGloss.rects` 本来就是矩形列表），
-    /// 摘要用 AI 正文的前 200 字，避免正文再查一次词典。
+    /// 长句也允许：高亮按选区矩形画（`PinnedGloss.rects` 本来就是矩形列表）。
+    /// 紧凑卡展示模型给出的「标题」而不是截断正文，避免折叠态读到半句话。
     pub(crate) fn pin_current_ai(&mut self, cx: &mut Context<Self>) {
         let text = match &self.ai.phase {
             AiPhase::Done { text, .. } => text.clone(),
             AiPhase::Streaming { text, .. } if !text.trim().is_empty() => text.clone(),
             _ => return,
         };
+        let sections = ai_core::parse_answer_sections(&text);
+        if sections.is_empty() {
+            return;
+        }
         let word = self.ai.term.trim().to_string();
         if word.is_empty() {
             return;
@@ -417,7 +421,14 @@ impl super::AppState {
             })
             .unwrap_or(0.0);
         let answer = text.trim().to_string();
-        let summary: String = answer.chars().take(200).collect();
+        let summary = if sections.title.is_empty() {
+            crate::ui::ai_markdown::plain_text(&sections.content)
+                .chars()
+                .take(200)
+                .collect()
+        } else {
+            sections.title
+        };
 
         // `add_gloss` 自己按「同页同词」原地更新，不会堆两条重复笺注。
         let had_rail = self.has_gloss_rail();

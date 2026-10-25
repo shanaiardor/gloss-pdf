@@ -141,6 +141,10 @@ pub struct AppState {
     pub(crate) ai: crate::ai_query::AiQueryState,
     /// 拖选松手后的「词典 / AI」胶囊；点它才查询。
     pub(crate) selection_capsule: Option<crate::selection::SelectionCapsule>,
+    /// 鼠标是否停在选区胶囊上；悬停期间不执行自动收起。
+    pub(crate) selection_capsule_hovered: bool,
+    /// 胶囊显示/悬停的代次；过期的自动收起任务据此退出。
+    selection_capsule_version: u64,
 }
 
 impl AppState {
@@ -441,6 +445,8 @@ impl AppState {
             page_text_request_id: 0,
             ai: crate::ai_query::AiQueryState::default(),
             selection_capsule: None,
+            selection_capsule_hovered: false,
+            selection_capsule_version: 0,
         }
     }
 

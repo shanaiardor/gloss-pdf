@@ -73,7 +73,20 @@ impl Selection {
         let mut text = String::new();
         let mut previous: Option<(RectPt, char)> = None;
 
-        for character in selected {
+        for (index, character) in selected.iter().enumerate() {
+            // 中文排版常在字与字之间塞空格（或字距大到会被当成空格）；
+            // 选中多个词时这些空格只会干扰查词，夹在中文之间的空白直接丢掉。
+            let space_between_cjk = character.ch.is_whitespace()
+                && !matches!(character.ch, '\n' | '\r')
+                && previous.is_some_and(|(_, previous_char)| is_cjk(previous_char))
+                && selected[index + 1..]
+                    .iter()
+                    .find(|next| !next.ch.is_whitespace())
+                    .is_some_and(|next| is_cjk(next.ch));
+            if space_between_cjk {
+                continue;
+            }
+
             if let Some((previous_rect, previous_char)) = previous {
                 let new_line = (character.rect.bottom - previous_rect.bottom).abs()
                     > previous_rect.height() * 0.5;
@@ -83,6 +96,7 @@ impl Selection {
                     }
                 } else if !previous_char.is_whitespace()
                     && !character.ch.is_whitespace()
+                    && !(is_cjk(previous_char) && is_cjk(character.ch))
                     && character.rect.left - previous_rect.right > previous_rect.height() * 1.5
                 {
                     text.push(' ');
@@ -229,6 +243,34 @@ mod tests {
         let mut selection = Selection::default();
         selection.select_word(0, &chars, 1);
         assert_eq!(selection.text(&chars).as_deref(), Some("好"));
+    }
+
+    #[test]
+    fn spaces_inside_chinese_are_dropped() {
+        let chars = line("汉 字", 0.0, 0.0);
+        let mut selection = Selection::default();
+        selection.start_at(0, 0);
+        selection.extend_to(2);
+        assert_eq!(selection.text(&chars).as_deref(), Some("汉字"));
+    }
+
+    #[test]
+    fn wide_gaps_between_chinese_do_not_become_spaces() {
+        let mut chars = line("汉", 0.0, 0.0);
+        chars.extend(line("字", 0.0, 40.0));
+        let mut selection = Selection::default();
+        selection.start_at(0, 0);
+        selection.extend_to(1);
+        assert_eq!(selection.text(&chars).as_deref(), Some("汉字"));
+    }
+
+    #[test]
+    fn spaces_between_latin_words_are_kept() {
+        let chars = chars();
+        let mut selection = Selection::default();
+        selection.start_at(0, 0);
+        selection.extend_to(chars.len() - 1);
+        assert_eq!(selection.text(&chars).as_deref(), Some("hello world"));
     }
 
     #[test]

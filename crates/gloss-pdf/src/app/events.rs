@@ -6,6 +6,7 @@
 //! 只有本模块使用。
 
 use std::borrow::Cow;
+use std::time::Duration;
 
 use dict_core::Event as DictEvent;
 use gpui::{
@@ -17,6 +18,9 @@ use pdf_core::{CharBox, Event, LinkTarget};
 use super::FocusTarget;
 use crate::dictionary::{DictLoadState, normalize_term};
 use crate::home::HomeNav;
+
+/// 选区胶囊在鼠标离开后自动收起的时间。
+const CAPSULE_HIDE_DELAY: Duration = Duration::from_secs(3);
 
 impl super::AppState {
     // ---------- 引擎事件 ----------
@@ -435,7 +439,7 @@ impl super::AppState {
         // 选择结束（拖选或双击选词）后打印选区，便于测试选中文字是否正确。
         if was_dragging {
             self.print_selection();
-            self.show_selection_capsule();
+            self.show_selection_capsule(cx);
         }
         cx.notify();
     }
@@ -489,7 +493,7 @@ impl super::AppState {
 
     /// 双击选词后直接在页边笺注栏锚定该词位置并查词。
     /// 拖选松手：把选区拍成胶囊数据（文本 + 矩形），由页面覆盖层画出来。
-    fn show_selection_capsule(&mut self) {
+    fn show_selection_capsule(&mut self, cx: &mut Context<Self>) {
         let Some(page) = self.viewer.selection.page else {
             self.selection_capsule = None;
             return;
@@ -514,6 +518,49 @@ impl super::AppState {
             text: trimmed.to_string(),
             rects,
         });
+        self.selection_capsule_hovered = false;
+        self.schedule_selection_capsule_hide(cx);
+    }
+
+    /// 鼠标移入/移出「词典 / AI」胶囊：移入时取消耗时任务，移出后重新计 3 秒。
+    pub(crate) fn on_selection_capsule_hover(
+        &mut self,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selection_capsule.is_none() {
+            self.selection_capsule_hovered = false;
+            return;
+        }
+        self.selection_capsule_hovered = hovered;
+        if hovered {
+            self.selection_capsule_version = self.selection_capsule_version.wrapping_add(1);
+        } else {
+            self.schedule_selection_capsule_hide(cx);
+        }
+    }
+
+    /// 3 秒内鼠标没有停在胶囊上就收起；显示新胶囊或悬停会推进代次，旧任务自然失效。
+    fn schedule_selection_capsule_hide(&mut self, cx: &mut Context<Self>) {
+        if self.selection_capsule.is_none() {
+            return;
+        }
+        self.selection_capsule_version = self.selection_capsule_version.wrapping_add(1);
+        let version = self.selection_capsule_version;
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CAPSULE_HIDE_DELAY).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.selection_capsule_version == version
+                    && !this.selection_capsule_hovered
+                    && this.selection_capsule.is_some()
+                {
+                    this.selection_capsule = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// 胶囊「词典」：走原有查词链路（清洗文本、记锚点、查 mdx）。

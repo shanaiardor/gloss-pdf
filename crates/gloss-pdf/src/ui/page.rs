@@ -190,6 +190,7 @@ impl AppState {
                 .max(0.0);
 
             let mut row = div()
+                .id("selection-capsule")
                 .absolute()
                 .left(px(left))
                 .top(px(top))
@@ -203,6 +204,10 @@ impl AppState {
                 .border_1()
                 .border_color(theme.border)
                 .shadow_md()
+                // 鼠标停在胶囊上时暂停 3 秒自动收起，移出后重新计时。
+                .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                    this.on_selection_capsule_hover(*hovered, cx);
+                }))
                 // 必须吞掉按下事件：页面的 on_mouse_down 会「按下即收起胶囊」，
                 // 冒泡过去就会在按钮的 on_click 之前把胶囊清空，点上去毫无反应。
                 .on_mouse_down(MouseButton::Left, |_event, _window, cx| {

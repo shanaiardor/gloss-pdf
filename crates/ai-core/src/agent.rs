@@ -37,8 +37,88 @@ toc_nearest 判断章节语境；当前页信息不足时才用 read_page 读别
 否则会浪费轮次。
 - 人名、典故、生僻的多字词是重点：说清它指谁/出自哪部书哪一篇、在这段话里承担什么角色。\
 若无法从文本确认，明确说「文本中无法确认」，不要编造出处。
-- 用简体中文回答，控制在 300 字以内；可用 **粗体** 和短列表，不要客套话。
-- 不要在开头重复这个词，直接给出解释。";
+- 严格按下面三段输出，不要加任何前后说明或额外标题：
+【标题】16 字以内的概括，点明这个词/典故的身份或这段话的主旨；不要用「这个词」「这段话」开头。
+【内容】解释本体，300 字以内；可用 **粗体** 和短列表，不要客套话。
+【原文】从当前页逐字摘录包含该词、或最能代表选区主旨的一句原文，不要改写；确实找不到时写「无」。
+- 不要在开头重复这个词；三段以外不要输出任何内容。";
+
+/// 结构化回答的三段标记。
+pub const TITLE_MARKER: &str = "【标题】";
+pub const CONTENT_MARKER: &str = "【内容】";
+pub const QUOTE_MARKER: &str = "【原文】";
+const ANSWER_MARKERS: [&str; 3] = [TITLE_MARKER, CONTENT_MARKER, QUOTE_MARKER];
+
+/// 模型回答的三段内容：折叠卡用标题，正文看内容，原文单独展示。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AnswerSections {
+    pub title: String,
+    pub content: String,
+    pub quote: String,
+}
+
+impl AnswerSections {
+    pub fn is_empty(&self) -> bool {
+        self.title.is_empty() && self.content.is_empty() && self.quote.is_empty()
+    }
+}
+
+/// 解析模型输出。流式到达时也调用同一函数：没写完的标记会被当作正文尾部剥掉，
+/// 因此不会在标题里闪出「【内」这类半截字符。
+///
+/// 模型偶尔不按格式返回：此时整段当作内容，界面仍能展示。
+pub fn parse_answer_sections(raw: &str) -> AnswerSections {
+    let mut found: Vec<(usize, &str)> = ANSWER_MARKERS
+        .iter()
+        .filter_map(|marker| raw.find(marker).map(|at| (at, *marker)))
+        .collect();
+
+    if found.is_empty() {
+        return AnswerSections {
+            content: clean_section(raw),
+            ..AnswerSections::default()
+        };
+    }
+
+    found.sort_by_key(|(at, _)| *at);
+    let mut sections = AnswerSections::default();
+    for (index, (at, marker)) in found.iter().enumerate() {
+        let start = at + marker.len();
+        let end = found
+            .get(index + 1)
+            .map(|(next, _)| *next)
+            .unwrap_or(raw.len());
+        let value = clean_section(&raw[start..end]);
+        match *marker {
+            TITLE_MARKER => sections.title = value,
+            CONTENT_MARKER => sections.content = value,
+            QUOTE_MARKER => sections.quote = value,
+            _ => {}
+        }
+    }
+
+    if matches!(sections.quote.trim(), "无" | "（无）" | "(无)") {
+        sections.quote.clear();
+    }
+    sections
+}
+
+fn clean_section(value: &str) -> String {
+    trim_partial_marker(value.trim()).trim().to_string()
+}
+
+/// 流式输出可能停在标记中间（例如「【内」）；把它从上一段末尾剥掉。
+fn trim_partial_marker(value: &str) -> String {
+    let mut chars: Vec<char> = value.chars().collect();
+    for length in (1..=4.min(chars.len())).rev() {
+        let tail: String = chars[chars.len() - length..].iter().collect();
+        if ANSWER_MARKERS.iter().any(|marker| marker.starts_with(&tail)) {
+            chars.truncate(chars.len() - length);
+            break;
+        }
+    }
+    chars.into_iter().collect()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LookupEvent {
@@ -267,5 +347,41 @@ mod tests {
         let question = build_question(&text, 0);
         assert!(question.contains("已截断"), "超长选区要提示截断");
         assert!(question.chars().count() < text.chars().count() + 200);
+    }
+
+    #[test]
+    fn structured_answer_is_split_into_title_content_and_quote() {
+        let raw = "【标题】子产：郑国政治家\n【内容】**子产**是郑国大夫。\n- 主持国政\n【原文】子产不毁乡校。";
+        let answer = parse_answer_sections(raw);
+        assert_eq!(answer.title, "子产：郑国政治家");
+        assert_eq!(answer.content, "**子产**是郑国大夫。\n- 主持国政");
+        assert_eq!(answer.quote, "子产不毁乡校。");
+        assert!(!answer.is_empty());
+    }
+
+    #[test]
+    fn unfinished_markers_do_not_leak_into_the_previous_section() {
+        let answer = parse_answer_sections("【标题】子产是郑国\n【内");
+        assert_eq!(answer.title, "子产是郑国");
+        assert!(answer.content.is_empty());
+
+        let answer = parse_answer_sections("【标");
+        assert!(answer.is_empty(), "半截标记不该被当成正文");
+    }
+
+    #[test]
+    fn plain_answers_fall_back_to_content() {
+        let answer = parse_answer_sections("  模型忘了分段，但解释本身仍然可读。  ");
+        assert_eq!(answer.content, "模型忘了分段，但解释本身仍然可读。");
+        assert!(answer.title.is_empty());
+        assert!(answer.quote.is_empty());
+    }
+
+    #[test]
+    fn missing_quote_marker_word_is_ignored() {
+        let answer = parse_answer_sections("【标题】标题\n【内容】正文\n【原文】无");
+        assert_eq!(answer.title, "标题");
+        assert_eq!(answer.content, "正文");
+        assert!(answer.quote.is_empty(), "「无」不该作为原文展示");
     }
 }

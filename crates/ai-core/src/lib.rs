@@ -12,8 +12,8 @@ pub mod settings;
 pub mod tools;
 
 pub use agent::{
-    ErrorKind, LookupEvent, MAX_TURNS, WORD_MAX_CHARS, build_question, classify_error,
-    is_word_query, run_lookup,
+    AnswerSections, ErrorKind, LookupEvent, MAX_TURNS, WORD_MAX_CHARS, build_question,
+    classify_error, is_word_query, parse_answer_sections, run_lookup,
 };
 pub use client::completion_model;
 pub use settings::{

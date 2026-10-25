@@ -347,7 +347,7 @@ impl Worker {
 
     fn run_open(&mut self, path: &Path) {
         // 先标记「阅读器有文档」，再抢闸门：缩略图 worker 可能在渲染中途，
-        // 等它退出临界区后再打开，避免两个 PDFium 实例同时解析同一个大文件。
+        // 等它退出临界区后再打开，避免两个 worker 同时进入 PDFium。
         self.gate.set_reader_active(true);
         let _guard = self.gate.lock();
         if self.pdfium.is_none() {
@@ -626,6 +626,16 @@ fn search_document(
     }
 }
 
+/// PDFium 的底层绑定是进程级单例：第二次 `bind_to_library` 会返回
+/// `PdfiumLibraryBindingsAlreadyInitialized`，而不是新的绑定。首页缩略图与阅读器
+/// 各有一个 worker，后绑定的那个要复用已有的全局绑定，不能把错误上抛。
+fn reuse_existing_bindings() -> &'static Pdfium {
+    log::info!("pdfium bindings already initialised; reusing the process-wide library");
+    // `Pdfium::default()` 在绑定已初始化时会走 pdfium-render 的复用分支：
+    // 返回一个不带自定义配置、通过全局表访问 PDFium 的实例。
+    Box::leak(Box::new(Pdfium::default()))
+}
+
 pub(crate) fn bind_pdfium(report: &mut dyn FnMut(&str)) -> Result<&'static Pdfium> {
     let mut directories = Vec::new();
     if let Ok(exe) = std::env::current_exe()
@@ -674,6 +684,9 @@ pub(crate) fn bind_pdfium(report: &mut dyn FnMut(&str)) -> Result<&'static Pdfiu
                 log::info!("pdfium bound from {}", library.display());
                 return Ok(Box::leak(Box::new(Pdfium::new(bindings))));
             }
+            Err(PdfiumError::PdfiumLibraryBindingsAlreadyInitialized) => {
+                return Ok(reuse_existing_bindings());
+            }
             Err(error) => {
                 last_error = Some(anyhow!(error));
             }
@@ -690,6 +703,9 @@ pub(crate) fn bind_pdfium(report: &mut dyn FnMut(&str)) -> Result<&'static Pdfiu
                         log::info!("pdfium bound from {}", library.display());
                         return Ok(Box::leak(Box::new(Pdfium::new(bindings))));
                     }
+                    Err(PdfiumError::PdfiumLibraryBindingsAlreadyInitialized) => {
+                        return Ok(reuse_existing_bindings());
+                    }
                     Err(error) => last_error = Some(anyhow!(error)),
                 },
                 Err(error) => last_error = Some(error),
@@ -701,6 +717,7 @@ pub(crate) fn bind_pdfium(report: &mut dyn FnMut(&str)) -> Result<&'static Pdfiu
 
     match Pdfium::bind_to_system_library() {
         Ok(bindings) => Ok(Box::leak(Box::new(Pdfium::new(bindings)))),
+        Err(PdfiumError::PdfiumLibraryBindingsAlreadyInitialized) => Ok(reuse_existing_bindings()),
         Err(error) => {
             let managed = managed
                 .as_deref()
@@ -1072,6 +1089,15 @@ mod tests {
 
         assert!(backlog.accept(Command::Open(PathBuf::from("b.pdf"))).is_some());
         assert!(backlog.is_empty(), "换文档后旧文档的慢任务都该作废");
+    }
+
+    #[test]
+    #[ignore = "需要 PDFium 动态库（首次会下载）"]
+    fn binding_twice_reuses_the_process_wide_library() {
+        let _first = bind_pdfium(&mut |_| {}).expect("第一次绑定应成功");
+        let second = bind_pdfium(&mut |_| {}).expect("第二次绑定应复用全局绑定");
+        let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples/dummy.pdf");
+        open_document(second, &sample).expect("复用绑定后应能打开 PDF");
     }
 
     #[test]

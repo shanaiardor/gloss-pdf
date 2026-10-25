@@ -3,7 +3,8 @@
 //! 和阅读器的主 PDF worker 分开：首页一次可能要补十几张缩略图，放在同一条队列
 //! 里会拖慢翻页。这里只做「打开文件 → 渲染指定页 → 回传 BGRA」，缓存与去重都在 UI 层。
 //!
-//! PDFium 不是线程安全的，所以 `Pdfium` 只在这个 worker 线程里初始化与使用。
+//! PDFium 不是线程安全的：绑定实例在 crate 内全局共享，但对它的调用仍由
+//! [`PdfiumGate`] 与阅读器 worker 串行化。
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
