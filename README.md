@@ -129,8 +129,8 @@ cargo run -p gloss-pdf -- samples/dummy.pdf
   ```powershell
   cargo build --release -p gloss-pdf
   & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
-    "/DAPP_VERSION=0.1.7" "installer\gloss-pdf.iss"
-  # 产物：dist\gloss-pdf-0.1.7-setup.exe
+    "/DAPP_VERSION=0.1.8" "installer\gloss-pdf.iss"
+  # 产物：dist\gloss-pdf-0.1.8-setup.exe
   ```
 
 若直接分发免安装绿色便携包，请保留以下文件同目录：
@@ -166,7 +166,7 @@ crates/gloss-pdf/assets/fonts/lxgw-wenkai-tc/OFL.txt   # 字体许可声明（SI
 工作区采用清晰的职责隔离架构，各核心 crate 解耦运行，保障了高性能与可维护性：
 
 ```text
-Cargo.toml                 # Workspace 根配置（版本 0.1.7）
+Cargo.toml                 # Workspace 根配置（版本 0.1.8）
 crates/
 ├── ai-core/               # AI 智能体与工具链引擎（独立轻量 crate）
 │   └── src/

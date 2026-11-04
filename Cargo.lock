@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "ai-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "futures",
  "rig",
@@ -2663,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "dict-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "encoding_rs",
@@ -3514,7 +3514,7 @@ dependencies = [
 
 [[package]]
 name = "gloss-pdf"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ai-core",
  "anyhow",
@@ -6832,7 +6832,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "flate2",
