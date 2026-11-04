@@ -4,6 +4,10 @@ use gpui::{
     App, ClickEvent, Context, MouseMoveEvent, Pixels, Point, Render, Window, WindowControlArea,
     div, prelude::*, px, svg,
 };
+// 自绘窗口按钮只在非 macOS 分支编译；本地 macOS 构建看不到这段，曾导致 Windows CI 报
+// `cannot find function rgb`。条件导入避免 macOS 下产生未使用导入的警告。
+#[cfg(not(target_os = "macos"))]
+use gpui::rgb;
 
 use crate::app::AppState;
 use crate::chrome_visibility::{ChromeInput, ChromeSignature, ChromeUpdate, HIDE_DELAY, band_at};
