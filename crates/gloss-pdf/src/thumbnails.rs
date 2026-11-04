@@ -26,9 +26,7 @@ struct ThumbKey {
 #[derive(Clone)]
 pub(crate) struct ThumbnailImage {
     pub image: Arc<RenderImage>,
-    #[allow(dead_code)]
     pub width: u32,
-    #[allow(dead_code)]
     pub height: u32,
 }
 

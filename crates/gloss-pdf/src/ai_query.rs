@@ -24,6 +24,15 @@ const NOTIFY_CHARS: usize = 20;
 /// 让「翻好几页追出处」这类长查询能跑完；真正的成本护栏是页预算。
 const AI_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// 第 `page` 页的页边笺注栏是否应该承载当前激活的 AI 卡。
+///
+/// 笺注栏是「按可见页逐页渲染」的，所以这个判据必须同时满足卡片可见与页码一致；
+/// 只看可见性会让相邻两页各画一张同样的卡（两页同时可见时的重复卡片 bug）。
+#[inline]
+pub(crate) fn ai_card_on_page(ai_page: usize, page: usize, visible: bool) -> bool {
+    visible && ai_page == page
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ToolLine {
     pub name: String,
@@ -165,12 +174,30 @@ impl crate::app::AppState {
         self.start_ai_lookup_text(term, cx);
     }
 
+    /// 记录本次查询锚定的页与选区矩形：笺注栏靠 `ai.page` 决定卡片落在哪一页。
+    /// 必须在所有可能提前 return 的分支之前调用，否则错误卡或缓存命中卡会留在上一次的页上。
+    fn capture_ai_anchor(&mut self) {
+        if let Some(capsule) = &self.selection_capsule {
+            self.ai.page = capsule.page;
+            self.ai.rects = capsule.rects.clone();
+        } else if let Some(selection_page) = self.viewer.selection.page {
+            let chars = self.viewer.chars_of(selection_page);
+            self.ai.page = selection_page;
+            self.ai.rects = self.viewer.selection.rects(chars);
+        } else {
+            self.ai.page = self.viewer.current_page;
+            self.ai.rects.clear();
+        }
+    }
+
     /// 发起一次 AI 查询：`text` 可能是词，也可能是一整段选中的文字。
     ///
     /// 词与段落的差别只体现在提示词与标题上，链路其余部分完全一致。
     pub(crate) fn start_ai_lookup_text(&mut self, text: String, cx: &mut Context<Self>) {
         let settings = self.settings.current.ai.clone();
         let label = Self::selection_label(&text);
+        // 配置校验失败也会显示一张错误卡，同样要锚定在用户选中的那一页。
+        self.capture_ai_anchor();
         if let Err(error) = settings.validate() {
             self.ai.term = label;
             self.ai.phase = AiPhase::Failed {
@@ -183,20 +210,6 @@ impl crate::app::AppState {
         let Some(snapshot) = self.lookup_snapshot() else {
             return;
         };
-
-        // 先记下「这段话在纸上的哪儿」：笺注栏靠 `ai.page` 决定在哪一页出现，
-        // 缓存命中会提前 return，所以必须在查缓存之前就写好。
-        if let Some(capsule) = &self.selection_capsule {
-            self.ai.page = capsule.page;
-            self.ai.rects = capsule.rects.clone();
-        } else if let Some(selection_page) = self.viewer.selection.page {
-            let chars = self.viewer.chars_of(selection_page);
-            self.ai.page = selection_page;
-            self.ai.rects = self.viewer.selection.rects(chars);
-        } else {
-            self.ai.page = snapshot.current_page();
-            self.ai.rects.clear();
-        }
 
         let model = settings.lookup.model.trim().to_string();
         let key = format!(
@@ -277,7 +290,13 @@ impl crate::app::AppState {
         if term.is_empty() {
             return;
         }
+        // 重试的是同一个词，锚点必须沿用；用户可能已经滚动或清掉了选区。
+        let page = self.ai.page;
+        let rects = self.ai.rects.clone();
         self.start_ai_lookup(term, cx);
+        self.ai.page = page;
+        self.ai.rects = rects;
+        cx.notify();
     }
 
     pub(crate) fn close_ai_card(&mut self, cx: &mut Context<Self>) {
@@ -350,6 +369,26 @@ impl crate::app::AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ai_card_belongs_only_to_the_query_page() {
+        assert!(ai_card_on_page(4, 4, true));
+        assert!(!ai_card_on_page(4, 3, true), "上一页不能再画一张");
+        assert!(!ai_card_on_page(4, 5, true), "下一页也不能再画一张");
+        assert!(!ai_card_on_page(4, 4, false), "卡片不可见时任何页都不画");
+    }
+
+    #[test]
+    fn two_visible_pages_render_exactly_one_ai_card() {
+        let ai_page = 4;
+        let visible_pages = [3, 4];
+        let rendered: Vec<usize> = visible_pages
+            .iter()
+            .copied()
+            .filter(|page| ai_card_on_page(ai_page, *page, true))
+            .collect();
+        assert_eq!(rendered, vec![4]);
+    }
 
     #[test]
     fn cache_is_lru_bounded_and_refreshes_on_hit() {

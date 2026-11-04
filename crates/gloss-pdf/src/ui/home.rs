@@ -1,5 +1,5 @@
-//! 首页：高保真还原设计稿（Ardot #740208401507583）
-//! 包含 248px 侧边栏、顶栏、内容区、继续阅读 Hero 深色卡、最近阅读卡片网格以及空态页面。
+//! 首页：紧凑栅格版书架（统一度量见 `m`）
+//! 包含侧边栏、顶栏、内容区、继续阅读 Hero 深色卡、最近阅读卡片网格以及空态页面。
 
 use gpui::{
     ClickEvent, ClipboardItem, Context, ExternalPaths, ObjectFit, Rgba, WindowControlArea, div, img,
@@ -10,6 +10,26 @@ use crate::app::AppState;
 use crate::home::{HomeNav, RecentDocument, ViewMode, format_today_header, relative_time};
 use crate::progress::unix_now;
 use crate::theme::Theme;
+
+/// 首页紧凑栅格：所有跨组件尺寸集中在此，以 4px 为基准统一调节整体密度。
+pub(crate) mod m {
+    /// 侧边栏宽度
+    pub const SIDEBAR_W: f32 = 208.0;
+    /// 顶栏与内容区左右留白（两者相等，保证视觉对齐）
+    pub const GUTTER: f32 = 28.0;
+    pub const TOPBAR_H: f32 = 58.0;
+    /// 页面大区块之间的纵向间距
+    pub const SECTION_GAP: f32 = 20.0;
+    pub const GRID_GAP: f32 = 14.0;
+    pub const CARD_H: f32 = 232.0;
+    pub const PREVIEW_H: f32 = 164.0;
+    pub const CARD_RADIUS: f32 = 12.0;
+    pub const HERO_H: f32 = 144.0;
+    /// 品牌行基础高度（Windows / Linux 直接使用）
+    pub const BRAND_H: f32 = 60.0;
+    /// macOS 无边框窗口左上角交通灯的安全区，避免系统按钮压住品牌 Logo
+    pub const TITLEBAR_SAFE_TOP: f32 = 24.0;
+}
 
 /// 首页高保真调色板（严格提取自设计稿）
 #[derive(Clone, Copy)]
@@ -38,13 +58,13 @@ fn palette(theme: &Theme) -> DesignPalette {
     if theme.dark {
         DesignPalette {
             bg: rgb(0x161618),
-            sidebar: rgb(0x1c1c1f),
+            sidebar: rgb(0x1a1a1d),
             card: rgb(0x222226),
-            preview_bg: rgb(0x28282c),
-            border: rgb(0x323238),
+            preview_bg: rgb(0x1e1e22),
+            border: rgb(0x36363d),
             border_strong: rgb(0x42424b),
             text: rgb(0xf5f5f7),
-            muted: rgb(0x86868b),
+            muted: rgb(0x929298),
             subtle: rgb(0xa1a1a6),
             accent: rgb(0x0a84ff),
             accent_hover: rgb(0x2492ff),
@@ -59,20 +79,20 @@ fn palette(theme: &Theme) -> DesignPalette {
     } else {
         DesignPalette {
             // 设计稿: #F5F5F7 (0.961, 0.961, 0.969)
-            bg: rgb(0xf5f5f7),
+            bg: rgb(0xf7f7f9),
             // 设计稿侧边栏: 同 #F5F5F7
-            sidebar: rgb(0xf5f5f7),
+            sidebar: rgb(0xf1f1f4),
             // 设计稿卡片: #FFFFFF
             card: rgb(0xffffff),
             // 预览底色: #FFFFFF
-            preview_bg: rgb(0xffffff),
+            preview_bg: rgb(0xeeeef2),
             // 边框 / 分隔线: #E5E5EA (0.898, 0.898, 0.918)
-            border: rgb(0xe5e5ea),
-            border_strong: rgb(0xd1d1d6),
+            border: rgb(0xdedee5),
+            border_strong: rgb(0xc7c7cf),
             // 主文字: #1D1D1F (0.114, 0.114, 0.122)
             text: rgb(0x1d1d1f),
             // 次级文案: #86868B (0.525, 0.525, 0.545)
-            muted: rgb(0x86868b),
+            muted: rgb(0x797980),
             // 第三级文案: #6E6E73 (0.431, 0.431, 0.451)
             subtle: rgb(0x6e6e73),
             // 强调亮蓝: #0071E3 / #0070E3 (0, 0.443, 0.890)
@@ -85,9 +105,9 @@ fn palette(theme: &Theme) -> DesignPalette {
             hero_accent: rgb(0x2997ff),
             hero_track: rgb(0x3a3a3c),
             // 导航选中: #E8E8EC (0.910, 0.910, 0.929)
-            nav_active: rgb(0xe8e8ec),
+            nav_active: rgb(0xe7e7ee),
             // Hover: #EFEFF3
-            hover: rgb(0xefeff3),
+            hover: rgb(0xeaeaef),
         }
     }
 }
@@ -110,15 +130,15 @@ impl AppState {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                 this.open_dropped(paths.paths(), cx);
             }))
-            // 铺在首页最底层的标题栏拖拽区（避让左侧边栏 248px，避免拖拽区盖住左侧导航点击）
+            // 铺在首页最底层的标题栏拖拽区（避让左侧边栏，避免拖拽区盖住左侧导航点击）
             .child(crate::ui::chrome::drag_cursor(
                 div()
                     .id("home-titlebar-drag")
                     .absolute()
                     .top_0()
-                    .left(px(248.))
+                    .left(px(m::SIDEBAR_W))
                     .right_0()
-                    .h(px(46.))
+                    .h(px(40.))
                     .window_control_area(WindowControlArea::Drag),
             ))
             .child(self.home_sidebar(colors, cx))
@@ -142,12 +162,12 @@ impl AppState {
     }
 
     // =========================================================================
-    // 侧边栏 (248px)
+    // 侧边栏
     // =========================================================================
 
     fn home_sidebar(&self, colors: DesignPalette, cx: &mut Context<Self>) -> gpui::Div {
         div()
-            .w(px(248.))
+            .w(px(m::SIDEBAR_W))
             .h_full()
             .flex_shrink_0()
             .flex()
@@ -161,17 +181,26 @@ impl AppState {
     }
 
     fn home_sidebar_brand(&self, colors: DesignPalette) -> gpui::Div {
+        // macOS 的交通灯由系统绘制在窗口左上角、覆盖在侧栏内容之上。品牌行必须
+        // 预留这段安全区：单纯收紧高度会让垂直居中的 Logo 上移并盖住红黄绿按钮。
+        // Windows 使用右上角自绘控件，无需留白。
+        let safe_top = if cfg!(target_os = "macos") {
+            m::TITLEBAR_SAFE_TOP
+        } else {
+            0.0
+        };
         div()
-            .h(px(84.))
-            .px(px(22.))
+            .h(px(m::BRAND_H + safe_top / 2.0))
+            .pt(px(safe_top))
+            .px(px(18.))
             .flex()
             .items_center()
-            .gap(px(10.))
+            .gap(px(9.))
             .child(
-                // Logo 标记 (26x26, 8px 圆角, 蓝底, 白图标)
+                // Logo 标记 (24x24, 7px 圆角, 蓝底, 白图标)
                 div()
-                    .size(px(26.))
-                    .rounded(px(8.))
+                    .size(px(24.))
+                    .rounded(px(7.))
                     .bg(colors.accent)
                     .flex()
                     .items_center()
@@ -179,13 +208,13 @@ impl AppState {
                     .child(
                         svg()
                             .path("icons/open.svg")
-                            .size(px(15.))
+                            .size(px(14.))
                             .text_color(rgb(0xffffff)),
                     ),
             )
             .child(
                 div()
-                    .text_size(px(20.))
+                    .text_size(px(17.))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(colors.text)
                     .child("gloss"),
@@ -195,7 +224,7 @@ impl AppState {
     fn home_sidebar_main_nav(&self, colors: DesignPalette, cx: &mut Context<Self>) -> gpui::Div {
         let count = self.home.recents.len();
         div()
-            .px(px(12.))
+            .px(px(10.))
             .flex()
             .flex_col()
             .gap(px(2.))
@@ -232,9 +261,9 @@ impl AppState {
             .child(
                 // 分组标题
                 div()
-                    .pt(px(26.))
-                    .pb(px(8.))
-                    .px(px(24.))
+                    .pt(px(18.))
+                    .pb(px(6.))
+                    .px(px(22.))
                     .text_size(px(11.))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(colors.muted)
@@ -242,7 +271,7 @@ impl AppState {
             )
             .child(
                 div()
-                    .px(px(12.))
+                    .px(px(10.))
                     .flex()
                     .flex_col()
                     .gap(px(2.))
@@ -267,14 +296,14 @@ impl AppState {
 
     fn home_sidebar_bottom(&self, colors: DesignPalette, cx: &mut Context<Self>) -> gpui::Div {
         div()
-            .px(px(12.))
-            .pb(px(16.))
+            .px(px(10.))
+            .pb(px(12.))
             .flex()
             .flex_col()
             .gap(px(2.))
             .child(
                 div()
-                    .mb(px(8.))
+                    .mb(px(6.))
                     .h(px(1.))
                     .bg(colors.border),
             )
@@ -296,8 +325,8 @@ impl AppState {
             ))
             .child(
                 div()
-                    .px(px(12.))
-                    .pt(px(8.))
+                    .px(px(10.))
+                    .pt(px(6.))
                     .text_size(px(11.))
                     .text_color(colors.muted)
                     .child(format!("v{} · 已是最新", env!("CARGO_PKG_VERSION"))),
@@ -318,12 +347,12 @@ impl AppState {
 
         div()
             .id(label)
-            .h(px(42.))
-            .px(px(12.))
+            .h(px(34.))
+            .px(px(10.))
             .flex()
             .items_center()
-            .gap(px(10.))
-            .rounded(px(10.))
+            .gap(px(9.))
+            .rounded(px(8.))
             .bg(if active {
                 colors.nav_active
             } else {
@@ -352,13 +381,13 @@ impl AppState {
             .child(
                 svg()
                     .path(icon_path)
-                    .size(px(18.))
+                    .size(px(16.))
                     .text_color(if active { colors.text } else { colors.muted }),
             )
             .child(
                 div()
                     .flex_1()
-                    .text_size(px(14.))
+                    .text_size(px(13.))
                     .font_weight(if active {
                         gpui::FontWeight::MEDIUM
                     } else {
@@ -376,7 +405,7 @@ impl AppState {
     }
 
     // =========================================================================
-    // 顶栏 (72px)
+    // 顶栏
     // =========================================================================
 
     fn home_topbar(&self, colors: DesignPalette, cx: &mut Context<Self>) -> gpui::Div {
@@ -384,25 +413,25 @@ impl AppState {
         let is_grid = self.home.view_mode == ViewMode::Grid;
 
         div()
-            .h(px(72.))
-            .pl(px(40.))
-            .pr(if cfg!(target_os = "windows") { px(180.) } else { px(40.) })
+            .h(px(m::TOPBAR_H))
+            .pl(px(m::GUTTER))
+            .pr(if cfg!(target_os = "windows") { px(180.) } else { px(m::GUTTER) })
             .flex()
             .items_center()
-            .gap(px(14.))
+            .gap(px(10.))
             .border_b_1()
             .border_color(colors.border)
             .child(
-                // 搜索框 (430x40, 圆角 10px, 白底)
+                // 搜索框
                 div()
                     .id("home-search-input")
-                    .w(px(430.))
-                    .h(px(40.))
-                    .px(px(12.))
+                    .w(px(360.))
+                    .h(px(34.))
+                    .px(px(10.))
                     .flex()
                     .items_center()
-                    .gap(px(8.))
-                    .rounded(px(10.))
+                    .gap(px(7.))
+                    .rounded(px(8.))
                     .bg(colors.card)
                     .border_1()
                     .border_color(if focused {
@@ -423,7 +452,7 @@ impl AppState {
                     .child(
                         svg()
                             .path("icons/search.svg")
-                            .size(px(16.))
+                            .size(px(15.))
                             .text_color(colors.muted),
                     )
                     .child(
@@ -438,7 +467,7 @@ impl AppState {
                         // Cmd K / Ctrl K 提示胶囊
                         div()
                             .px(px(6.))
-                            .h(px(20.))
+                            .h(px(18.))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -453,23 +482,23 @@ impl AppState {
             .child(
                 // 视图切换 (网格 / 列表)
                 div()
-                    .h(px(40.))
-                    .p(px(4.))
+                    .h(px(34.))
+                    .p(px(3.))
                     .flex()
                     .items_center()
                     .gap(px(2.))
-                    .rounded(px(12.))
+                    .rounded(px(9.))
                     .bg(colors.card)
                     .border_1()
                     .border_color(colors.border)
                     .child(
                         div()
                             .id("view-grid")
-                            .size(px(32.))
+                            .size(px(28.))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(7.))
+                            .rounded(px(6.))
                             .bg(if is_grid { colors.bg } else { rgba(0x00000000) })
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
@@ -478,7 +507,7 @@ impl AppState {
                             }))
                             .child(
                                 div()
-                                    .text_size(px(14.))
+                                    .text_size(px(13.))
                                     .text_color(if is_grid { colors.text } else { colors.muted })
                                     .child("⊞"),
                             ),
@@ -486,11 +515,11 @@ impl AppState {
                     .child(
                         div()
                             .id("view-list")
-                            .size(px(32.))
+                            .size(px(28.))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(7.))
+                            .rounded(px(6.))
                             .bg(if !is_grid { colors.bg } else { rgba(0x00000000) })
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
@@ -499,7 +528,7 @@ impl AppState {
                             }))
                             .child(
                                 div()
-                                    .text_size(px(14.))
+                                    .text_size(px(13.))
                                     .text_color(if !is_grid { colors.text } else { colors.muted })
                                     .child("☰"),
                             ),
@@ -509,11 +538,11 @@ impl AppState {
                 // 打开 PDF 按钮 (蓝底胶囊)
                 div()
                     .id("home-open-pdf-btn")
-                    .h(px(40.))
-                    .px(px(20.))
+                    .h(px(34.))
+                    .px(px(14.))
                     .flex()
                     .items_center()
-                    .gap(px(7.))
+                    .gap(px(6.))
                     .rounded_full()
                     .bg(colors.accent)
                     .cursor_pointer()
@@ -526,14 +555,14 @@ impl AppState {
                     }))
                     .child(
                         div()
-                            .text_size(px(16.))
+                            .text_size(px(15.))
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(rgb(0xffffff))
                             .child("+"),
                     )
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(rgb(0xffffff))
                             .child("打开 PDF"),
@@ -570,11 +599,11 @@ impl AppState {
                     .scrollbar_width(px(8.))
                     .child(
                         div()
-                            .px(px(40.))
-                            .py(px(30.))
+                            .px(px(m::GUTTER))
+                            .py(px(22.))
                             .flex()
                             .flex_col()
-                            .gap(px(30.))
+                            .gap(px(m::SECTION_GAP))
                             .child(self.home_header_section(is_empty, colors))
                             .child(if is_empty {
                                 self.home_empty_section(colors, cx)
@@ -594,7 +623,7 @@ impl AppState {
             div()
                 .flex()
                 .flex_col()
-                .gap(px(5.))
+                .gap(px(4.))
                 .child(
                     div()
                         .text_size(px(11.))
@@ -604,14 +633,14 @@ impl AppState {
                 )
                 .child(
                     div()
-                        .text_size(px(34.))
+                        .text_size(px(27.))
                         .font_weight(gpui::FontWeight::BOLD)
                         .text_color(colors.text)
                         .child("从第一本书开始"),
                 )
                 .child(
                     div()
-                        .text_size(px(13.))
+                        .text_size(px(12.))
                         .text_color(colors.subtle)
                         .child("把 PDF 拖进来，或从磁盘选择文件。gloss 会记住你读到哪里。"),
                 )
@@ -628,7 +657,7 @@ impl AppState {
             div()
                 .flex()
                 .flex_col()
-                .gap(px(5.))
+                .gap(px(4.))
                 .child(
                     div()
                         .text_size(px(11.))
@@ -638,14 +667,14 @@ impl AppState {
                 )
                 .child(
                     div()
-                        .text_size(px(34.))
+                        .text_size(px(27.))
                         .font_weight(gpui::FontWeight::BOLD)
                         .text_color(colors.text)
                         .child("我的书架"),
                 )
                 .child(
                     div()
-                        .text_size(px(13.))
+                        .text_size(px(12.))
                         .text_color(colors.subtle)
                         .child(format!("{count} 份文档 · 上次阅读 {last_opened}")),
                 )
@@ -661,14 +690,14 @@ impl AppState {
             .flex_1()
             .flex()
             .flex_col()
-            .gap(px(32.))
+            .gap(px(20.))
             .child(
                 // 虚线大投放区 (20px 圆角, 居中)
                 div()
                     .id("empty-drop-zone")
                     .w_full()
-                    .h(px(380.))
-                    .rounded(px(20.))
+                    .h(px(300.))
+                    .rounded(px(14.))
                     .border_2()
                     .border_dashed()
                     .border_color(colors.border)
@@ -677,7 +706,7 @@ impl AppState {
                     .flex_col()
                     .items_center()
                     .justify_center()
-                    .gap(px(16.))
+                    .gap(px(12.))
                     .cursor_pointer()
                     .hover({
                         let hover_border = colors.accent;
@@ -689,7 +718,7 @@ impl AppState {
                     .child(
                         // 投放图标 (64x64, 白底圆圈, 带边框)
                         div()
-                            .size(px(64.))
+                            .size(px(52.))
                             .rounded_full()
                             .bg(colors.bg)
                             .border_1()
@@ -700,20 +729,20 @@ impl AppState {
                             .child(
                                 svg()
                                     .path("icons/open.svg")
-                                    .size(px(28.))
+                                    .size(px(24.))
                                     .text_color(colors.accent),
                             ),
                     )
                     .child(
                         div()
-                            .text_size(px(22.))
+                            .text_size(px(19.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(colors.text)
                             .child("把第一份 PDF 放进来"),
                     )
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(px(12.))
                             .text_color(colors.subtle)
                             .child("拖拽文件到窗口任意位置，或点击下方按钮从磁盘选择"),
                     )
@@ -721,16 +750,16 @@ impl AppState {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(10.))
+                            .gap(px(8.))
                             .child(
                                 // 选择文件 (蓝底)
                                 div()
                                     .id("empty-choose-file")
-                                    .h(px(42.))
-                                    .px(px(20.))
+                                    .h(px(34.))
+                                    .px(px(16.))
                                     .flex()
                                     .items_center()
-                                    .gap(px(8.))
+                                    .gap(px(6.))
                                     .rounded_full()
                                     .bg(colors.accent)
                                     .cursor_pointer()
@@ -743,7 +772,7 @@ impl AppState {
                                     }))
                                     .child(
                                         div()
-                                            .text_size(px(13.))
+                                            .text_size(px(12.))
                                             .font_weight(gpui::FontWeight::MEDIUM)
                                             .text_color(rgb(0xffffff))
                                             .child("选择文件"),
@@ -753,8 +782,8 @@ impl AppState {
                                 // 先看一份示例 (白底圆角边框)
                                 div()
                                     .id("empty-sample-btn")
-                                    .h(px(42.))
-                                    .px(px(18.))
+                                    .h(px(34.))
+                                    .px(px(14.))
                                     .flex()
                                     .items_center()
                                     .rounded_full()
@@ -776,7 +805,7 @@ impl AppState {
                                     }))
                                     .child(
                                         div()
-                                            .text_size(px(13.))
+                                            .text_size(px(12.))
                                             .font_weight(gpui::FontWeight::MEDIUM)
                                             .text_color(colors.text)
                                             .child("先看一份示例"),
@@ -795,7 +824,7 @@ impl AppState {
                 div()
                     .w_full()
                     .flex()
-                    .gap(px(16.))
+                    .gap(px(12.))
                     .child(self.empty_feature_card(
                         "icons/open.svg",
                         "拖拽即可打开",
@@ -826,18 +855,18 @@ impl AppState {
     ) -> gpui::Div {
         div()
             .flex_1()
-            .p(px(16.))
+            .p(px(12.))
             .flex()
             .items_center()
-            .gap(px(12.))
-            .rounded(px(14.))
+            .gap(px(10.))
+            .rounded(px(10.))
             .bg(colors.card)
             .border_1()
             .border_color(colors.border)
             .child(
                 div()
-                    .size(px(32.))
-                    .rounded(px(10.))
+                    .size(px(28.))
+                    .rounded(px(8.))
                     .bg(colors.bg)
                     .border_1()
                     .border_color(colors.border)
@@ -847,7 +876,7 @@ impl AppState {
                     .child(
                         svg()
                             .path(icon_path)
-                            .size(px(16.))
+                            .size(px(15.))
                             .text_color(colors.muted),
                     ),
             )
@@ -858,7 +887,7 @@ impl AppState {
                     .gap(px(2.))
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(colors.text)
                             .child(title),
@@ -880,14 +909,14 @@ impl AppState {
         div()
             .flex()
             .flex_col()
-            .gap(px(30.))
+            .gap(px(m::SECTION_GAP))
             .children(self.home.hero_document().map(|hero| {
                 self.home_hero_card(hero, colors, cx)
             }))
             .child(self.home_recent_grid_section(colors, cx))
     }
 
-    // ---------- 继续阅读 Hero 深色卡片 (200px, 20px 圆角) ----------
+    // ---------- 继续阅读 Hero 深色卡片 ----------
 
     fn home_hero_card(
         &self,
@@ -903,45 +932,60 @@ impl AppState {
         let fraction = progress.map(|p| p.fraction()).unwrap_or(0.0);
 
         let path = hero.path.clone();
+        let hero_thumb = self.thumbnails.image_for(&hero.path);
 
         div()
             .id("home-hero-card")
             .w_full()
-            .h(px(200.))
-            .px(px(26.))
+            .h(px(m::HERO_H))
+            .px(px(22.))
             .flex()
             .items_center()
-            .gap(px(24.))
-            .rounded(px(20.))
+            .gap(px(18.))
+            .rounded(px(14.))
             .bg(colors.hero_bg)
             .cursor_pointer()
             .on_click(cx.listener(move |this, _event: &ClickEvent, _window, _cx| {
                 this.open_path(path.clone());
             }))
             .child(
-                // 封面微缩 (88x124, 4px 圆角, 白纸)
+                // 封面微缩（真实页面缩略图，缺失时回退占位排版）
                 div()
-                    .w(px(88.))
-                    .h(px(124.))
-                    .p(px(10.))
-                    .rounded(px(4.))
+                    .w(px(72.))
+                    .h(px(102.))
+                    .p(px(5.))
+                    .rounded(px(3.))
                     .bg(rgb(0xffffff))
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .child(
-                        div()
-                            .w(px(26.))
-                            .h(px(3.))
-                            .rounded(px(2.))
-                            .bg(colors.accent),
-                    )
-                    .child(div().w_full().h(px(3.)).rounded(px(2.)).bg(rgb(0xe5e5ea)))
-                    .child(div().w_full().h(px(3.)).rounded(px(2.)).bg(rgb(0xe5e5ea)))
-                    .child(div().w(px(44.)).h(px(3.)).rounded(px(2.)).bg(rgb(0xe5e5ea)))
-                    .child(div().w_full().h(px(3.)).rounded(px(2.)).bg(rgb(0xf2f2f7)))
-                    .child(div().w_full().h(px(3.)).rounded(px(2.)).bg(rgb(0xf2f2f7)))
-                    .child(div().w(px(52.)).h(px(3.)).rounded(px(2.)).bg(rgb(0xf2f2f7))),
+                    .shadow_sm()
+                    .child(match hero_thumb {
+                        Some(thumb) => div()
+                            .size_full()
+                            .child(
+                                img(thumb.image)
+                                    .size_full()
+                                    .object_fit(ObjectFit::Contain),
+                            )
+                            .into_any_element(),
+                        None => div()
+                            .size_full()
+                            .flex()
+                            .flex_col()
+                            .gap(px(5.))
+                            .child(
+                                div()
+                                    .w(px(22.))
+                                    .h(px(3.))
+                                    .rounded(px(2.))
+                                    .bg(colors.accent),
+                            )
+                            .child(div().w_full().h(px(3.)).rounded(px(2.)).bg(rgb(0xe5e5ea)))
+                            .child(div().w_full().h(px(3.)).rounded(px(2.)).bg(rgb(0xe5e5ea)))
+                            .child(div().w(px(36.)).h(px(3.)).rounded(px(2.)).bg(rgb(0xe5e5ea)))
+                            .child(div().w_full().h(px(3.)).rounded(px(2.)).bg(rgb(0xf2f2f7)))
+                            .child(div().w_full().h(px(3.)).rounded(px(2.)).bg(rgb(0xf2f2f7)))
+                            .child(div().w(px(42.)).h(px(3.)).rounded(px(2.)).bg(rgb(0xf2f2f7)))
+                            .into_any_element(),
+                    }),
             )
             .child(
                 // 文案列
@@ -949,12 +993,12 @@ impl AppState {
                     .flex_1()
                     .flex()
                     .flex_col()
-                    .gap(px(9.))
+                    .gap(px(6.))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(9.))
+                            .gap(px(7.))
                             .child(
                                 div()
                                     .text_size(px(11.))
@@ -971,14 +1015,14 @@ impl AppState {
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(colors.muted)
+                                    .text_color(colors.hero_subtext)
                                     .child(format!("上次打开 {time}")),
                             ),
                     )
                     .child(
                         div()
                             .truncate()
-                            .text_size(px(26.))
+                            .text_size(px(21.))
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(colors.hero_text)
                             .child(hero.title.clone()),
@@ -992,8 +1036,8 @@ impl AppState {
                     .child(
                         // 进度条轨道 (320x4)
                         div()
-                            .w(px(320.))
-                            .h(px(4.))
+                            .w(px(240.))
+                            .h(px(3.))
                             .rounded_full()
                             .bg(colors.hero_track)
                             .child(
@@ -1011,27 +1055,27 @@ impl AppState {
                     .flex()
                     .flex_col()
                     .items_end()
-                    .gap(px(9.))
+                    .gap(px(6.))
                     .child(
                         // 继续阅读按钮 (白底胶囊)
                         div()
-                            .h(px(42.))
-                            .px(px(20.))
+                            .h(px(34.))
+                            .px(px(14.))
                             .flex()
                             .items_center()
-                            .gap(px(8.))
+                            .gap(px(6.))
                             .rounded_full()
                             .bg(rgb(0xffffff))
                             .child(
                                 div()
-                                    .text_size(px(13.))
+                                    .text_size(px(12.))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(rgb(0x1d1d1f))
                                     .child("继续阅读"),
                             )
                             .child(
                                 div()
-                                    .text_size(px(14.))
+                                    .text_size(px(13.))
                                     .text_color(rgb(0x1d1d1f))
                                     .child("→"),
                             ),
@@ -1039,7 +1083,7 @@ impl AppState {
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(colors.muted)
+                            .text_color(colors.hero_subtext)
                             .child(format!("从第 {page_now} 页开始")),
                     ),
             )
@@ -1055,7 +1099,7 @@ impl AppState {
         div()
             .flex()
             .flex_col()
-            .gap(px(16.))
+            .gap(px(12.))
             .child(
                 // 标题行
                 div()
@@ -1066,18 +1110,18 @@ impl AppState {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(10.))
+                            .gap(px(8.))
                             .child(
                                 div()
-                                    .text_size(px(17.))
+                                    .text_size(px(15.))
                                     .font_weight(gpui::FontWeight::BOLD)
                                     .text_color(colors.text)
                                     .child(if is_fav { "我的收藏" } else { "最近阅读" }),
                             )
                             .child(
                                 div()
-                                    .h(px(20.))
-                                    .px(px(8.))
+                                    .h(px(18.))
+                                    .px(px(7.))
                                     .flex()
                                     .items_center()
                                     .justify_center()
@@ -1098,7 +1142,7 @@ impl AppState {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(16.))
+                            .gap(px(12.))
                             .child(
                                 div()
                                     .text_size(px(11.))
@@ -1151,15 +1195,15 @@ impl AppState {
         if filtered.is_empty() {
             return div()
                 .w_full()
-                .h(px(140.))
+                .h(px(120.))
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(16.))
+                .rounded(px(12.))
                 .border_1()
                 .border_dashed()
                 .border_color(colors.border)
-                .text_size(px(13.))
+                .text_size(px(12.))
                 .text_color(colors.muted)
                 .child(if self.home.nav == HomeNav::Favorites {
                     "暂无收藏的文档"
@@ -1170,7 +1214,7 @@ impl AppState {
                 });
         }
 
-        let mut list = div().flex().flex_col().gap(px(8.));
+        let mut list = div().flex().flex_col().gap(px(6.));
         for &index in filtered {
             list = list.child(self.home_document_list_row(index, colors, cx));
         }
@@ -1203,12 +1247,12 @@ impl AppState {
         let mut row = div()
             .id(("list-row", index))
             .relative()
-            .h(px(56.))
-            .px(px(16.))
+            .h(px(46.))
+            .px(px(14.))
             .flex()
             .items_center()
-            .gap(px(16.))
-            .rounded(px(12.))
+            .gap(px(12.))
+            .rounded(px(10.))
             .bg(colors.card)
             .border_1()
             .border_color(colors.border)
@@ -1228,8 +1272,8 @@ impl AppState {
             .child(
                 // 文档小图标
                 div()
-                    .size(px(32.))
-                    .rounded(px(8.))
+                    .size(px(28.))
+                    .rounded(px(7.))
                     .bg(colors.bg)
                     .flex()
                     .items_center()
@@ -1237,7 +1281,7 @@ impl AppState {
                     .child(
                         svg()
                             .path("icons/open.svg")
-                            .size(px(16.))
+                            .size(px(15.))
                             .text_color(colors.accent),
                     ),
             )
@@ -1247,7 +1291,7 @@ impl AppState {
                     .flex_1()
                     .min_w(px(0.))
                     .truncate()
-                    .text_size(px(14.))
+                    .text_size(px(13.))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(colors.text)
                     .child(title),
@@ -1255,8 +1299,8 @@ impl AppState {
             .child(
                 // 进度胶囊
                 div()
-                    .h(px(24.))
-                    .px(px(10.))
+                    .h(px(22.))
+                    .px(px(8.))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1269,7 +1313,7 @@ impl AppState {
             .child(
                 // 打开时间
                 div()
-                    .w(px(80.))
+                    .w(px(72.))
                     .text_right()
                     .text_size(px(12.))
                     .text_color(colors.muted)
@@ -1279,11 +1323,11 @@ impl AppState {
                 // 快捷收藏星标按钮
                 div()
                     .id(("list-fav", index))
-                    .size(px(26.))
+                    .size(px(24.))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(6.))
+                    .rounded(px(5.))
                     .cursor_pointer()
                     .hover({
                         let hover_bg = colors.hover;
@@ -1305,7 +1349,7 @@ impl AppState {
                     .child(
                         svg()
                             .path("icons/favorite.svg")
-                            .size(px(15.))
+                            .size(px(14.))
                             .text_color(if is_fav {
                                 colors.accent
                             } else {
@@ -1317,12 +1361,12 @@ impl AppState {
                 // 更多菜单
                 div()
                     .id(("list-more", index))
-                    .size(px(26.))
+                    .size(px(24.))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(6.))
-                    .text_size(px(16.))
+                    .rounded(px(5.))
+                    .text_size(px(15.))
                     .text_color(colors.muted)
                     .cursor_pointer()
                     .hover({
@@ -1354,36 +1398,46 @@ impl AppState {
         row
     }
 
+    /// 网格列数与预览区真实像素尺寸，供缩略图按原始比例精确排布。
+    fn home_grid_metrics(&self) -> (u16, f32, f32) {
+        let available =
+            (f32::from(self.viewport.width) - m::SIDEBAR_W - m::GUTTER * 2.0).max(1.0);
+        let columns = if available >= 660.0 {
+            3
+        } else if available >= 430.0 {
+            2
+        } else {
+            1
+        };
+        let card_w = (available - m::GRID_GAP * (columns as f32 - 1.0)) / columns as f32;
+        let preview_w = (card_w - 22.0).max(1.0); // 卡片内边距 10*2 + 预览边框 1*2
+        let preview_h = (m::PREVIEW_H - 2.0).max(1.0);
+        (columns, preview_w, preview_h)
+    }
+
     fn home_card_grid(
         &self,
         filtered: &[usize],
         colors: DesignPalette,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let available = f32::from(self.viewport.width) - 248.0 - 80.0;
-        let columns = if available >= 900.0 {
-            3
-        } else if available >= 560.0 {
-            2
-        } else {
-            1
-        };
+        let (columns, _, _) = self.home_grid_metrics();
 
-        let mut grid = div().grid().grid_cols(columns).gap(px(20.));
+        let mut grid = div().grid().grid_cols(columns).gap(px(m::GRID_GAP));
 
         if filtered.is_empty() {
             grid = grid.child(
                 div()
                     .col_span_full()
-                    .h(px(140.))
+                    .h(px(120.))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(16.))
+                    .rounded(px(12.))
                     .border_1()
                     .border_dashed()
                     .border_color(colors.border)
-                    .text_size(px(13.))
+                    .text_size(px(12.))
                     .text_color(colors.muted)
                     .child(if self.home.is_filtering() {
                         "没有找到匹配的文档"
@@ -1400,7 +1454,7 @@ impl AppState {
         grid
     }
 
-    // ---------- 文档卡片 (356x276, 16px 圆角) ----------
+    // ---------- 文档卡片 ----------
 
     fn home_document_card(
         &self,
@@ -1413,6 +1467,7 @@ impl AppState {
         let time = relative_time(recent.opened_at);
         let menu_open = self.home.menu_open == Some(index);
         let thumbnail = self.thumbnails.image_for(&recent.path);
+        let (_, preview_w, preview_h) = self.home_grid_metrics();
 
         let progress = recent.progress.filter(|p| p.pages > 0);
         let meta = match progress {
@@ -1426,15 +1481,15 @@ impl AppState {
         let mut card = div()
             .id(("recent-card", index))
             .relative()
-            .h(px(276.))
-            .p(px(12.))
+            .h(px(m::CARD_H))
+            .p(px(10.))
             .flex()
             .flex_col()
-            .gap(px(12.))
-            .rounded(px(16.))
+            .gap(px(9.))
+            .rounded(px(m::CARD_RADIUS))
             .bg(colors.card)
             .border_1()
-            .border_color(colors.border)
+            .border_color(colors.border).shadow_sm()
             .cursor_pointer()
             .hover({
                 let hover_border = colors.border_strong;
@@ -1449,27 +1504,47 @@ impl AppState {
                 this.open_recent(index, cx);
             }))
             .child(
-                // 页面预览区域 (332x200, 10px 圆角)
+                // 页面预览区域（等比显示，避免拉伸变形）
                 div()
-                    .h(px(200.))
+                    .h(px(m::PREVIEW_H))
                     .w_full()
                     .overflow_hidden()
-                    .rounded(px(10.))
+                    .rounded(px(8.))
                     .bg(colors.preview_bg)
                     .border_1()
                     .border_color(colors.border)
+                    .flex()
+                    .items_start()
+                    .justify_center()
                     .child(match thumbnail {
-                        Some(thumb) => div()
-                            .size_full()
-                            .child(
-                                img(thumb.image)
-                                    .size_full()
-                                    .object_fit(ObjectFit::Fill),
-                            )
-                            .into_any_element(),
+                        Some(thumb) => {
+                            // 按真实像素比例等比铺满预览宽度，只截取书页上半部分，
+                            // 既不拉伸变形，也不会在两侧留下大片空白。
+                            let iw = (thumb.width as f32).max(1.0);
+                            let ih = (thumb.height as f32).max(1.0);
+                            let scale = (preview_w / iw).max(preview_h / ih);
+                            div()
+                                .w(px(iw * scale))
+                                .h(px(ih * scale))
+                                .flex_shrink_0()
+                                .child(
+                                    img(thumb.image)
+                                        .size_full()
+                                        .object_fit(ObjectFit::Fill),
+                                )
+                                .into_any_element()
+                        }
                         None => {
-                            // 渲染与设计图一致的书页预览排版
-                            self.home_card_page_mockup(&recent.title, &recent.path, colors)
+                            // 尚未生成缩略图时的占位书页排版
+                            div()
+                                .w(px(preview_w))
+                                .h(px(preview_h))
+                                .flex_shrink_0()
+                                .child(self.home_card_page_mockup(
+                                    &recent.title,
+                                    &recent.path,
+                                    colors,
+                                ))
                                 .into_any_element()
                         }
                     }),
@@ -1487,11 +1562,11 @@ impl AppState {
                             .min_w(px(0.))
                             .flex()
                             .flex_col()
-                            .gap(px(4.))
+                            .gap(px(3.))
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(px(15.))
+                                    .text_size(px(14.))
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(colors.text)
                                     .child(title),
@@ -1508,12 +1583,12 @@ impl AppState {
                         // 更多菜单按钮 "…"
                         div()
                             .id(("card-more", index))
-                            .size(px(24.))
+                            .size(px(22.))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(6.))
-                            .text_size(px(16.))
+                            .rounded(px(5.))
+                            .text_size(px(15.))
                             .text_color(colors.muted)
                             .cursor_pointer()
                             .hover({
@@ -1569,12 +1644,12 @@ impl AppState {
 
         div()
             .size_full()
-            .px(px(18.))
-            .py(px(16.))
+            .px(px(14.))
+            .py(px(12.))
             .bg(rgb(0xffffff))
             .flex()
             .flex_col()
-            .gap(px(9.))
+            .gap(px(7.))
             .child(
                 div()
                     .truncate()
@@ -1607,7 +1682,7 @@ impl AppState {
             .absolute()
             .bottom(px(40.))
             .right(px(12.))
-            .w(px(150.))
+            .w(px(140.))
             .p(px(4.))
             .rounded(px(8.))
             .bg(colors.card)
@@ -1708,25 +1783,25 @@ impl AppState {
             .filter(|r| r.progress.is_some())
             .collect();
 
-        let mut list = div().flex().flex_col().gap(px(12.));
+        let mut list = div().flex().flex_col().gap(px(10.));
         if bookmarks.is_empty() {
             list = list.child(
                 div()
                     .w_full()
-                    .h(px(180.))
+                    .h(px(140.))
                     .flex()
                     .flex_col()
                     .items_center()
                     .justify_center()
                     .gap(px(8.))
-                    .rounded(px(16.))
+                    .rounded(px(12.))
                     .border_1()
                     .border_dashed()
                     .border_color(colors.border)
                     .bg(colors.card)
                     .child(
                         div()
-                            .text_size(px(14.))
+                            .text_size(px(13.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(colors.text)
                             .child("暂无书签与阅读进度"),
@@ -1750,12 +1825,12 @@ impl AppState {
                 list = list.child(
                     div()
                         .id(("bookmark-row", idx))
-                        .h(px(64.))
-                        .px(px(20.))
+                        .h(px(52.))
+                        .px(px(14.))
                         .flex()
                         .items_center()
-                        .gap(px(16.))
-                        .rounded(px(14.))
+                        .gap(px(12.))
+                        .rounded(px(10.))
                         .bg(colors.card)
                         .border_1()
                         .border_color(colors.border)
@@ -1770,7 +1845,7 @@ impl AppState {
                         .child(
                             svg()
                                 .path("icons/bookmark.svg")
-                                .size(px(18.))
+                                .size(px(16.))
                                 .text_color(colors.accent),
                         )
                         .child(
@@ -1783,7 +1858,7 @@ impl AppState {
                                 .child(
                                     div()
                                         .truncate()
-                                        .text_size(px(14.))
+                                        .text_size(px(13.))
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(colors.text)
                                         .child(title),
@@ -1797,8 +1872,8 @@ impl AppState {
                         )
                         .child(
                             div()
-                                .px(px(10.))
-                                .py(px(4.))
+                                .px(px(8.))
+                                .py(px(3.))
                                 .rounded_full()
                                 .bg(colors.bg)
                                 .text_size(px(11.))
@@ -1808,7 +1883,7 @@ impl AppState {
                         )
                         .child(
                             div()
-                                .text_size(px(13.))
+                                .text_size(px(12.))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(colors.accent)
                                 .child("恢复阅读 →"),
@@ -1825,16 +1900,16 @@ impl AppState {
             .scrollbar_width(px(8.))
             .child(
                 div()
-                    .px(px(40.))
-                    .py(px(30.))
+                    .px(px(m::GUTTER))
+                    .py(px(22.))
                     .flex()
                     .flex_col()
-                    .gap(px(24.))
+                    .gap(px(18.))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(5.))
+                            .gap(px(4.))
                             .child(
                                 div()
                                     .text_size(px(11.))
@@ -1844,14 +1919,14 @@ impl AppState {
                             )
                             .child(
                                 div()
-                                    .text_size(px(32.))
+                                    .text_size(px(25.))
                                     .font_weight(gpui::FontWeight::BOLD)
                                     .text_color(colors.text)
                                     .child("书签与阅读进度"),
                             )
                             .child(
                                 div()
-                                    .text_size(px(13.))
+                                    .text_size(px(12.))
                                     .text_color(colors.subtle)
                                     .child("浏览每本书上次阅读的位置与进度，点击直接恢复阅读"),
                             ),
@@ -1879,16 +1954,16 @@ impl AppState {
             .scrollbar_width(px(8.))
             .child(
                 div()
-                    .px(px(40.))
-                    .py(px(30.))
+                    .px(px(m::GUTTER))
+                    .py(px(22.))
                     .flex()
                     .flex_col()
-                    .gap(px(24.))
+                    .gap(px(18.))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(5.))
+                            .gap(px(4.))
                             .child(
                                 div()
                                     .text_size(px(11.))
@@ -1898,14 +1973,14 @@ impl AppState {
                             )
                             .child(
                                 div()
-                                    .text_size(px(32.))
+                                    .text_size(px(25.))
                                     .font_weight(gpui::FontWeight::BOLD)
                                     .text_color(colors.text)
                                     .child("离线词典与生词本"),
                             )
                             .child(
                                 div()
-                                    .text_size(px(13.))
+                                    .text_size(px(12.))
                                     .text_color(colors.subtle)
                                     .child("支持汉字、多字词语及外文文献查词；在阅读器中双击字词也可一键钉住页边笺注"),
                             ),
@@ -1913,27 +1988,27 @@ impl AppState {
                     .child(
                         // 查词卡片
                         div()
-                            .p(px(20.))
-                            .rounded(px(16.))
+                            .p(px(16.))
+                            .rounded(px(12.))
                             .bg(colors.card)
                             .border_1()
                             .border_color(colors.border)
                             .flex()
                             .flex_col()
-                            .gap(px(16.))
+                            .gap(px(12.))
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(12.))
+                                    .gap(px(10.))
                                     .child(
                                         div()
                                             .flex_1()
-                                            .h(px(40.))
-                                            .px(px(12.))
+                                            .h(px(34.))
+                                            .px(px(10.))
                                             .flex()
                                             .items_center()
-                                            .rounded(px(10.))
+                                            .rounded(px(8.))
                                             .bg(colors.bg)
                                             .border_1()
                                             .border_color(colors.border)
@@ -1942,14 +2017,14 @@ impl AppState {
                                     .child(
                                         div()
                                             .id("dict-page-submit-btn")
-                                            .h(px(40.))
-                                            .px(px(24.))
+                                            .h(px(34.))
+                                            .px(px(16.))
                                             .flex()
                                             .items_center()
                                             .justify_center()
                                             .rounded_full()
                                             .bg(colors.accent)
-                                            .text_size(px(13.))
+                                            .text_size(px(12.))
                                             .font_weight(gpui::FontWeight::MEDIUM)
                                             .text_color(rgb(0xffffff))
                                             .cursor_pointer()
@@ -1969,7 +2044,7 @@ impl AppState {
                                     .flex()
                                     .flex_wrap()
                                     .items_center()
-                                    .gap(px(8.))
+                                    .gap(px(7.))
                                     .child(
                                         div()
                                             .text_size(px(12.))
@@ -1982,7 +2057,7 @@ impl AppState {
                                         div()
                                             .id(("dict-page-hist", idx))
                                             .px(px(10.))
-                                            .py(px(4.))
+                                            .py(px(3.))
                                             .rounded_full()
                                             .bg(colors.bg)
                                             .text_size(px(12.))
@@ -2002,14 +2077,14 @@ impl AppState {
                     .child(
                         // 释义呈现
                         div()
-                            .p(px(24.))
-                            .rounded(px(16.))
+                            .p(px(18.))
+                            .rounded(px(12.))
                             .bg(colors.card)
                             .border_1()
                             .border_color(colors.border)
                             .child(if entries.is_empty() {
                                 div()
-                                    .py(px(40.))
+                                    .py(px(28.))
                                     .flex()
                                     .flex_col()
                                     .items_center()
@@ -2017,7 +2092,7 @@ impl AppState {
                                     .gap(px(8.))
                                     .child(
                                         div()
-                                            .text_size(px(14.))
+                                            .text_size(px(13.))
                                             .font_weight(gpui::FontWeight::MEDIUM)
                                             .text_color(colors.text)
                                             .child("在上方输入字词或点击历史标签查词"),
@@ -2030,7 +2105,7 @@ impl AppState {
                                     )
                                     .into_any_element()
                             } else {
-                                let mut entries_col = div().flex().flex_col().gap(px(16.));
+                                let mut entries_col = div().flex().flex_col().gap(px(12.));
                                 for entry in &entries {
                                     entries_col = entries_col.child(crate::ui::dictionary::entry_element(
                                         entry,
@@ -2101,25 +2176,25 @@ impl AppState {
             }
         }
 
-        let mut list = div().flex().flex_col().gap(px(12.));
+        let mut list = div().flex().flex_col().gap(px(10.));
         if all_annotations.is_empty() {
             list = list.child(
                 div()
                     .w_full()
-                    .h(px(180.))
+                    .h(px(140.))
                     .flex()
                     .flex_col()
                     .items_center()
                     .justify_center()
                     .gap(px(8.))
-                    .rounded(px(16.))
+                    .rounded(px(12.))
                     .border_1()
                     .border_dashed()
                     .border_color(colors.border)
                     .bg(colors.card)
                     .child(
                         div()
-                            .text_size(px(14.))
+                            .text_size(px(13.))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(colors.text)
                             .child("暂无文档标注与页边笺注"),
@@ -2137,11 +2212,11 @@ impl AppState {
                 list = list.child(
                     div()
                         .id(("annot-row", idx))
-                        .p(px(16.))
+                        .p(px(12.))
                         .flex()
                         .items_center()
-                        .gap(px(16.))
-                        .rounded(px(14.))
+                        .gap(px(12.))
+                        .rounded(px(10.))
                         .bg(colors.card)
                         .border_1()
                         .border_color(colors.border)
@@ -2155,8 +2230,8 @@ impl AppState {
                         }))
                         .child(
                             div()
-                                .size(px(32.))
-                                .rounded(px(8.))
+                                .size(px(28.))
+                                .rounded(px(7.))
                                 .bg(colors.bg)
                                 .flex()
                                 .items_center()
@@ -2164,7 +2239,7 @@ impl AppState {
                                 .child(
                                     svg()
                                         .path(if item.is_gloss { "icons/dictionary.svg" } else { "icons/highlight.svg" })
-                                        .size(px(16.))
+                                        .size(px(15.))
                                         .text_color(if item.is_gloss { colors.accent } else { rgb(0xff9500) }),
                                 ),
                         )
@@ -2178,7 +2253,7 @@ impl AppState {
                                 .child(
                                     div()
                                         .truncate()
-                                        .text_size(px(14.))
+                                        .text_size(px(13.))
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(colors.text)
                                         .child(item.title),
@@ -2224,16 +2299,16 @@ impl AppState {
             .scrollbar_width(px(8.))
             .child(
                 div()
-                    .px(px(40.))
-                    .py(px(30.))
+                    .px(px(m::GUTTER))
+                    .py(px(22.))
                     .flex()
                     .flex_col()
-                    .gap(px(24.))
+                    .gap(px(18.))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(5.))
+                            .gap(px(4.))
                             .child(
                                 div()
                                     .text_size(px(11.))
@@ -2243,14 +2318,14 @@ impl AppState {
                             )
                             .child(
                                 div()
-                                    .text_size(px(32.))
+                                    .text_size(px(25.))
                                     .font_weight(gpui::FontWeight::BOLD)
                                     .text_color(colors.text)
                                     .child("我的标注与笺注"),
                             )
                             .child(
                                 div()
-                                    .text_size(px(13.))
+                                    .text_size(px(12.))
                                     .text_color(colors.subtle)
                                     .child("集中归档与回看所有文档中的划词高亮与页边词典笺注"),
                             ),
@@ -2275,16 +2350,16 @@ impl AppState {
             .scrollbar_width(px(8.))
             .child(
                 div()
-                    .px(px(40.))
-                    .py(px(30.))
+                    .px(px(m::GUTTER))
+                    .py(px(22.))
                     .flex()
                     .flex_col()
-                    .gap(px(24.))
+                    .gap(px(18.))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(5.))
+                            .gap(px(4.))
                             .child(
                                 div()
                                     .text_size(px(11.))
@@ -2294,14 +2369,14 @@ impl AppState {
                             )
                             .child(
                                 div()
-                                    .text_size(px(32.))
+                                    .text_size(px(25.))
                                     .font_weight(gpui::FontWeight::BOLD)
                                     .text_color(colors.text)
                                     .child("笺释 gloss-pdf"),
                             )
                             .child(
                                 div()
-                                    .text_size(px(13.))
+                                    .text_size(px(12.))
                                     .text_color(colors.subtle)
                                     .child("基于 GPUI 高性能 GPU 渲染框架与 PDFium 引擎构建的深度批注阅读器"),
                             ),
@@ -2309,8 +2384,8 @@ impl AppState {
                     .child(
                         // 版本与概览卡片
                         div()
-                            .p(px(24.))
-                            .rounded(px(16.))
+                            .p(px(18.))
+                            .rounded(px(12.))
                             .bg(colors.card)
                             .border_1()
                             .border_color(colors.border)
@@ -2321,11 +2396,11 @@ impl AppState {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(16.))
+                                    .gap(px(12.))
                                     .child(
                                         div()
-                                            .size(px(48.))
-                                            .rounded(px(14.))
+                                            .size(px(40.))
+                                            .rounded(px(10.))
                                             .bg(colors.accent)
                                             .flex()
                                             .items_center()
@@ -2333,7 +2408,7 @@ impl AppState {
                                             .child(
                                                 svg()
                                                     .path("icons/open.svg")
-                                                    .size(px(26.))
+                                                    .size(px(22.))
                                                     .text_color(rgb(0xffffff)),
                                             ),
                                     )
@@ -2341,10 +2416,10 @@ impl AppState {
                                         div()
                                             .flex()
                                             .flex_col()
-                                            .gap(px(4.))
+                                            .gap(px(3.))
                                             .child(
                                                 div()
-                                                    .text_size(px(18.))
+                                                    .text_size(px(16.))
                                                     .font_weight(gpui::FontWeight::BOLD)
                                                     .text_color(colors.text)
                                                     .child(format!("gloss-pdf v{}", env!("CARGO_PKG_VERSION"))),
@@ -2361,7 +2436,7 @@ impl AppState {
                                 div()
                                     .id("about-page-check-update-btn")
                                     .px(px(16.))
-                                    .py(px(8.))
+                                    .py(px(6.))
                                     .rounded_full()
                                     .bg(colors.bg)
                                     .border_1()
@@ -2385,7 +2460,7 @@ impl AppState {
                         div()
                             .grid()
                             .grid_cols(3)
-                            .gap(px(16.))
+                            .gap(px(12.))
                             .child(self.empty_feature_card(
                                 "icons/open.svg",
                                 "GPUI 渲染管线",

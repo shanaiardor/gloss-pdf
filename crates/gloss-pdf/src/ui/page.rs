@@ -48,12 +48,20 @@ impl AppState {
         );
 
         let mut canvas_children: Vec<gpui::AnyElement> = Vec::new();
+        // AI 卡不受页底裁剪、可能延伸到下一页上方的空白笺注区，因此统一在所有页
+        // 之后绘制，避免被下一页的钉住笺注卡覆盖。
+        let mut ai_layers: Vec<gpui::AnyElement> = Vec::new();
         for page in range {
             canvas_children.push(self.page_view(page, &layout, theme, cx).into_any_element());
-            if let Some(rail) = self.page_gloss_rail(page, &layout, theme, cx) {
+            let (rail, ai_layer) = self.page_gloss_rail(page, &layout, theme, cx);
+            if let Some(rail) = rail {
                 canvas_children.push(rail.into_any_element());
             }
+            if let Some(ai_layer) = ai_layer {
+                ai_layers.push(ai_layer);
+            }
         }
+        canvas_children.extend(ai_layers);
 
         container.child(
             div()

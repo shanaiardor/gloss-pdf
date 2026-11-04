@@ -106,6 +106,37 @@ pub const GLOSS_CARD_GAP: f32 = 10.0;
 /// 低于这个宽度就不再预留笺注栏：宁可让笺注卡临时浮在纸张上，也不把正文压成一条。
 pub const MIN_READING_WIDTH_WITH_RAIL: f32 = 240.0;
 
+/// AI 释义卡允许的最大高度：视口高度的 55%，但不超过 420px（窄窗口至少 160px）。
+pub fn ai_card_max_height(viewport_h: f32) -> f32 {
+    (viewport_h * 0.55).min(420.0).max(160.0)
+}
+
+/// 计算 AI 释义卡的页级布局与可见度。
+///
+/// 卡片**锚定在锁定页右侧的画布坐标上**，随页一起滚动；`top` 绝不依赖 `scroll_top`，
+/// 否则会被钉在屏幕固定位置，翻到前面几页时一直跟随。高度上限只取决于视口尺寸，
+/// 越过页底的部分由滚动容器自然裁在屏幕下沿。
+///
+/// `opacity` 按「所属页还有多少露在视口里」柔和淡出：页面大部分可见时完全不透明，
+/// 快滚出去时渐隐，页面完全离开视口后返回 0（调用方不渲染）。
+///
+/// 返回 `(top, available_height, opacity)`。
+pub fn ai_card_placement(
+    desired_top: f32,
+    page_top: f32,
+    page_height: f32,
+    scroll_top: f32,
+    viewport_h: f32,
+) -> (f32, f32, f32) {
+    let max_height = ai_card_max_height(viewport_h);
+    let page_visible = (page_top + page_height).min(scroll_top + viewport_h)
+        - page_top.max(scroll_top);
+    let ratio = (page_visible / page_height.max(1.0)).clamp(0.0, 1.0);
+    // 页面还有 40% 以上可见时保持完全不透明，之后线性淡出。
+    let opacity = (ratio / 0.4).clamp(0.0, 1.0);
+    (desired_top, max_height, opacity)
+}
+
 /// 视口是否宽到可以同时放下「正文 + 笺注栏」。
 ///
 /// [`FitArea`] 与 [`DocumentLayout`] 必须共用这一个判断：一个扣栏宽、一个加栏宽，
@@ -523,6 +554,52 @@ mod tests {
             width: 595.0,
             height: 842.0,
         }
+    }
+
+    #[test]
+    fn ai_card_stays_anchored_to_its_page_while_scrolling() {
+        // 回归：卡片位置绝不能随 scroll_top 变化，否则会被钉在屏幕上跟着翻页。
+        let viewport_h = 900.0;
+        let desired_top = 270.0;
+        for scroll_top in [0.0, 100.0, 250.0, 600.0, 1200.0] {
+            let (top, available, _) =
+                ai_card_placement(desired_top, 2000.0, 300.0, scroll_top, viewport_h);
+            assert_eq!(top, desired_top, "scroll_top={scroll_top} 时卡片被挪动了");
+            assert_eq!(2000.0 + top, 2270.0, "画布坐标必须固定在页上");
+            assert_eq!(available, ai_card_max_height(viewport_h));
+        }
+    }
+
+    #[test]
+    fn ai_card_height_is_not_limited_by_page_bottom() {
+        // 选区贴着页底：页内只剩 30px，卡片仍能向下延展到视口尺寸上限，
+        // 越过页底的部分由滚动容器裁在屏幕下沿。
+        let viewport_h = 900.0;
+        let max_height = ai_card_max_height(viewport_h);
+        let page_top = 40.0;
+        let page_height = 300.0;
+        let desired_top = 270.0;
+        let (_, available, _) =
+            ai_card_placement(desired_top, page_top, page_height, 0.0, viewport_h);
+        assert_eq!(available, max_height);
+        assert!(
+            page_top + desired_top + available > page_top + page_height,
+            "卡片应能越过当前页页底"
+        );
+    }
+
+    #[test]
+    fn ai_card_fades_out_when_its_page_scrolls_away() {
+        // 向后翻到前面几页：锁定页逐渐滑出视口下沿，卡片应柔和淡出并消失。
+        let viewport_h = 900.0;
+        let page_top = 2000.0;
+        let page_height = 300.0;
+        let fully_visible = ai_card_placement(270.0, page_top, page_height, 1800.0, viewport_h).2;
+        let fading = ai_card_placement(270.0, page_top, page_height, 1150.0, viewport_h).2;
+        let gone = ai_card_placement(270.0, page_top, page_height, 1100.0, viewport_h).2;
+        assert_eq!(fully_visible, 1.0, "页面完整可见时不应变透明");
+        assert!(fading > 0.0 && fading < 1.0, "快滚出去时应渐隐");
+        assert_eq!(gone, 0.0, "页面完全离开视口后不再显示");
     }
 
     #[test]

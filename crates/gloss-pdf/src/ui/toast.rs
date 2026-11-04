@@ -7,7 +7,7 @@ use crate::theme::Theme;
 
 impl AppState {
     pub(crate) fn toast(&self, theme: &Theme) -> Option<gpui::Div> {
-        // 首页有左侧边栏（宽 248px），toast 需要在内容区内显示，不能挡住侧栏底部的设置与关于
+        // 首页有左侧边栏，toast 需要在内容区内显示，不能挡住侧栏底部的设置与关于
         if self.status.is_empty() {
             return None;
         }
@@ -15,7 +15,7 @@ impl AppState {
         let left = if self.viewer.has_document() {
             px(14.)
         } else {
-            px(264.)
+            px(crate::ui::home::m::SIDEBAR_W + 16.0)
         };
 
         Some(

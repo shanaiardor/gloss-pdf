@@ -5,21 +5,29 @@
 
 use gpui::{AnyElement, ClickEvent, FontWeight, Window, div, prelude::*, px, relative};
 
-use crate::ai_query::AiPhase;
+use crate::ai_query::{AiPhase, ai_card_on_page};
 use crate::app::AppState;
 use crate::layout::GLOSS_RAIL_WIDTH;
 use crate::theme::Theme;
 use crate::ui::ai_markdown;
 
 impl AppState {
+    /// `left` / `top` 是整篇文档画布里的绝对坐标（不是页内坐标）：
+    /// AI 卡不受页底裁剪，由调用方在所有页之后单独绘制。
+    /// `opacity` 由所属页的可见度决定，页面滚出视口时柔和淡出。
     pub(crate) fn ai_card(
         &self,
+        page: usize,
+        left: f32,
         top: f32,
         max_height: f32,
+        opacity: f32,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !self.ai_card_visible() {
+        // 笺注栏按可见页逐页渲染，AI 卡只属于发起查询的那一页。
+        // 这里做一道硬校验：即使调用方漏判，也不会在其它页重复画出同一张卡。
+        if !ai_card_on_page(self.ai.page, page, self.ai_card_visible()) {
             return None;
         }
 
@@ -166,10 +174,11 @@ impl AppState {
         Some(
             div()
                 .absolute()
-                .left_0()
+                .left(px(left))
                 .top(px(top))
                 .w(px(GLOSS_RAIL_WIDTH))
                 .max_h(px(max_height))
+                .opacity(opacity)
                 .flex()
                 .flex_col()
                 .overflow_hidden()

@@ -19,12 +19,13 @@ use gpui::{
     prelude::*, px, relative,
 };
 
+use crate::ai_query::ai_card_on_page;
 use crate::app::AppState;
 use crate::dictionary::{DictLoadState, DictRequest};
 use crate::highlights::PinnedGloss;
 use crate::layout::{
     DocumentLayout, GLOSS_CARD_GAP, GLOSS_RAIL_GAP, GLOSS_RAIL_WIDTH, GlossSlotInput, PAGE_PAD,
-    layout_gloss_slots,
+    ai_card_placement, layout_gloss_slots,
 };
 use crate::theme::Theme;
 
@@ -41,31 +42,35 @@ const MIN_ACTIVE_CARD_HEIGHT: f32 = 220.0;
 const ACTIVE_SLOT_ID: u64 = u64::MAX;
 
 impl AppState {
-    /// 渲染第 `page` 页右侧的页边笺注栏（含该页已钉住的紧凑笺注卡与激活态查词卡）。
+    /// 渲染第 `page` 页右侧的页边笺注栏（钉住的紧凑笺注卡与激活态查词卡）。
     ///
-    /// 若该页既没有已钉住的笺注、也不是当前激活态查词卡所在页，则返回 `None`。
+    /// 返回 `(页级笺注栏, AI 释义卡图层)`。钉住的卡片按页高裁剪，避免盖到下一页；
+    /// AI 卡单独返回、由调用方在所有页之后统一绘制，因此它可以越过当前页页底，
+    /// 只受屏幕下沿约束，也不会被下一页的笺注卡盖住。
     ///
     /// 卡片高度优先用上一帧的实测值（[`Self::gloss_card_height`]），首帧才退回估算。
-    /// 所有卡片都放在一个 `overflow_hidden` 的裁剪层里：即使整列确实放不下，
-    /// 也不会越过页底盖到下一页的笺注栏上。
     pub(crate) fn page_gloss_rail(
         &self,
         page: usize,
         layout: &DocumentLayout,
         theme: &Theme,
         cx: &mut Context<Self>,
-    ) -> Option<gpui::Div> {
-        let geometry = layout.page_box(page)?;
+    ) -> (Option<gpui::Div>, Option<AnyElement>) {
+        let Some(geometry) = layout.page_box(page) else {
+            return (None, None);
+        };
         let active_here = self.dictionary.open && self.dictionary.anchor_page == page;
+        let ai_visible = self.ai_card_visible();
         // AI 卡也住在笺注栏里：这一页有它时，即使词典卡没开，栏也要存在。
-        let ai_here = self.ai_card_visible() && self.ai.page == page;
+        // 逐页渲染时必须限定页码，否则上一页也会画出同一张卡。
+        let ai_here = ai_card_on_page(self.ai.page, page, ai_visible);
         let active_word = self.dictionary.word.trim();
 
         // 若某个已钉住词条正好在当前页处于激活展开态，不重复渲染折叠态小卡，
         // 由激活态查词卡右上角的「已钉」徽章直接表达其钉住状态。
         // AI 卡是同一个词时，让紧凑卡让位——否则一个词会出现两张卡，
         // 且 AI 卡会被排版挤到下方，离用户点的地方很远。
-        let ai_word = if self.ai_card_visible() && self.ai.page == page {
+        let ai_word = if ai_here {
             Some(self.ai.term.trim().to_string())
         } else {
             None
@@ -90,7 +95,7 @@ impl AppState {
             .collect();
 
         if pinned.is_empty() && !active_here && !ai_here {
-            return None;
+            return (None, None);
         }
 
         let zoom = self.viewer.zoom;
@@ -195,31 +200,60 @@ impl AppState {
             }
         }
 
-        // AI 卡的位置：有词典卡就排它下面，否则贴选区锚点。
-        let anchor_top = self
-            .ai
-            .rects
-            .first()
-            .and_then(|rect| self.viewer.page_size_at(page).map(|size| size.height - rect.top))
-            .map(|anchor| (anchor * zoom).clamp(8.0, geometry.height));
-        // 期望位置：有词典卡就排在它下面，否则贴选区；只有当别的卡压在这个
-        // 位置附近（同一段纵向区间）时才往下挪，避免把它推到很远的地方。
-        let ai_desired = active_bottom.or(anchor_top).unwrap_or(0.0);
-        let blocking = slots
-            .iter()
-            .filter(|slot| slot.top + slot.height > ai_desired + 1.0)
-            .filter(|slot| slot.top < ai_desired + 120.0)
-            .map(|slot| slot.top + slot.height)
-            .fold(0.0f32, f32::max);
-        let top = ai_desired.max(blocking) + GLOSS_CARD_GAP;
-        let viewport_h = f32::from(self.viewport.height);
-        let max_height = (viewport_h * 0.55).min(420.0).max(160.0);
-        let available = (geometry.height - top - GLOSS_CARD_GAP).max(120.0);
-        if let Some(card) = self.ai_card(top, available.min(max_height), theme, cx) {
-            cards = cards.child(card);
-        }
+        // AI 卡只画在发起查询的那一页。其它页即使因为钉住笺注 / 词典卡而存在
+        // 笺注栏，也不能再画一张，否则两页同时可见时会在相同位置出现重复卡片。
+        let ai_layer = if ai_here {
+            // 位置：有词典卡就排它下面，否则贴选区锚点。
+            let anchor_top = self
+                .ai
+                .rects
+                .first()
+                .and_then(|rect| {
+                    self.viewer
+                        .page_size_at(page)
+                        .map(|size| size.height - rect.top)
+                })
+                .map(|anchor| (anchor * zoom).clamp(8.0, geometry.height));
+            // 期望位置：有词典卡就排在它下面，否则贴选区；只有当别的卡压在这个
+            // 位置附近（同一段纵向区间）时才往下挪，避免把它推到很远的地方。
+            let ai_desired = active_bottom.or(anchor_top).unwrap_or(0.0);
+            let blocking = slots
+                .iter()
+                .filter(|slot| slot.top + slot.height > ai_desired + 1.0)
+                .filter(|slot| slot.top < ai_desired + 120.0)
+                .map(|slot| slot.top + slot.height)
+                .fold(0.0f32, f32::max);
+            let desired_top = ai_desired.max(blocking) + GLOSS_CARD_GAP;
 
-        Some(rail.child(cards))
+            // 卡片锚定在页上、随页滚动；高度不受页底限制，越过页底的部分由
+            // 滚动容器裁在屏幕下沿。所属页滚出视口时按可见度柔和淡出。
+            let (top, available, opacity) = ai_card_placement(
+                desired_top,
+                geometry.top,
+                geometry.height,
+                self.scroll_top(),
+                f32::from(self.viewport.height),
+            );
+            if opacity <= 0.0 {
+                None
+            } else {
+                // 直接用画布坐标绘制，不进页级 overflow_hidden 裁剪层；
+                // 由 page.rs 在所有页之后追加，天然位于下一页笺注卡之上。
+                self.ai_card(
+                    page,
+                    rail_left,
+                    geometry.top + top,
+                    available,
+                    opacity,
+                    theme,
+                    cx,
+                )
+            }
+        } else {
+            None
+        };
+
+        (Some(rail.child(cards)), ai_layer)
     }
 
     /// 上一帧实测到的卡片高度；没有测量结果时用 `fallback`。
